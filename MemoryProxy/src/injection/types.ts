@@ -58,6 +58,12 @@ export interface AgentTool {
   description: string;
   parameters: Record<string, unknown>; // JSON Schema
   /**
+   * Original protocol-native tool definition. Adapters use this snapshot to
+   * preserve provider-specific and future fields across injection round-trips.
+   * Tools created by injectors omit it and serialize in canonical form.
+   */
+  rawDefinition?: Record<string, unknown>;
+  /**
    * Prompt-cache breakpoint marker (Anthropic `cache_control`), carried through
    * the parse→serialize round-trip so upstream prompt caching keeps working.
    * Sits at the same level as `input_schema` in the wire format.
