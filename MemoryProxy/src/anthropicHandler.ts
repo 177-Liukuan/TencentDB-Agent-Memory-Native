@@ -51,6 +51,7 @@ import { isExtractionAllowed, logExtractionSkipped } from "./extraction-gate.js"
 import type { CcRequestKind } from "./common/cc-request-classifier.js";
 import { buildRequestDebugMetadata } from "./common/langfuse-debug.js";
 import { resolveAgentAdapter } from "./agent-adapters/index.js";
+import { stripSessionInitArtifacts } from "./session/claude-code/form.js";
 import {
   enforceRateLimit,
   isRateLimitExceededError,
@@ -260,60 +261,29 @@ function extractApiKey(c: Context): string {
 }
 
 /**
- * Heuristically decide whether a `thinking` block carries a valid native
- * Anthropic/Bedrock signature.
- */
-function hasValidThinkingSignature(block: Record<string, unknown>): boolean {
-  const sig = block.signature;
-  if (typeof sig !== "string" || sig.length < 40) return false;
-  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(sig)) {
-    return false;
-  }
-  return /^[A-Za-z0-9+/=]+$/.test(sig);
-}
-
-/**
- * Sanitize `thinking` blocks across all assistant messages.
+ * Preserve provider-owned `thinking` blocks across all assistant messages.
  *
- * Exported for unit testing.
+ * Kept as a compatibility wrapper for existing callers. A transparent proxy
+ * cannot infer the signature format used by every Anthropic-compatible
+ * provider, so validation and rejection belong to the selected upstream.
  */
 export function sanitizeThinkingBlocks(
   body: Record<string, unknown>,
 ): { body: Record<string, unknown>; removed: number } {
-  const messages = body.messages;
-  if (!Array.isArray(messages)) return { body, removed: 0 };
+  return { body, removed: 0 };
+}
 
-  let removed = 0;
-  let changed = false;
-
-  const newMessages = messages.map((msg) => {
-    const m = msg as Record<string, unknown>;
-    if (m.role !== "assistant" || !Array.isArray(m.content)) return msg;
-
-    let msgChanged = false;
-    const newContent = (m.content as unknown[]).filter((block) => {
-      const b = block as Record<string, unknown>;
-      const isThinking = b.type === "thinking" || b.type === "redacted_thinking";
-      if (!isThinking) return true;
-      if (hasValidThinkingSignature(b)) return true;
-      removed += 1;
-      msgChanged = true;
-      return false;
-    });
-
-    if (!msgChanged) return msg;
-    changed = true;
-    return { ...m, content: newContent };
-  });
-
-  if (!changed) return { body, removed: 0 };
-  return { body: { ...body, messages: newMessages }, removed };
+function stripSessionInitArtifactsFromBody(body: Record<string, unknown>): Record<string, unknown> {
+  if (!Array.isArray(body.messages)) return body;
+  const stripped = stripSessionInitArtifacts(body.messages as Record<string, unknown>[]);
+  if (stripped.removed === 0) return body;
+  return { ...body, messages: stripped.messages };
 }
 
 /**
  * Build upstream body from original body + cost guard overrides.
  */
-function buildUpstreamBody(
+export function buildUpstreamBody(
   body: Record<string, unknown>,
   target: ForwardTarget,
 ): { body: Record<string, unknown>; sanitizedCount: number } {
@@ -322,7 +292,14 @@ function buildUpstreamBody(
     result = { ...result, ...target.bodyOverrides };
   }
   const sanitized = sanitizeThinkingBlocks(result);
-  return { body: sanitized.body, sanitizedCount: sanitized.removed };
+  return {
+    body: stripSessionInitArtifactsFromBody(sanitized.body),
+    sanitizedCount: sanitized.removed,
+  };
+}
+
+export function buildRetryBody(body: Record<string, unknown>): Record<string, unknown> {
+  return stripSessionInitArtifactsFromBody(sanitizeThinkingBlocks(body).body);
 }
 
 /**
@@ -1225,7 +1202,7 @@ export async function handleAnthropicMessages(
     delete originalHeaders["authorization"];
   }
 
-  const retryBody = sanitizeThinkingBlocks(body).body;
+  const retryBody = buildRetryBody(body);
 
   // ── Forward to upstream (with automatic retry if configured) ──────────────
   const forwardTimeoutMs = config.server.forwardTimeoutMs ?? 600_000;

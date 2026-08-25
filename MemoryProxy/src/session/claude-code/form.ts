@@ -71,6 +71,64 @@ export interface FormData {
   modelId?: string;
 }
 
+/** Remove proxy-generated Claude Code session-init form artifacts. */
+export function stripSessionInitArtifacts(
+  messages: Record<string, unknown>[],
+): { messages: Record<string, unknown>[]; removed: number } {
+  const sessionInitToolUseIds = new Set<string>();
+
+  for (const message of messages) {
+    if (message.role !== "assistant" || !Array.isArray(message.content)) continue;
+    for (const rawBlock of message.content) {
+      const block = rawBlock as Record<string, unknown>;
+      if (
+        block.type === "tool_use" &&
+        typeof block.id === "string" &&
+        isSessionInitToolCallId(block.id)
+      ) {
+        sessionInitToolUseIds.add(block.id);
+      }
+    }
+  }
+
+  if (sessionInitToolUseIds.size === 0) return { messages, removed: 0 };
+
+  let removed = 0;
+  const filteredMessages: Record<string, unknown>[] = [];
+
+  for (const message of messages) {
+    if (!Array.isArray(message.content)) {
+      filteredMessages.push(message);
+      continue;
+    }
+
+    const filteredContent = message.content.filter((rawBlock) => {
+      const block = rawBlock as Record<string, unknown>;
+      const isSessionInitToolUse =
+        message.role === "assistant" &&
+        block.type === "tool_use" &&
+        typeof block.id === "string" &&
+        sessionInitToolUseIds.has(block.id);
+      const isMatchingToolResult =
+        block.type === "tool_result" &&
+        typeof block.tool_use_id === "string" &&
+        sessionInitToolUseIds.has(block.tool_use_id);
+
+      if (!isSessionInitToolUse && !isMatchingToolResult) return true;
+      removed += 1;
+      return false;
+    });
+
+    if (filteredContent.length === message.content.length) {
+      filteredMessages.push(message);
+    } else if (filteredContent.length > 0) {
+      filteredMessages.push({ ...message, content: filteredContent });
+    }
+  }
+
+  return { messages: filteredMessages, removed };
+}
+
 // ── Claude Code AskUserQuestion input schema ───────────────────────────────────
 
 interface CCAskQuestion {
