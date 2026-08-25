@@ -183,6 +183,37 @@ Anthropic Messages client:
 }
 ```
 
+### Non-interactive Claude Code runs
+
+Claude Code disables `AskUserQuestion` in `-p/--print` mode, so a fresh
+session cannot complete the interactive team → agent → task form. Use the QA
+launcher to send a validated identity through MemoryProxy's header auto-select
+path instead:
+
+```bash
+CLAUDE_NATIVE_LAUNCHER=/path/to/claude-native \
+  ./scripts/qa/claude-native-batch.sh \
+  --team-id team-example \
+  --agent-id agt-example \
+  --task-id task-example \
+  'Query TDAI Memory before answering.'
+```
+
+The launcher:
+
+- requires all three asset IDs and rejects characters that could inject an
+  extra HTTP header;
+- creates a new UUID session unless `--session-id <uuid>` is supplied;
+- exports `x-team-id`, `x-agent-id` and `x-task-id` through
+  `ANTHROPIC_CUSTOM_HEADERS`;
+- invokes Claude Code in print mode with `--output-format json`.
+
+Each invocation represents one isolated test case, so a shell loop can run a
+batch without reusing conversation context. The IDs are still validated by
+MemoryProxy against assets visible to the authenticated user; headers do not
+bypass authorization. Run `./scripts/qa/claude-native-batch.sh --help` for the
+full syntax.
+
 ## Main HTTP endpoints
 
 | Method | Path | Description |
