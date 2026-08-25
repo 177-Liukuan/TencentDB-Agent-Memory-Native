@@ -8,9 +8,23 @@
  */
 
 import fs from "node:fs";
-import { request as undiciRequest, Agent as UndiciAgent } from "undici";
+import { createRequire } from "node:module";
 import type { Dispatcher } from "undici";
 import type { StoreLogger } from "./types.js";
+
+// undici v8 uses a newer global-dispatcher slot and overwrites Node's legacy
+// slot while loading. Node 22 global fetch still reads the legacy slot, where
+// NODE_USE_ENV_PROXY installs EnvHttpProxyAgent. Preserve that dispatcher so
+// loading the TCVDB client cannot silently disable proxy routing for LLM calls.
+const legacyDispatcherSymbol = Symbol.for("undici.globalDispatcher.1");
+const dispatcherGlobal = globalThis as typeof globalThis & Record<symbol, unknown>;
+const preservedLegacyDispatcher = dispatcherGlobal[legacyDispatcherSymbol];
+const require = createRequire(import.meta.url);
+const undici = require("undici") as typeof import("undici");
+if (preservedLegacyDispatcher !== undefined) {
+  dispatcherGlobal[legacyDispatcherSymbol] = preservedLegacyDispatcher;
+}
+const { request: undiciRequest, Agent: UndiciAgent } = undici;
 
 // ============================
 // Types
