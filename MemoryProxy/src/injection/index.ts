@@ -233,7 +233,10 @@ function buildPipelineBundle(config: ProxyConfig): PipelineBundle {
       console.log(`[injection] proxyBaseUrl (from injection.externalGatewayUrl) = ${proxyBaseUrl}`);
     } else {
       let hostIp = config.server.host;
-      if (hostIp === "0.0.0.0" || hostIp === "127.0.0.1") {
+      // A wildcard listener needs a concrete address in the generated curl
+      // recipes. An explicit loopback listener must stay loopback: replacing
+      // 127.0.0.1 with a NIC address produces a URL the listener cannot serve.
+      if (hostIp === "0.0.0.0") {
         const interfaces = os.networkInterfaces();
         let foundIp = "";
         for (const name of Object.keys(interfaces)) {
