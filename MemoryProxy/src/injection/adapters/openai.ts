@@ -8,7 +8,9 @@
  *   - tool: { role: "tool", content: string, tool_call_id: string }
  */
 
+import type { NativeProxyToolRegistry } from "../../native-proxy-tools/tool-registry.js";
 import type { ProtocolAdapter } from "./interface.js";
+import { OpenAIStreamParser } from "./openai-stream.js";
 import type {
   AgentContext,
   AgentContextMetadata,
@@ -20,6 +22,10 @@ import type {
 
 export class OpenAIAdapter implements ProtocolAdapter {
   readonly protocol = "openai" as const;
+
+  createStreamParser(registry: NativeProxyToolRegistry): OpenAIStreamParser {
+    return new OpenAIStreamParser(registry);
+  }
 
   parse(body: Record<string, unknown>, metadata: AgentContextMetadata): AgentContext {
     const rawMessages = (body.messages as unknown[]) ?? [];

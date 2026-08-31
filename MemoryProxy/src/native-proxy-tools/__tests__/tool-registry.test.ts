@@ -250,6 +250,16 @@ describe("Native Proxy Tool injection", () => {
       .toHaveLength(expected);
   });
 
+  it("injects the same function schemas for streaming OpenAI Chat Completions", () => {
+    const injector = new NativeProxyToolsInjector({
+      enabled: true,
+      registry: createDefaultNativeProxyToolRegistry(),
+    });
+
+    expect(injector.execute(initializedAnthropicContext({ protocol: "openai" })))
+      .toHaveLength(6);
+  });
+
   it("does not expose the tool without a trusted initialized Session", async () => {
     const injector = new NativeProxyToolsInjector({
       enabled: true,

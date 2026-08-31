@@ -102,7 +102,11 @@ export class NativeProxyToolsInjector implements InjectionHook {
   }
 
   private isEligibleRequest(ctx: AgentContext): boolean {
-    if (!this.options.enabled || ctx.metadata.protocol !== "anthropic" || !ctx.metadata.stream) {
+    if (
+      !this.options.enabled
+      || !["anthropic", "openai"].includes(ctx.metadata.protocol)
+      || !ctx.metadata.stream
+    ) {
       return false;
     }
     const custom = ctx.metadata.custom as Record<string, unknown> | undefined;
