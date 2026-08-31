@@ -1,17 +1,17 @@
 import type { UnifiedToolCall } from "../injection/adapters/interface.js";
-import {
-  executeMemoryBridge,
-  type MemoryBridgeDeps,
-  type MemoryBridgeExecutionInput,
-  type MemoryBridgeExecutionResult,
+import type {
+  MemoryBridgeDeps,
+  MemoryBridgeExecutionInput,
+  MemoryBridgeExecutionResult,
 } from "../memory/memory-bridge.js";
 import type { ProxyConfig } from "../types.js";
-import type { NativeProxyToolRegistry } from "./tool-registry.js";
-import type {
-  JsonValue,
-  NativeToolResult,
-  ToolExecutionScope,
-} from "./types.js";
+import {
+  createBridgeToolExecutors,
+  type BridgeToolExecutionResult,
+  type BridgeToolExecutors,
+} from "./bridge-tool-executors.js";
+import type { NativeProxyToolDefinition, NativeProxyToolRegistry } from "./tool-registry.js";
+import type { JsonValue, NativeToolResult, ToolExecutionScope } from "./types.js";
 
 type ExecuteMemoryBridge = (
   input: MemoryBridgeExecutionInput,
@@ -21,31 +21,23 @@ type ExecuteMemoryBridge = (
 export interface NativeProxyToolDispatcherOptions {
   config: ProxyConfig;
   registry: NativeProxyToolRegistry;
+  executors?: BridgeToolExecutors;
+  /** Compatibility seam retained for existing Memory Bridge unit tests. */
   executeBridge?: ExecuteMemoryBridge;
   bridgeDeps?: MemoryBridgeDeps;
 }
 
-interface MemoryBridgeEnvelope {
+interface BridgeEnvelope {
   code?: unknown;
   message?: unknown;
   request_id?: unknown;
   data?: unknown;
 }
 
-function errorResult(
-  code: string,
-  message: string,
-  retryable: boolean,
-  requestId?: string,
-): NativeToolResult {
+function errorResult(code: string, message: string, retryable: boolean, requestId?: string): NativeToolResult {
   return {
     isError: true,
-    value: {
-      code,
-      message,
-      ...(requestId ? { request_id: requestId } : {}),
-      retryable,
-    },
+    value: { code, message, ...(requestId ? { request_id: requestId } : {}), retryable },
   };
 }
 
@@ -77,8 +69,9 @@ function boundedResult(value: JsonValue, maxBytes: number): JsonValue {
 
   const base = {
     code: "result_too_large",
-    message: "Memory search result exceeded the configured size limit",
+    message: "Native tool result exceeded the configured size limit",
     content_omitted: true,
+    truncated: true,
     original_bytes: originalBytes,
     preview: "",
   };
@@ -100,15 +93,12 @@ function boundedResult(value: JsonValue, maxBytes: number): JsonValue {
 }
 
 function waitForBridge(
-  operation: Promise<MemoryBridgeExecutionResult>,
+  operation: Promise<BridgeToolExecutionResult>,
   signal: AbortSignal,
-): Promise<MemoryBridgeExecutionResult> {
+): Promise<BridgeToolExecutionResult> {
   return new Promise((resolve, reject) => {
     const abort = () => reject(signal.reason ?? new Error("Native tool timed out"));
-    if (signal.aborted) {
-      abort();
-      return;
-    }
+    if (signal.aborted) return abort();
     signal.addEventListener("abort", abort, { once: true });
     operation.then(
       (value) => {
@@ -123,131 +113,129 @@ function waitForBridge(
   });
 }
 
+function labels(definition: NativeProxyToolDefinition): {
+  prefix: "memory" | "skill";
+  operation: string;
+} {
+  return definition.backend === "memory"
+    ? { prefix: "memory", operation: "Memory search" }
+    : { prefix: "skill", operation: "Skill operation" };
+}
+
+function responseIsRetryable(response: BridgeToolExecutionResult): boolean {
+  return response.status === 408 || response.status === 429 || response.status >= 500;
+}
+
 export class NativeProxyToolDispatcher {
-  private readonly executeBridge: ExecuteMemoryBridge;
+  private readonly executors: BridgeToolExecutors;
 
   constructor(private readonly options: NativeProxyToolDispatcherOptions) {
-    this.executeBridge = options.executeBridge ?? executeMemoryBridge;
+    this.executors = options.executors ?? createBridgeToolExecutors(options.config, {
+      memory: options.bridgeDeps,
+    });
+    if (options.executeBridge) {
+      const executeBridge = options.executeBridge;
+      this.executors = {
+        ...this.executors,
+        memory: async ({ definition, body, scope, signal }) => executeBridge({
+          config: options.config,
+          subpath: definition.route,
+          body,
+          sessionId: scope.sessionId,
+          spaceId: scope.spaceId,
+          signal,
+        }, options.bridgeDeps ?? {}),
+      };
+    }
   }
 
-  async execute(
-    call: UnifiedToolCall,
-    context: ToolExecutionScope,
-  ): Promise<NativeToolResult> {
+  async execute(call: UnifiedToolCall, context: ToolExecutionScope): Promise<NativeToolResult> {
     if (call.owner !== "proxy") {
-      return errorResult(
-        "tool_not_owned_by_proxy",
-        "The requested tool is not owned by the proxy",
-        false,
-      );
+      return errorResult("tool_not_owned_by_proxy", "The requested tool is not owned by the proxy", false);
     }
     if (call.parseError) {
-      return errorResult(
-        "invalid_tool_arguments",
-        "Tool arguments are not valid JSON",
-        false,
-      );
+      return errorResult("invalid_tool_arguments", "Tool arguments are not valid JSON", false);
     }
 
     const definition = this.options.registry.get(call.toolName);
     if (!definition) {
-      return errorResult(
-        "unknown_native_tool",
-        "The requested Native Proxy Tool is not registered",
-        false,
-      );
+      return errorResult("unknown_native_tool", "The requested Native Proxy Tool is not registered", false);
     }
     const validated = definition.validate(call.input);
     if (!validated.ok) {
-      return errorResult(
-        "invalid_tool_arguments",
-        "Tool arguments do not match the registered schema",
-        false,
-      );
+      return errorResult("invalid_tool_arguments", "Tool arguments do not match the registered schema", false);
     }
 
+    const label = labels(definition);
     const signal = AbortSignal.timeout(this.options.config.nativeProxyTools.toolTimeoutMs);
-    let response: MemoryBridgeExecutionResult;
-    try {
-      response = await waitForBridge(this.executeBridge({
-        config: this.options.config,
-        subpath: definition.route,
-        body: validated.value,
-        sessionId: context.sessionId,
-        spaceId: context.spaceId,
-        signal,
-      }, this.options.bridgeDeps ?? {}), signal);
-    } catch {
-      if (signal.aborted) {
+    const executor = this.executors[definition.backend];
+    const maxAttempts = definition.effect === "read" ? 2 : 1;
+    let response: BridgeToolExecutionResult | undefined;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      try {
+        response = await waitForBridge(executor({
+          callId: call.callId,
+          definition,
+          body: validated.value,
+          scope: context,
+          signal,
+        }), signal);
+      } catch {
+        if (signal.aborted) {
+          return errorResult(`${label.prefix}_bridge_timeout`, `${label.operation} timed out`, true);
+        }
+        if (attempt < maxAttempts) continue;
         return errorResult(
-          "memory_bridge_timeout",
-          "Memory search timed out",
+          `${label.prefix}_bridge_unavailable`,
+          `${label.operation} is temporarily unavailable`,
           true,
         );
       }
-      return errorResult(
-        "memory_bridge_unavailable",
-        "Memory search is temporarily unavailable",
-        true,
-      );
+      if (responseIsRetryable(response) && attempt < maxAttempts) continue;
+      break;
     }
 
-    let envelope: MemoryBridgeEnvelope;
+    if (!response) {
+      return errorResult(`${label.prefix}_bridge_unavailable`, `${label.operation} is temporarily unavailable`, true);
+    }
+
+    let envelope: BridgeEnvelope;
     try {
       const parsed = JSON.parse(response.text) as unknown;
-      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-        throw new Error("not an envelope");
-      }
-      envelope = parsed as MemoryBridgeEnvelope;
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("not an envelope");
+      envelope = parsed as BridgeEnvelope;
     } catch {
-      return errorResult(
-        "memory_bridge_invalid_response",
-        "Memory search returned an invalid response",
-        true,
-      );
+      return errorResult(`${label.prefix}_bridge_invalid_response`, `${label.operation} returned an invalid response`, true);
     }
 
     const requestId = safeRequestId(envelope.request_id);
     if (response.status < 200 || response.status >= 300) {
-      const retryable = response.status >= 500 || response.status === 408 || response.status === 429;
-      return retryable
-        ? errorResult(
-            "memory_bridge_unavailable",
-            "Memory search is temporarily unavailable",
-            true,
-            requestId,
-          )
-        : errorResult(
-            "memory_bridge_rejected",
-            "Memory search request was rejected",
-            false,
-            requestId,
-          );
+      const retryable = responseIsRetryable(response);
+      return errorResult(
+        retryable ? `${label.prefix}_bridge_unavailable` : `${label.prefix}_bridge_rejected`,
+        retryable ? `${label.operation} is temporarily unavailable` : `${label.operation} was rejected`,
+        retryable,
+        requestId,
+      );
     }
 
     if (envelope.code !== 0) {
       return errorResult(
-        "memory_search_failed",
-        "Memory search failed",
+        definition.backend === "memory" ? "memory_search_failed" : "skill_operation_failed",
+        `${label.operation} failed`,
         false,
         requestId,
       );
     }
-    if (!isJsonValue(envelope.data)) {
-      return errorResult(
-        "memory_bridge_invalid_response",
-        "Memory search returned an invalid response",
-        true,
-        requestId,
-      );
-    }
 
+    const data = envelope.data === undefined ? null : envelope.data;
+    if (!isJsonValue(data)) {
+      return errorResult(`${label.prefix}_bridge_invalid_response`, `${label.operation} returned an invalid response`, true, requestId);
+    }
     return {
       isError: false,
-      value: boundedResult(
-        envelope.data,
-        this.options.config.nativeProxyTools.maxResultBytes,
-      ),
+      value: boundedResult(data, this.options.config.nativeProxyTools.maxResultBytes),
     };
   }
 }

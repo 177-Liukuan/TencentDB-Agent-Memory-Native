@@ -184,6 +184,7 @@ const READ_VERSION_OPS = new Set<string>(["get", "files/read"]);
 const WRITE_LOCK_OPS = new Set<string>([
   "update",
   "patch",
+  "delete",
   "files/write",
   "files/remove",
 ]);
@@ -377,6 +378,59 @@ export interface SkillBridgeDeps {
    * (B) and already-injected skills (C) — see whitelist composition below.
    */
   coreClient?: CoreSkillClient;
+}
+
+export interface SkillBridgeExecutionInput {
+  config: ProxyConfig;
+  subpath: string;
+  body: Record<string, unknown>;
+  sessionId: string;
+  spaceId?: string;
+  signal?: AbortSignal;
+}
+
+export interface SkillBridgeExecutionResult {
+  status: number;
+  text: string;
+  contentType: string;
+}
+
+/**
+ * Protocol-independent Native Tool entry point. It deliberately enters the
+ * same Bridge handler used by the HTTP route so identity recovery, ACL,
+ * visibility filtering and version pinning have one implementation.
+ */
+export async function executeSkillBridge(
+  input: SkillBridgeExecutionInput,
+  deps: SkillBridgeDeps = {},
+): Promise<SkillBridgeExecutionResult> {
+  const subpath = input.subpath.replace(/^\/+|\/+$/g, "");
+  const url = `http://native-skill-bridge/skill-bridge/v3/skill/${subpath}`;
+  const request = new Request(url, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-conversation-id": input.sessionId,
+      ...(input.spaceId ? { "x-tdai-service-id": input.spaceId } : {}),
+    },
+    body: JSON.stringify(input.body),
+    signal: input.signal,
+  });
+  const context = {
+    req: {
+      raw: request,
+      url,
+      method: "POST",
+      header: (name: string) => request.headers.get(name) ?? undefined,
+      text: () => request.text(),
+    },
+  } as unknown as Context;
+  const response = await createSkillBridgeHandler(input.config, deps)(context);
+  return {
+    status: response.status,
+    text: await response.text().catch(() => ""),
+    contentType: response.headers.get("content-type") ?? "application/json",
+  };
 }
 
 /**

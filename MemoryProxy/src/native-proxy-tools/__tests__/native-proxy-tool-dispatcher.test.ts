@@ -27,6 +27,14 @@ function memoryCall(input: unknown = { query: "rules" }): UnifiedToolCall {
   };
 }
 
+function proxyCall(toolName: string, input: unknown, callId = "call-1"): UnifiedToolCall {
+  return {
+    ...memoryCall(input),
+    callId,
+    toolName,
+  };
+}
+
 function trustedContext(): ToolExecutionScope {
   return {
     spaceId: "space-1",
@@ -56,6 +64,88 @@ function dispatcherWithBridge(
 }
 
 describe("NativeProxyToolDispatcher", () => {
+  it("dispatches Skill tools to the Skill executor with normalized arguments and call identity", async () => {
+    const memory = vi.fn();
+    const skill = vi.fn(async () => bridgeResult({
+      code: 0,
+      data: { skill_id: "skl-1", content: "# Skill" },
+    }));
+    const dispatcher = new NativeProxyToolDispatcher({
+      config: config(),
+      registry: createDefaultNativeProxyToolRegistry(),
+      executors: { memory, skill },
+    } as any);
+
+    const result = await dispatcher.execute(
+      proxyCall("skill_view", { skill_id: "skl-1" }, "skill-call-1"),
+      trustedContext(),
+    );
+
+    expect(memory).not.toHaveBeenCalled();
+    expect(skill).toHaveBeenCalledWith(expect.objectContaining({
+      callId: "skill-call-1",
+      definition: expect.objectContaining({ backend: "skill", route: "get" }),
+      body: {
+        skill_id: "skl-1",
+        include_content: true,
+        include_manifest: true,
+      },
+      scope: trustedContext(),
+      signal: expect.any(AbortSignal),
+    }));
+    expect(result).toEqual({
+      isError: false,
+      value: { skill_id: "skl-1", content: "# Skill" },
+    });
+  });
+
+  it("retries one retryable Bridge response but never retries a version conflict", async () => {
+    const retryable = vi.fn()
+      .mockResolvedValueOnce(bridgeResult({ code: 50301, message: "unavailable" }, 503))
+      .mockResolvedValueOnce(bridgeResult({ code: 0, data: { items: [] } }));
+    const conflict = vi.fn(async () => bridgeResult({
+      code: 40901,
+      message: "stale",
+      request_id: "request-conflict",
+    }, 409));
+    const retryDispatcher = new NativeProxyToolDispatcher({
+      config: config(),
+      registry: createDefaultNativeProxyToolRegistry(),
+      executors: { memory: retryable, skill: vi.fn() },
+    } as any);
+    const conflictDispatcher = new NativeProxyToolDispatcher({
+      config: config(),
+      registry: createDefaultNativeProxyToolRegistry(),
+      executors: { memory: vi.fn(), skill: conflict },
+    } as any);
+
+    expect(await retryDispatcher.execute(memoryCall(), trustedContext())).toEqual({
+      isError: false,
+      value: { items: [] },
+    });
+    expect(retryable).toHaveBeenCalledTimes(2);
+
+    expect(await conflictDispatcher.execute(
+      proxyCall("skill_update", { skill_id: "skl-1", content: "new" }),
+      trustedContext(),
+    )).toEqual({
+      isError: true,
+      value: {
+        code: "skill_bridge_rejected",
+        message: "Skill operation was rejected",
+        request_id: "request-conflict",
+        retryable: false,
+      },
+    });
+    expect(conflict).toHaveBeenCalledTimes(1);
+  });
+
+  it("treats a successful empty Bridge envelope as an empty result", async () => {
+    const result = await dispatcherWithBridge(async () => bridgeResult({ code: 0 }))
+      .execute(memoryCall(), trustedContext());
+
+    expect(result).toEqual({ isError: false, value: null });
+  });
   it("validates and defaults input through the Registry before invoking Memory Bridge", async () => {
     const executeBridge = vi.fn(async () => bridgeResult({
       code: 0,
