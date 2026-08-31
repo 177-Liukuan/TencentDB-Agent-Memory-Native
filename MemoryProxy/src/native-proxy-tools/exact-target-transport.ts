@@ -32,6 +32,15 @@ const REQUEST_PARAMETER_ALLOWLIST = new Set([
   "response_format",
   "seed",
   "stream_options",
+  "max_output_tokens",
+  "reasoning",
+  "text",
+  "include",
+  "truncation",
+  "previous_response_id",
+  "conversation",
+  "store",
+  "background",
 ]);
 
 const SKIP_REQUEST_HEADERS = new Set([
@@ -139,7 +148,13 @@ export function buildUpstreamRequestSnapshot(
     requestParameters[name] = asJsonValue(value);
   }
 
-  const baseMessages = asJsonArray(input.body.messages, "messages");
+  const inputField = input.protocol === "responses" ? "input" : "messages";
+  const rawBase = input.body[inputField];
+  const baseMessages = Array.isArray(rawBase)
+    ? asJsonArray(rawBase, inputField)
+    : input.protocol === "responses" && typeof rawBase === "string"
+      ? [asJsonValue({ role: "user", content: rawBase })]
+      : asJsonArray(rawBase, inputField);
   const logicalBaseMessages = input.logicalBaseMessages === undefined
     ? baseMessages
     : asJsonArray(input.logicalBaseMessages, "logicalBaseMessages");
@@ -156,6 +171,9 @@ export function buildUpstreamRequestSnapshot(
     ...(input.body.system !== undefined
       ? { system: asJsonValue(input.body.system) }
       : {}),
+    ...(input.body.instructions !== undefined
+      ? { instructions: asJsonValue(input.body.instructions) }
+      : {}),
     ...(input.body.tools !== undefined
       ? { tools: asJsonArray(input.body.tools, "tools") }
       : {}),
@@ -169,7 +187,7 @@ export function buildUpstreamRequestSnapshot(
 }
 
 function validateSnapshot(snapshot: UpstreamRequestSnapshot): void {
-  if (!["anthropic", "openai"].includes(snapshot.protocol)) throw new NativeToolTargetUnavailableError();
+  if (!["anthropic", "openai", "responses"].includes(snapshot.protocol)) throw new NativeToolTargetUnavailableError();
   if (
     snapshot.requestParameters.model !== snapshot.target.model
     || snapshot.requestParameters.stream !== true
@@ -203,12 +221,15 @@ function buildReentryBody(
   snapshot: UpstreamRequestSnapshot,
   messages: JsonValue[],
 ): Record<string, JsonValue> {
-  return {
+  const shared = {
     ...cloneJson(snapshot.requestParameters),
     ...(snapshot.system !== undefined ? { system: cloneJson(snapshot.system) } : {}),
+    ...(snapshot.instructions !== undefined ? { instructions: cloneJson(snapshot.instructions) } : {}),
     ...(snapshot.tools !== undefined ? { tools: cloneJson(snapshot.tools) } : {}),
-    messages: cloneJson(messages),
   };
+  return snapshot.protocol === "responses"
+    ? { ...shared, input: cloneJson(messages) }
+    : { ...shared, messages: cloneJson(messages) };
 }
 
 function sanitizeRequestHeaders(headers: Record<string, string>): Record<string, string> {
@@ -331,7 +352,7 @@ function restartHeaders(
   const headers = sanitizeRequestHeaders(options.currentRequestHeaders);
   if (candidate.authSource !== "client") {
     if (!candidate.apiKey) throw new NativeToolTargetUnavailableError();
-    if (protocol === "openai") {
+    if (protocol === "openai" || protocol === "responses") {
       headers.authorization = `Bearer ${candidate.apiKey}`;
       delete headers["x-api-key"];
     } else {

@@ -255,6 +255,23 @@ describe("extractAnthropicClientToolResults", () => {
   });
 });
 
+describe("OpenAI Responses Client Tool Result extraction", () => {
+  it("collects the trailing function_call_output batch and rejects duplicate call_id values", () => {
+    expect(extractClientToolResults({ input: [
+      { role: "user", content: "question" },
+      { type: "function_call_output", call_id: "call_1", output: "first" },
+      { type: "function_call_output", call_id: "call_2", output: { stdout: "second" } },
+    ] })).toEqual([
+      { callId: "call_1", content: "first", isError: false },
+      { callId: "call_2", content: { stdout: "second" }, isError: false },
+    ]);
+    expect(() => extractClientToolResults({ input: [
+      { type: "function_call_output", call_id: "call_1", output: "a" },
+      { type: "function_call_output", call_id: "call_1", output: "b" },
+    ] })).toThrow(/duplicate Tool Result/i);
+  });
+});
+
 describe("resumeClientToolResults", () => {
   it("waits when Client results arrive before the running Native result", async () => {
     const harness = resumeHarness();

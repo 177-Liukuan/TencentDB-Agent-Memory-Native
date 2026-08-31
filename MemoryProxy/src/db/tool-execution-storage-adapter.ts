@@ -379,6 +379,7 @@ export function validateToolExecutionContext(context: ToolExecutionContext): voi
     "observationIntent",
     "compressionCheckpoint",
     "system",
+    "instructions",
     "tools",
     "requestParameters",
     "target",

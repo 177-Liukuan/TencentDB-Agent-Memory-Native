@@ -278,7 +278,7 @@ export function decodeToolExecutionStateRow(
   if (
     finiteInteger(row.schema_version ?? 1) !== 1
     ||
-    !["anthropic", "openai"].includes(row.protocol)
+    !["anthropic", "openai", "responses"].includes(row.protocol)
     || !row.mutation_token
     || row.call_ids.length !== slots.length
     || row.call_ids.some((callId, index) => callId !== slots[index]?.callId)

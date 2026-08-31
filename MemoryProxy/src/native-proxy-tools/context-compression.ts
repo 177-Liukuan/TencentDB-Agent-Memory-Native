@@ -20,6 +20,16 @@ function terminal(context: ToolExecutionContext): boolean {
 }
 
 function hiddenMessages(context: ToolExecutionContext): JsonValue[] {
+  if (context.protocol === "responses") {
+    return [
+      ...structuredClone(context.assistantSkeleton),
+      ...[...context.slots].sort((left, right) => left.slotIndex - right.slotIndex).map((slot) => ({
+        type: "function_call_output",
+        call_id: slot.callId,
+        output: typeof slot.result === "string" ? slot.result : JSON.stringify(slot.result ?? null),
+      })),
+    ];
+  }
   if (context.protocol === "openai") {
     return [
       { role: "assistant", content: null, tool_calls: structuredClone(context.assistantSkeleton) },
@@ -49,13 +59,14 @@ export async function prepareContextCompression(input: {
     .filter(terminal)
     .sort((left, right) => left.turnSeq - right.turnSeq || left.round - right.round);
   if (contexts.length === 0) return null;
-  const messages = Array.isArray(input.body.messages)
-    ? structuredClone(input.body.messages) as unknown[]
+  const field = contexts.every((context) => context.protocol === "responses") ? "input" : "messages";
+  const messages = Array.isArray(input.body[field])
+    ? structuredClone(input.body[field]) as unknown[]
     : [];
   const insertAt = Math.max(0, messages.length - 1);
   messages.splice(insertAt, 0, ...contexts.flatMap(hiddenMessages));
   return {
-    body: { ...structuredClone(input.body), messages },
+    body: { ...structuredClone(input.body), [field]: messages },
     checkpointId: (input.createId ?? randomUUID)(),
     coveredStates: contexts.map((context) => ({ key: structuredClone(context.key), revision: context.revision })),
   };

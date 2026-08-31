@@ -58,3 +58,31 @@ describe("Context Compression hidden history", () => {
     })).toBeNull();
   });
 });
+
+describe("Responses Context Compression history", () => {
+  it("rehydrates output items and function_call_output into input[]", async () => {
+    const storage = new InMemoryToolExecutionStorageAdapter({ now: () => now });
+    const responses = state("succeeded");
+    responses.key.toolBatchId = "responses-batch";
+    responses.protocol = "responses";
+    responses.assistantSkeleton = [{ type: "function_call", id: "fc_1", call_id: "call-succeeded", name: "tdai_memory_search", arguments: "{\"query\":\"x\"}" }];
+    responses.upstreamSnapshot = {
+      ...responses.upstreamSnapshot,
+      protocol: "responses",
+      instructions: "be helpful",
+      target: { ...responses.upstreamSnapshot.target, url: "https://upstream.test/v1/responses" },
+    };
+    await storage.create(responses);
+
+    const preparation = await prepareContextCompression({
+      body: { input: [{ role: "user", content: "question" }, { role: "user", content: "compress" }] },
+      scope, storage, createId: () => "responses-checkpoint",
+    });
+    expect(preparation?.body.input).toEqual([
+      { role: "user", content: "question" },
+      ...responses.assistantSkeleton,
+      { type: "function_call_output", call_id: "call-succeeded", output: "{\"hits\":[\"hidden\"]}" },
+      { role: "user", content: "compress" },
+    ]);
+  });
+});

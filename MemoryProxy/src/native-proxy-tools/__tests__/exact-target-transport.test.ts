@@ -331,3 +331,30 @@ describe("exact Anthropic target transport", () => {
     expect(fetchImpl).not.toHaveBeenCalled();
   });
 });
+
+describe("exact OpenAI Responses target transport", () => {
+  it("re-enters with input, instructions, flat tools, and Responses parameters", async () => {
+    const body = {
+      model: "gpt-5", stream: true, max_output_tokens: 2048,
+      reasoning: { effort: "medium" }, instructions: "be helpful",
+      input: [{ role: "user", content: "question" }],
+      tools: [{ type: "function", name: "client_shell", parameters: { type: "object" } }],
+    };
+    const snapshot = buildUpstreamRequestSnapshot({
+      protocol: "responses", body, url: "https://api.example/v1/responses", model: "gpt-5", authSource: "agent",
+    });
+    const fetchImpl = vi.fn<typeof fetch>(async () => new Response(responseStream(), { status: 200, headers: { "content-type": "text/event-stream" } }));
+    const reenter = createRetainedExactTargetTransport({
+      capturedSnapshot: snapshot, headers: { authorization: "Bearer retained" }, timeoutMs: 5_000, fetchImpl,
+    });
+    const input = [...snapshot.baseMessages, { type: "function_call_output", call_id: "call_1", output: "ok" }];
+    await reenter({ upstreamSnapshot: snapshot, messages: input, round: 2, totalCalls: 1 });
+
+    const sent = JSON.parse(fetchImpl.mock.calls[0][1]?.body as string) as Record<string, unknown>;
+    expect(sent).toMatchObject({
+      model: "gpt-5", stream: true, max_output_tokens: 2048,
+      reasoning: { effort: "medium" }, instructions: "be helpful", input,
+    });
+    expect(sent).not.toHaveProperty("messages");
+  });
+});

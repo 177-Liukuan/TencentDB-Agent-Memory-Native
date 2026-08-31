@@ -54,6 +54,15 @@ import { trackWrite, withL0Retry } from "./tdai/pending-writes.js";
 import type { TdaiIdentity, TdaiMessage } from "./tdai/types.js";
 import { triggerSkillExtractIfReady } from "./skill/handler-glue.js";
 import { isExtractionAllowed, logExtractionSkipped } from "./extraction-gate.js";
+import { describeNativeProxyToolInjectionFailure } from "./native-proxy-tools/native-proxy-tools-injector.js";
+import { getNativeProxyToolRuntime } from "./native-proxy-tools/runtime.js";
+import { commitContextCompressionCheckpoint, prepareContextCompression } from "./native-proxy-tools/context-compression.js";
+import {
+  buildResponsesNativeRequestContext,
+  resumeResponsesNativeToolLoop,
+  runResponsesNativeToolLoop,
+  type ResponsesNativeRequestContext,
+} from "./native-proxy-tools/responses-handler-runtime.js";
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -344,6 +353,29 @@ export async function handleCodexEndpoint(
   // ── 5. Aux passthrough ─────────────────────────────────────────────────────
   if (isAuxiliary) {
     pipe.info("CODEX_AUX", `auxiliary request → passthrough (path=${path})`);
+    if (path.endsWith("/responses/compact") && config.nativeProxyTools.enabled) {
+      const compactSessionId = extractCodexSessionId(headers, body);
+      const compactRequest = compactSessionId ? buildResponsesNativeRequestContext({
+        config, spaceId, userId, agentSource: "codex", sessionId: compactSessionId,
+        turnSeq: countHumanTurnsCodex(body.input), eligible: true,
+      }) : null;
+      if (compactRequest) {
+        try {
+          const runtime = getNativeProxyToolRuntime(config);
+          await runtime.ready();
+          if (!runtime.storage) throw new Error("Native Proxy Tool storage is unavailable");
+          const preparation = await prepareContextCompression({ body, scope: compactRequest.scope, storage: runtime.storage });
+          if (preparation) {
+            const response = await forwardToUpstream(c, config, preparation.body, traceId, startTime, keyId, modelId, pipe, null);
+            const completed = response.ok && (await response.clone().text()).includes("response.completed");
+            if (completed) await commitContextCompressionCheckpoint({ preparation, storage: runtime.storage });
+            return response;
+          }
+        } catch (error) {
+          return c.json({ error: { type: "api_error", code: "native_tool_compression_failed", message: error instanceof Error ? error.message : String(error) } }, 503);
+        }
+      }
+    }
     // aux 不上报 langfuse（跟 CC/CB 对齐——sidequery/fork 类 aux 不算真对话轮）
     return forwardToUpstream(c, config, body, traceId, startTime, keyId, modelId, pipe, null);
   }
@@ -705,6 +737,25 @@ export async function handleCodexEndpoint(
     }
   }
 
+  const nativeRequest = buildResponsesNativeRequestContext({
+    config, spaceId, userId, agentSource, sessionId: sessionKey, sessionInfo, turnSeq,
+    eligible: body.stream === true && !injectionSkipped && Boolean(sessionInfo),
+  });
+  const resumedNativeResponse = await resumeResponsesNativeToolLoop({
+    config,
+    body,
+    request: nativeRequest,
+    model: typeof body.model === "string" ? body.model : modelId,
+    agentSource,
+    requestPath: c.req.path,
+    sessionId: sessionKey,
+    currentRequestHeaders: headers,
+  }).catch((error: unknown) => new Response(JSON.stringify({ error: {
+    type: "api_error", code: "native_tool_state_unavailable",
+    message: error instanceof Error ? error.message : String(error),
+  } }), { status: 503, headers: { "content-type": "application/json" } }));
+  if (resumedNativeResponse) return resumedNativeResponse;
+
   // ── 9. Asset injection (every turn, no caching) ────────────────────────────
   // Only inject when session is initialized and not bypassed.
   //
@@ -715,7 +766,9 @@ export async function handleCodexEndpoint(
   //
   // This reuses 100% of the existing pipeline infrastructure (hook cache,
   // prewarm, all injectors) without writing a third protocol adapter.
-  if (!injectionSkipped && sessionInfo && config.injection?.enabled && (config.injection.injectors?.length ?? 0) > 0) {
+  if (!injectionSkipped && sessionInfo && config.injection?.enabled && (
+    (config.injection.injectors?.length ?? 0) > 0 || config.nativeProxyTools.enabled
+  )) {
     try {
       const { getInjectionPipeline } = await import("./injection/index.js");
       const pipeline = getInjectionPipeline(config);
@@ -739,20 +792,12 @@ export async function handleCodexEndpoint(
         sessionKey,
       );
 
-      // Build a synthetic OpenAI body that the pipeline can parse/serialize.
-      // The pipeline's OpenAI adapter reads `body.messages` and injects
-      // text into the system message. We use a single system message as
-      // the injection target; all injected text ends up there.
-      const syntheticBody: Record<string, unknown> = {
-        messages: [
-          { role: "system", content: sessionContextBlock ?? "" },
-          { role: "user", content: "." },
-        ],
-        model: modelId,
-      };
-
-      const injectedBody = await pipeline.process(syntheticBody, {
-        protocol: "openai",
+      const originalInstructions = typeof body.instructions === "string" ? body.instructions : "";
+      const requestBody = sessionContextBlock
+        ? { ...body, instructions: [originalInstructions, sessionContextBlock].filter(Boolean).join("\n") }
+        : body;
+      body = await pipeline.process(requestBody, {
+        protocol: "responses",
         traceId,
         keyId,
         modelId: modelId as string,
@@ -763,26 +808,16 @@ export async function handleCodexEndpoint(
         sessionKey,
         turnSeq: 0,
         requestPath: c.req.path,
-        custom: { session: sessionInfo, userKey: callerUserKey ?? undefined, assetCapabilities },
+        custom: {
+          session: sessionInfo,
+          userKey: callerUserKey ?? undefined,
+          assetCapabilities,
+          nativeProxyEligible: body.stream === true,
+        },
       });
-
-      // Extract injected content from the synthetic body's system message.
-      // The pipeline appends to `messages[0].content` (system message).
-      const injectedMessages = injectedBody.messages as Array<Record<string, unknown>> | undefined;
-      const sysMsg = injectedMessages?.[0];
-      const injectedText = typeof sysMsg?.content === "string" ? sysMsg.content : "";
-
-      if (injectedText.length > 0) {
-        // Pipeline 产出的 injectedText 已经是**成品 XML 文本**（含
-        // <available_skills> / <user_memory> / <tdai_profile_memory>
-        // 等参考资产 tag)，
-        // 与 CC / CB 客户端在 system message 里看到的内容字节一致。
-        // 走 raw 模式原样嵌入 <tdai_injections> wrapper 内层——不再套
-        // 内层 <available_skills> tag，也不 escape 内容里的 XML tag，
-        // 否则模型看到的会是转义字符（`&lt;user_memory&gt;`）读不出结构。
-        body = injectCodexAssets(body, { raw: injectedText });
-      }
     } catch (err: unknown) {
+      const nativeFailure = describeNativeProxyToolInjectionFailure(err);
+      if (nativeFailure) return c.json({ error: nativeFailure }, 400);
       console.error("[codex] injection pipeline error:", err instanceof Error ? err.message : String(err));
       // Degrade gracefully: forward without injection
     }
@@ -807,7 +842,7 @@ export async function handleCodexEndpoint(
   });
 
   // ── 11. Forward to upstream ────────────────────────────────────────────────
-  return forwardToUpstream(c, config, body, traceId, startTime, keyId, modelId, pipe, lf, archiveCtx);
+  return forwardToUpstream(c, config, body, traceId, startTime, keyId, modelId, pipe, lf, archiveCtx, nativeRequest);
 }
 
 // ── Archive context (skill/conversation/add + TDAI L0 write) ─────────────────
@@ -951,6 +986,7 @@ async function forwardToUpstream(
   pipe: ReturnType<typeof createPipeline>,
   lf: LangfuseTurnContext | null,
   archiveCtx: CodexArchiveCtx | null = null,
+  nativeRequest: ResponsesNativeRequestContext | null = null,
 ): Promise<Response> {
   // Per-agent upstream override (upstream.agents.codex.url) 优先于全局 url。
   // 对齐 anthropicHandler.ts:1029 的解析姿势。codex 通常需要单独指向支持
@@ -1045,6 +1081,22 @@ async function forwardToUpstream(
       headers: filterResponseHeaders(upstreamResp.headers),
     });
   }
+
+  const nativeResponse = await runResponsesNativeToolLoop({
+    config,
+    body,
+    upstreamResponse: upstreamResp,
+    upstreamUrl,
+    upstreamHeaders,
+    model: typeof body.model === "string" ? body.model : modelId,
+    authSource: agentUpstreamEntry?.apiKey
+      ? "agent"
+      : config.upstream.apiKey ? "global" : "client",
+    request: nativeRequest,
+  }).catch((error: unknown) => new Response(JSON.stringify({
+    error: { type: "api_error", code: "native_tool_coordination_failed", message: error instanceof Error ? error.message : String(error) },
+  }), { status: 503, headers: { "content-type": "application/json" } }));
+  if (nativeResponse) return nativeResponse;
 
   // 2xx: aux 场景 (lf=null && archiveCtx=null) 直接透传不 tap; 主对话场景 tap
   // 一份用于 langfuse 上报 + skill/L0 归档 hook (P1-P2 gap 修复)。

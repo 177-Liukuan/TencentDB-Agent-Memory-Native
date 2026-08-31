@@ -76,7 +76,7 @@ export interface AgentTool {
 /**
  * Protocol identifier.
  */
-export type Protocol = "openai" | "anthropic";
+export type Protocol = "openai" | "anthropic" | "responses";
 
 /**
  * Request-level metadata attached to every AgentContext.

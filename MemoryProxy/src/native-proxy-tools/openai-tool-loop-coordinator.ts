@@ -2,8 +2,8 @@ import { Buffer } from "node:buffer";
 import { randomUUID } from "node:crypto";
 
 import { isReplaySafeResponseHeader, type ToolExecutionStorageAdapter } from "../db/tool-execution-storage-adapter.js";
-import { OpenAIStreamParser, type OpenAIStreamSnapshot } from "../injection/adapters/openai-stream.js";
-import type { UnifiedToolCall } from "../injection/adapters/interface.js";
+import { OpenAIStreamParser } from "../injection/adapters/openai-stream.js";
+import type { ProtocolStreamEvent, UnifiedToolCall } from "../injection/adapters/interface.js";
 import { assertNoNativeToolLeak, buildNativeRegistryLeakMarkers, mergeNativeToolLeakMarkers } from "./anthropic-response-rebuilder.js";
 import type { NativeProxyToolDispatcher } from "./native-proxy-tool-dispatcher.js";
 import { buildClientVisibleOpenAISse, buildOpenAIToolMessages } from "./openai-response-rebuilder.js";
@@ -26,10 +26,30 @@ export interface OpenAIToolLoopRoundInput extends UpstreamRound {
   parentReentryAttempt?: number;
 }
 
+export interface ToolStreamSnapshot {
+  rawBytes: Uint8Array;
+  messageCompleted: boolean;
+  toolCalls: UnifiedToolCall[];
+}
+
+export interface ToolStreamParser {
+  push(chunk: Uint8Array): ProtocolStreamEvent[];
+  finish(): ProtocolStreamEvent[];
+  snapshot(): ToolStreamSnapshot;
+}
+
+export interface ToolLoopProtocolCodec {
+  protocol: "openai" | "responses";
+  createParser(registry: NativeProxyToolRegistry): ToolStreamParser;
+  assistantSkeleton(snapshot: ToolStreamSnapshot): JsonValue[];
+  buildToolMessages(snapshot: ToolStreamSnapshot, slots: readonly ToolCallSlot[]): JsonValue[];
+  buildClientVisibleSse(rawBytes: Uint8Array, proxyIndexes: ReadonlySet<number>): Uint8Array;
+}
+
 export type OpenAIToolLoopDecision =
-  | { kind: "replay" | "final"; bytes: Uint8Array; status: number; headers: Headers; rounds: OpenAIStreamSnapshot[]; observationStateKey?: ToolExecutionStateKey }
-  | { kind: "client_dispatch"; stateKey: ToolExecutionStateKey; bytes: Uint8Array; status: number; headers: Headers; rounds: OpenAIStreamSnapshot[] }
-  | { kind: "error"; code: string; message: string; bytes: Uint8Array; status: number; headers: Headers; rounds: OpenAIStreamSnapshot[] };
+  | { kind: "replay" | "final"; bytes: Uint8Array; status: number; headers: Headers; rounds: ToolStreamSnapshot[]; observationStateKey?: ToolExecutionStateKey }
+  | { kind: "client_dispatch"; stateKey: ToolExecutionStateKey; bytes: Uint8Array; status: number; headers: Headers; rounds: ToolStreamSnapshot[] }
+  | { kind: "error"; code: string; message: string; bytes: Uint8Array; status: number; headers: Headers; rounds: ToolStreamSnapshot[] };
 
 export interface OpenAIToolLoopCoordinatorOptions {
   registry: NativeProxyToolRegistry;
@@ -49,6 +69,8 @@ export interface OpenAIToolLoopCoordinatorOptions {
     status: number;
     headers: Headers;
   }): Promise<void>;
+  /** Internal extension point used by the distinct OpenAI Responses adapter. */
+  codec?: ToolLoopProtocolCodec;
 }
 
 class OpenAICoordinatorFailure extends Error {
@@ -86,11 +108,19 @@ export class OpenAIToolLoopCoordinator {
   private readonly now: () => Date;
   private readonly createId: () => string;
   private readonly maxStorageAttempts: number;
+  private readonly codec: ToolLoopProtocolCodec;
 
   constructor(private readonly options: OpenAIToolLoopCoordinatorOptions) {
     this.now = options.now ?? (() => new Date());
     this.createId = options.createId ?? randomUUID;
     this.maxStorageAttempts = options.maxStorageAttempts ?? 8;
+    this.codec = options.codec ?? {
+      protocol: "openai",
+      createParser: (registry) => new OpenAIStreamParser(registry),
+      assistantSkeleton: (snapshot) => assistantSkeleton(snapshot.toolCalls),
+      buildToolMessages: (_snapshot, persistedSlots) => buildOpenAIToolMessages(persistedSlots),
+      buildClientVisibleSse: buildClientVisibleOpenAISse,
+    };
   }
 
   async handleRound(input: OpenAIToolLoopRoundInput): Promise<OpenAIToolLoopDecision> {
@@ -115,7 +145,17 @@ export class OpenAIToolLoopCoordinator {
       await this.drain(input.stream).catch(() => {});
       return this.error("upstream_non_2xx", "OpenAI upstream returned an error response", input.status, []);
     }
-    const parser = new OpenAIStreamParser(this.options.registry);
+    const parser = this.codec.createParser(this.options.registry);
+    let streamingStateKey: ToolExecutionStateKey | undefined;
+    const executionTasks = new Map<string, Promise<void>>();
+    const scheduleExecution = (call: UnifiedToolCall): void => {
+      if (!streamingStateKey || executionTasks.has(call.callId)) return;
+      const operation = () => this.executeAndPersist(call, input.scope, streamingStateKey!);
+      const task = (this.options.trackBackgroundOperation
+        ? this.options.trackBackgroundOperation(operation)
+        : operation()).catch(() => {});
+      executionTasks.set(call.callId, task);
+    };
     try {
       const reader = input.stream.getReader();
       try {
@@ -125,16 +165,43 @@ export class OpenAIToolLoopCoordinator {
           const events = parser.push(next.value);
           if (events.some((event) => event.type === "protocol_error")) {
             await reader.cancel().catch(() => {});
+            if (streamingStateKey) await this.abortStream(streamingStateKey);
             return this.error("upstream_stream_invalid", "OpenAI upstream returned an invalid event stream", 502, [parser.snapshot()]);
+          }
+          if (this.codec.protocol === "responses") {
+            for (const event of events) {
+              if (event.type !== "tool_call_completed") continue;
+              const partial = parser.snapshot();
+              const nativeCount = partial.toolCalls.filter((call) => call.owner === "proxy").length;
+              if (
+                input.round > this.options.limits.maxRounds
+                || nativeCount > this.options.limits.maxCallsPerRound
+                || input.totalCalls + nativeCount > this.options.limits.maxTotalCalls
+              ) {
+                await reader.cancel().catch(() => {});
+                return this.error("native_tool_limit_exceeded", "Native Proxy Tool loop limit exceeded", 400, [partial]);
+              }
+              if (event.call.owner === "proxy" && !streamingStateKey) {
+                streamingStateKey = await this.createBatch(input, partial.toolCalls, partial, "streaming");
+              } else if (streamingStateKey) {
+                await this.persistStreamSnapshot(streamingStateKey, partial, "streaming", input.totalCalls + nativeCount);
+              }
+              if (
+                event.call.owner === "proxy"
+                && this.options.registry.require(event.call.toolName).effect === "read"
+              ) scheduleExecution(event.call);
+            }
           }
         }
       } catch {
+        if (streamingStateKey) await this.abortStream(streamingStateKey);
         return this.error("upstream_stream_interrupted", "OpenAI upstream stream was interrupted", 502, [parser.snapshot()]);
       } finally {
         reader.releaseLock();
       }
       const finishEvents = parser.finish();
       if (finishEvents.some((event) => event.type === "protocol_error")) {
+        if (streamingStateKey) await this.abortStream(streamingStateKey);
         return this.error("upstream_stream_incomplete", "OpenAI upstream stream ended before the round boundary", 502, [parser.snapshot()]);
       }
       const snapshot = parser.snapshot();
@@ -152,19 +219,20 @@ export class OpenAIToolLoopCoordinator {
         || input.totalCalls + nativeCalls.length > this.options.limits.maxTotalCalls
       ) return this.error("native_tool_limit_exceeded", "Native Proxy Tool loop limit exceeded", 400, [snapshot]);
 
-      const stateKey = await this.createBatch(input, snapshot.toolCalls);
-      const executionTasks = new Map<string, Promise<void>>();
+      const stateKey = streamingStateKey ?? await this.createBatch(input, snapshot.toolCalls, snapshot);
+      if (streamingStateKey) {
+        await this.persistStreamSnapshot(stateKey, snapshot, "completed", input.totalCalls + nativeCalls.length);
+      }
       for (const call of nativeCalls) {
-        const operation = () => this.executeAndPersist(call, input.scope, stateKey);
-        const task = (this.options.trackBackgroundOperation
-          ? this.options.trackBackgroundOperation(operation)
-          : operation()).catch(() => {});
-        executionTasks.set(call.callId, task);
+        if (!executionTasks.has(call.callId)) {
+          streamingStateKey = stateKey;
+          scheduleExecution(call);
+        }
       }
       const totalCalls = input.totalCalls + nativeCalls.length;
       if (clientCalls.length > 0) {
         await this.options.beforeClientDispatch?.();
-        const bytes = buildClientVisibleOpenAISse(snapshot.rawBytes, new Set(nativeCalls.map((call) => call.contentBlockIndex)));
+        const bytes = this.codec.buildClientVisibleSse(snapshot.rawBytes, new Set(nativeCalls.map((call) => call.contentBlockIndex)));
         assertNoNativeToolLeak(bytes, [...nativeCalls, ...buildNativeRegistryLeakMarkers(this.options.registry)]);
         const outcome = persistedResponse(bytes, input.status, input.headers);
         const pending = await this.transitionDispatch(stateKey, "none", "pending", outcome);
@@ -188,7 +256,7 @@ export class OpenAIToolLoopCoordinator {
       }
       const messages = [
         ...structuredClone(input.upstreamSnapshot.baseMessages),
-        ...buildOpenAIToolMessages(context.slots),
+        ...this.codec.buildToolMessages(snapshot, context.slots),
       ];
       await this.options.beforeReenter?.();
       const next = await this.options.reenter({
@@ -215,18 +283,24 @@ export class OpenAIToolLoopCoordinator {
         : nextDecision;
       return { ...observable, rounds: [snapshot, ...observable.rounds] };
     } catch (error) {
+      if (streamingStateKey) await this.abortStream(streamingStateKey);
       if (error instanceof OpenAICoordinatorFailure) return this.error(error.code, error.message, error.status, [parser.snapshot()]);
       return this.error("native_tool_state_unavailable", "Native Proxy Tool coordination failed", 503, [parser.snapshot()]);
     }
   }
 
-  private async createBatch(input: OpenAIToolLoopRoundInput, calls: readonly UnifiedToolCall[]): Promise<ToolExecutionStateKey> {
+  private async createBatch(
+    input: OpenAIToolLoopRoundInput,
+    calls: readonly UnifiedToolCall[],
+    snapshot?: ToolStreamSnapshot,
+    responseStreamStatus: ToolExecutionContext["responseStreamStatus"] = "completed",
+  ): Promise<ToolExecutionStateKey> {
     const timestamp = this.now();
     const key = { ...input.scope, toolBatchId: this.createId() };
     const context: ToolExecutionContext = {
-      key, turnSeq: input.turnSeq, protocol: "openai", round: input.round,
+      key, turnSeq: input.turnSeq, protocol: this.codec.protocol, round: input.round,
       totalCalls: input.totalCalls + calls.filter((call) => call.owner === "proxy").length,
-      assistantSkeleton: assistantSkeleton(calls), slots: slots(calls), responseStreamStatus: "completed",
+      assistantSkeleton: snapshot ? this.codec.assistantSkeleton(snapshot) : assistantSkeleton(calls), slots: slots(calls), responseStreamStatus,
       clientDispatchStatus: "none", upstreamSnapshot: structuredClone(input.upstreamSnapshot), revision: 0,
       ...(input.parentStateKey && input.parentReentryAttempt !== undefined
         ? { parentStateKey: structuredClone(input.parentStateKey), parentReentryAttempt: input.parentReentryAttempt }
@@ -236,6 +310,36 @@ export class OpenAIToolLoopCoordinator {
     };
     await this.options.storage.create(context);
     return key;
+  }
+
+  private async persistStreamSnapshot(
+    key: ToolExecutionStateKey,
+    snapshot: ToolStreamSnapshot,
+    responseStreamStatus: ToolExecutionContext["responseStreamStatus"],
+    totalCalls: number,
+  ): Promise<void> {
+    for (let attempt = 0; attempt < this.maxStorageAttempts; attempt++) {
+      const current = await this.options.storage.get(key);
+      if (!current) throw new OpenAICoordinatorFailure("native_tool_state_unavailable", "Native Proxy Tool state disappeared", 503);
+      if (await this.options.storage.compareAndSetStreamSnapshot({
+        key,
+        expectedRevision: current.revision,
+        assistantSkeleton: this.codec.assistantSkeleton(snapshot),
+        slots: slots(snapshot.toolCalls),
+        responseStreamStatus,
+        totalCalls,
+      })) return;
+    }
+    throw new OpenAICoordinatorFailure("native_tool_state_conflict", "Native Proxy Tool stream state could not be persisted", 503);
+  }
+
+  private async abortStream(key: ToolExecutionStateKey): Promise<void> {
+    for (let attempt = 0; attempt < this.maxStorageAttempts; attempt++) {
+      const current = await this.options.storage.get(key);
+      if (!current || current.responseStreamStatus === "aborted") return;
+      if (current.responseStreamStatus !== "streaming") return;
+      if (await this.options.storage.markAborted(key, current.revision)) return;
+    }
   }
 
   private async executeAndPersist(call: UnifiedToolCall, scope: ToolExecutionScope, key: ToolExecutionStateKey): Promise<void> {
@@ -298,7 +402,7 @@ export class OpenAIToolLoopCoordinator {
     try { while (!(await reader.read()).done) { /* consume */ } } finally { reader.releaseLock(); }
   }
 
-  private error(code: string, message: string, status: number, rounds: OpenAIStreamSnapshot[]): OpenAIToolLoopDecision {
+  private error(code: string, message: string, status: number, rounds: ToolStreamSnapshot[]): OpenAIToolLoopDecision {
     return {
       kind: "error", code, message, status, rounds,
       bytes: new TextEncoder().encode(JSON.stringify({ error: { type: status >= 500 ? "api_error" : "invalid_request_error", code, message } })),
