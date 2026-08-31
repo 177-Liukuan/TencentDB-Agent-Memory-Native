@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  buildLangfuseInput,
   buildRetryBody,
   buildUpstreamBody,
   sanitizeThinkingBlocks,
@@ -150,5 +151,33 @@ describe("Anthropic upstream session-init cleanup", () => {
         content: [{ type: "text", text: "original request" }],
       }],
     });
+  });
+});
+
+describe("Anthropic Langfuse debug input", () => {
+  const messages = [{ role: "user", content: [{ type: "text", text: "hello", cache_control: { type: "ephemeral" } }] }];
+  const tools = [{ name: "skill_view", description: "View a skill", input_schema: { type: "object", required: ["skill_name"] } }];
+
+  it("captures complete injected system/messages/tools for non-streaming requests", () => {
+    const system = [{ type: "text", text: "injected system", cache_control: { type: "ephemeral" } }];
+    const snapshot = structuredClone({ system, messages, tools });
+
+    expect(buildLangfuseInput(messages, system, true, tools)).toEqual(snapshot);
+    expect({ system, messages, tools }).toEqual(snapshot);
+  });
+
+  it("captures the same complete shape for streaming requests", () => {
+    expect(buildLangfuseInput(messages, "stream system", true, tools)).toEqual({
+      system: "stream system",
+      messages,
+      tools,
+    });
+  });
+
+  it("does not add tools or change the compact normal-mode payload", () => {
+    expect(buildLangfuseInput(messages, "system", false, tools)).toEqual([
+      { role: "system", content: "system" },
+      { role: "user", content: "hello" },
+    ]);
   });
 });

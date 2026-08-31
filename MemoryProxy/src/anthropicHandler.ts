@@ -125,24 +125,23 @@ function stringifyAnthropicSystem(system: unknown): string {
  *   arrays are stringified for compact display. Loses `cache_control` markers,
  *   `thinking` blocks with signatures, native `tool_use`/`tool_result` shape.
  *
- * - Debug mode (`langfuse.debug=true`): passes the raw Anthropic body straight
- *   through, preserving every native structure. Use when investigating cache
- *   markers, thinking-signature issues, or request classification. Costs 2-5x
- *   more upload bandwidth + Langfuse storage — leave off in production.
+ * - Debug mode (`langfuse.debug=true`): reports the three model-input fields as
+ *   `{system, messages, tools}`, preserving every native structure. Use when
+ *   investigating cache markers, thinking-signature issues, injected tool
+ *   schemas, or request classification. Costs 2-5x more upload bandwidth +
+ *   Langfuse storage — leave off in production.
  */
 export function buildLangfuseInput(
   messages: unknown[],
   system: unknown,
   debug: boolean,
+  tools?: unknown,
 ): unknown {
   if (debug) {
-    // Preserve original shape end-to-end. Prepend a synthetic system message
-    // when it's non-empty so the display order matches other consumers.
-    const out: unknown[] = [];
-    if (system !== undefined && system !== null && system !== "") {
-      out.push({ role: "system", content: system });
-    }
-    return out.concat(messages);
+    // Preserve the actual post-injection Anthropic request fields. Do not
+    // normalize or clone here: the tracing SDK serializes the value, while the
+    // upstream body keeps the exact same references and bytes as before.
+    return { system, messages, tools: Array.isArray(tools) ? tools : [] };
   }
   return flattenAnthropicMessagesForOpik(messages, system);
 }
@@ -1230,7 +1229,7 @@ export async function handleAnthropicMessages(
       model: target.model,
       startTime,
       endTime: new Date().toISOString(),
-      input: buildLangfuseInput(messages, body.system, langfuseDebug),
+      input: buildLangfuseInput(messages, body.system, langfuseDebug, body.tools),
       statusMessage: err instanceof Error ? err.message : "Upstream request failed",
       extraTags: ["error"],
       observationMetadata: { stage: "forward", ...debugMetadata },
@@ -1288,7 +1287,7 @@ export async function handleAnthropicMessages(
         model: effectiveModel,
         startTime,
         endTime: new Date().toISOString(),
-        input: buildLangfuseInput(messages, body.system, langfuseDebug),
+        input: buildLangfuseInput(messages, body.system, langfuseDebug, body.tools),
         status: upstreamResp.status,
         statusMessage: errText.slice(0, 500),
         extraTags: ["error"],
@@ -1314,6 +1313,7 @@ export async function handleAnthropicMessages(
       startTime,
       inputMessages: messages,
       system: body.system,
+      tools: body.tools,
       retried,
       logMeta: retried ? { retrySuccess: true } : {},
       routedFrom,
@@ -1496,7 +1496,7 @@ export async function handleAnthropicMessages(
       model: effectiveModel,
       startTime,
       endTime,
-      input: buildLangfuseInput(messages, body.system, langfuseDebug),
+      input: buildLangfuseInput(messages, body.system, langfuseDebug, body.tools),
       output: langfuseOutput,
       usage,
       traceName: lf.traceName,
@@ -1515,7 +1515,7 @@ export async function handleAnthropicMessages(
       model: effectiveModel,
       startTime,
       endTime,
-      input: buildLangfuseInput(messages, body.system, langfuseDebug),
+      input: buildLangfuseInput(messages, body.system, langfuseDebug, body.tools),
       status: upstreamResp.status,
       statusMessage: respText.slice(0, 500),
       extraTags: ["error"],
@@ -1717,6 +1717,8 @@ interface AnthropicTapContext {
   inputMessages: unknown[];
   /** Anthropic top-level `system` field (string or content-block array). */
   system: unknown;
+  /** Actual post-injection Anthropic `tools` field sent upstream. */
+  tools: unknown;
   retried: boolean;
   logMeta: Record<string, unknown>;
   /** Requested model when the router forwarded elsewhere; "" otherwise. */
@@ -1855,7 +1857,7 @@ function consumeAnthropicStream(stream: ReadableStream<Uint8Array>, ctx: Anthrop
             model: modelId,
             startTime,
             endTime,
-            input: buildLangfuseInput(inputMessages, system, ctx.langfuseDebug),
+            input: buildLangfuseInput(inputMessages, system, ctx.langfuseDebug, ctx.tools),
             output: outputText ? { role: "assistant", content: outputText } : undefined,
             usage,
             traceName: lf.traceName,
