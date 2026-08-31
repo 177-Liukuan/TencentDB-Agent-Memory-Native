@@ -22,6 +22,8 @@ export interface OpenAIToolLoopRoundInput extends UpstreamRound {
   upstreamSnapshot: UpstreamRequestSnapshot;
   round: number;
   totalCalls: number;
+  parentStateKey?: ToolExecutionStateKey;
+  parentReentryAttempt?: number;
 }
 
 export type OpenAIToolLoopDecision =
@@ -39,6 +41,14 @@ export interface OpenAIToolLoopCoordinatorOptions {
   createId?: () => string;
   maxStorageAttempts?: number;
   trackBackgroundOperation?(operation: () => Promise<void>): Promise<void>;
+  beforeReenter?(): Promise<void>;
+  beforeClientDispatch?(): Promise<void>;
+  onClientDispatchPrepared?(dispatch: {
+    stateKey: ToolExecutionStateKey;
+    bytes: Uint8Array;
+    status: number;
+    headers: Headers;
+  }): Promise<void>;
 }
 
 class OpenAICoordinatorFailure extends Error {
@@ -153,10 +163,19 @@ export class OpenAIToolLoopCoordinator {
       }
       const totalCalls = input.totalCalls + nativeCalls.length;
       if (clientCalls.length > 0) {
+        await this.options.beforeClientDispatch?.();
         const bytes = buildClientVisibleOpenAISse(snapshot.rawBytes, new Set(nativeCalls.map((call) => call.contentBlockIndex)));
         assertNoNativeToolLeak(bytes, [...nativeCalls, ...buildNativeRegistryLeakMarkers(this.options.registry)]);
         const outcome = persistedResponse(bytes, input.status, input.headers);
         const pending = await this.transitionDispatch(stateKey, "none", "pending", outcome);
+        if (pending) {
+          await this.options.onClientDispatchPrepared?.({
+            stateKey,
+            bytes,
+            status: input.status,
+            headers: new Headers(input.headers),
+          });
+        }
         const dispatched = pending && await this.transitionDispatch(stateKey, "pending", "dispatched");
         if (!dispatched) return this.error("client_tool_dispatch_conflict", "Client Tool batch has already been dispatched", 409, [snapshot]);
         return { kind: "client_dispatch", stateKey, bytes, status: input.status, headers: new Headers(input.headers), rounds: [snapshot] };
@@ -171,6 +190,7 @@ export class OpenAIToolLoopCoordinator {
         ...structuredClone(input.upstreamSnapshot.baseMessages),
         ...buildOpenAIToolMessages(context.slots),
       ];
+      await this.options.beforeReenter?.();
       const next = await this.options.reenter({
         upstreamSnapshot: structuredClone(input.upstreamSnapshot), messages: structuredClone(messages),
         round: input.round + 1, totalCalls,
@@ -185,6 +205,9 @@ export class OpenAIToolLoopCoordinator {
           ),
         },
         round: input.round + 1, totalCalls,
+        ...(input.parentStateKey && input.parentReentryAttempt !== undefined
+          ? { parentStateKey: input.parentStateKey, parentReentryAttempt: input.parentReentryAttempt }
+          : {}),
       }, true);
       assertNoNativeToolLeak(nextDecision.bytes, context.slots.filter((slot) => slot.owner === "proxy"));
       const observable = nextDecision.kind === "final" && !nextDecision.observationStateKey
@@ -205,6 +228,9 @@ export class OpenAIToolLoopCoordinator {
       totalCalls: input.totalCalls + calls.filter((call) => call.owner === "proxy").length,
       assistantSkeleton: assistantSkeleton(calls), slots: slots(calls), responseStreamStatus: "completed",
       clientDispatchStatus: "none", upstreamSnapshot: structuredClone(input.upstreamSnapshot), revision: 0,
+      ...(input.parentStateKey && input.parentReentryAttempt !== undefined
+        ? { parentStateKey: structuredClone(input.parentStateKey), parentReentryAttempt: input.parentReentryAttempt }
+        : {}),
       expiresAt: new Date(timestamp.getTime() + this.options.limits.stateTtlSeconds * 1_000).toISOString(),
       createdAt: timestamp.toISOString(), updatedAt: timestamp.toISOString(),
     };

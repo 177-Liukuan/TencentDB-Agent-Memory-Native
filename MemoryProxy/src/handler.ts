@@ -63,6 +63,7 @@ import {
 import {
   completeClientToolReentry,
   createPersistedClientReentryOutcome,
+  renewClientToolReentry,
   resumeClientToolResults,
 } from "./native-proxy-tools/client-tool-resume.js";
 import { describeNativeProxyToolInjectionFailure } from "./native-proxy-tools/native-proxy-tools-injector.js";
@@ -1204,9 +1205,19 @@ export async function handleChatCompletions(
       });
     }
     if (resume.kind === "reentered") {
+      const reentryLeaseMs = (config.server.forwardTimeoutMs ?? 600_000)
+        + config.nativeProxyTools.toolTimeoutMs * 2;
+      const renewParentReentry = () => renewClientToolReentry(
+        nativeStorage,
+        resume.stateKey,
+        resume.reentryLeaseOwner,
+        reentryLeaseMs,
+      );
+      await renewParentReentry();
       const exactReentry = (request: Parameters<typeof restartReentry>[0]) => (
         (selectedReentry ?? restartReentry)(request)
       );
+      let parentContinuationCommitted = false;
       const coordinator = new OpenAIToolLoopCoordinator({
         registry: nativeToolRuntime.registry,
         storage: nativeStorage,
@@ -1214,6 +1225,23 @@ export async function handleChatCompletions(
         limits: config.nativeProxyTools,
         reenter: exactReentry,
         trackBackgroundOperation: (operation) => nativeToolRuntime.trackBackgroundOperation(operation),
+        beforeReenter: renewParentReentry,
+        beforeClientDispatch: renewParentReentry,
+        onClientDispatchPrepared: async (dispatch) => {
+          await completeClientToolReentry(
+            nativeStorage,
+            resume.stateKey,
+            resume.reentryLeaseOwner,
+            createPersistedClientReentryOutcome({
+              kind: "client_dispatch",
+              status: dispatch.status,
+              headers: dispatch.headers,
+              bytes: dispatch.bytes,
+              childStateKey: dispatch.stateKey,
+            }),
+          );
+          parentContinuationCommitted = true;
+        },
       });
       const decision = await nativeToolRuntime.runOperation(() => coordinator.handleRound({
         ...resume.upstreamRound,
@@ -1222,19 +1250,23 @@ export async function handleChatCompletions(
         upstreamSnapshot: resume.upstreamSnapshot,
         round: resume.round,
         totalCalls: resume.totalCalls,
+        parentStateKey: resume.stateKey,
+        parentReentryAttempt: resume.reentryAttempt,
       }));
-      await completeClientToolReentry(
-        nativeStorage,
-        resume.stateKey,
-        resume.reentryLeaseOwner,
-        createPersistedClientReentryOutcome({
-          kind: decision.kind,
-          status: decision.status,
-          headers: decision.headers,
-          bytes: decision.bytes,
-          ...(decision.kind === "client_dispatch" ? { childStateKey: decision.stateKey } : {}),
-        }),
-      );
+      if (!parentContinuationCommitted) {
+        await completeClientToolReentry(
+          nativeStorage,
+          resume.stateKey,
+          resume.reentryLeaseOwner,
+          createPersistedClientReentryOutcome({
+            kind: decision.kind,
+            status: decision.status,
+            headers: decision.headers,
+            bytes: decision.bytes,
+            ...(decision.kind === "client_dispatch" ? { childStateKey: decision.stateKey } : {}),
+          }),
+        );
+      }
       if (decision.kind === "client_dispatch") {
         nativeToolRuntime.retainExactTarget(decision.stateKey, exactReentry);
       }
