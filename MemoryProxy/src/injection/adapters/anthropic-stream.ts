@@ -77,12 +77,14 @@ function joinBytes(chunks: readonly Uint8Array[]): Uint8Array {
 function findFrameBoundary(bytes: Uint8Array): number {
   let lineStart = 0;
   for (let index = 0; index < bytes.byteLength; index++) {
-    if (bytes[index] !== 0x0a) continue;
-    const contentEnd = index > lineStart && bytes[index - 1] === 0x0d
-      ? index - 1
-      : index;
-    if (contentEnd === lineStart) return index + 1;
-    lineStart = index + 1;
+    const byte = bytes[index];
+    if (byte !== 0x0a && byte !== 0x0d) continue;
+    const terminatorEnd = byte === 0x0d && bytes[index + 1] === 0x0a
+      ? index + 2
+      : index + 1;
+    if (index === lineStart) return terminatorEnd;
+    lineStart = terminatorEnd;
+    index = terminatorEnd - 1;
   }
   return -1;
 }

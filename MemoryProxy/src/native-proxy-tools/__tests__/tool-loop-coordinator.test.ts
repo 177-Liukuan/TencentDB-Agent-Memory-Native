@@ -117,7 +117,7 @@ function visibleToolStarts(bytes: Uint8Array): Array<{ index: number; id: string
     }));
 }
 
-function finalFixture(): Uint8Array {
+function finalFixture(text = "final answer"): Uint8Array {
   return concat(
     messageStart(),
     frame("content_block_start", {
@@ -128,7 +128,7 @@ function finalFixture(): Uint8Array {
     frame("content_block_delta", {
       type: "content_block_delta",
       index: 0,
-      delta: { type: "text_delta", text: "final answer" },
+      delta: { type: "text_delta", text },
     }),
     frame("content_block_stop", { type: "content_block_stop", index: 0 }),
     messageStop("end_turn"),
@@ -227,6 +227,14 @@ function coordinatorHarness(options: {
   execute?: (call: UnifiedToolCall, context: ToolExecutionScope) => Promise<NativeToolResult>;
   reenter?: (request: NativeReentryRequest) => Promise<UpstreamRound>;
   configure?: (config: typeof DEFAULT_CONFIG) => void;
+  beforeReenter?: () => Promise<void>;
+  beforeClientDispatch?: () => Promise<void>;
+  onClientDispatchPrepared?: (dispatch: {
+    stateKey: import("../types.js").ToolExecutionStateKey;
+    bytes: Uint8Array;
+    status: number;
+    headers: Headers;
+  }) => Promise<void>;
 } = {}) {
   const config = structuredClone(DEFAULT_CONFIG);
   config.nativeProxyTools.enabled = true;
@@ -248,6 +256,9 @@ function coordinatorHarness(options: {
     dispatcher: { execute },
     limits: config.nativeProxyTools,
     reenter,
+    beforeReenter: options.beforeReenter,
+    beforeClientDispatch: options.beforeClientDispatch,
+    onClientDispatchPrepared: options.onClientDispatchPrepared,
     now: () => fixedNow,
     createId: () => `id-${++sequence}`,
   });
@@ -287,6 +298,21 @@ describe("AnthropicToolLoopCoordinator", () => {
     expect(reenter).not.toHaveBeenCalled();
   });
 
+  it("fails closed when an otherwise ordinary response echoes the Native Registry", async () => {
+    const { coordinator } = coordinatorHarness();
+
+    const decision = await coordinator.handleRound(roundInput(byteStream(
+      finalFixture("available tool: tdai_memory_search"),
+    ).stream));
+
+    expect(decision).toMatchObject({
+      kind: "error",
+      code: "native_tool_leak_detected",
+      status: 500,
+    });
+    expect(decoder.decode(decision.bytes)).not.toContain("tdai_memory_search");
+  });
+
   it("starts Native execution after block stop and before message_stop", async () => {
     const gates = controlledNativeStream();
     const { coordinator, execute } = coordinatorHarness();
@@ -300,6 +326,17 @@ describe("AnthropicToolLoopCoordinator", () => {
     await expect(promise).resolves.toMatchObject({ kind: "final" });
   });
 
+  it("coordinates a CR-only Anthropic event stream without losing the final frame", async () => {
+    const crOnly = encoder.encode(decoder.decode(nativeFixture()).replaceAll("\n", "\r"));
+    const { coordinator, execute, reenter } = coordinatorHarness();
+
+    const decision = await coordinator.handleRound(roundInput(byteStream(crOnly).stream));
+
+    expect(decision).toMatchObject({ kind: "final", status: 200 });
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(reenter).toHaveBeenCalledTimes(1);
+  });
+
   it("persists Native results and re-enters with the first request snapshot", async () => {
     const source = byteStream(nativeFixture());
     const { coordinator, storage, reenter } = coordinatorHarness();
@@ -310,6 +347,7 @@ describe("AnthropicToolLoopCoordinator", () => {
     if (decision.kind === "final") {
       expect(decoder.decode(decision.bytes)).toContain("final answer");
       expect(decision.rounds).toHaveLength(2);
+      expect(decision.observationStateKey).toMatchObject({ toolBatchId: "id-1" });
     }
     expect(reenter).toHaveBeenCalledTimes(1);
     const request = reenter.mock.calls[0][0];
@@ -347,8 +385,51 @@ describe("AnthropicToolLoopCoordinator", () => {
     expect(states[0]).toMatchObject({
       responseStreamStatus: "completed",
       totalCalls: 1,
+      observationStatus: "pending",
+      observationOutcome: {
+        status: 200,
+        bodyBase64: expect.any(String),
+      },
       slots: [{ callId: "proxy-1", status: "succeeded" }],
     });
+  });
+
+  it("sanitizes an internal re-entry non-2xx body without parsing or leaking it", async () => {
+    const exactError = encoder.encode("{\"type\":\"error\",\"marker\":\"tdai_memory_search\"}");
+    const { coordinator } = coordinatorHarness({
+      reenter: async () => ({
+        stream: byteStream(exactError).stream,
+        status: 503,
+        headers: new Headers({ "content-type": "application/json", "x-request-id": "retry-error" }),
+      }),
+    });
+
+    const decision = await coordinator.handleRound(roundInput(byteStream(nativeFixture()).stream));
+
+    expect(decision).toMatchObject({
+      kind: "error",
+      code: "upstream_non_2xx",
+      status: 503,
+    });
+    expect(decision.bytes).not.toEqual(exactError);
+    expect(decoder.decode(decision.bytes)).not.toContain("tdai_memory_search");
+    expect(decision.headers.get("content-type")).toBe("application/json");
+    expect(decision.headers.has("x-request-id")).toBe(false);
+  });
+
+  it("fails closed if a later model round repeats a hidden Native identifier", async () => {
+    const { coordinator } = coordinatorHarness({
+      reenter: async () => ({
+        stream: byteStream(finalFixture("internal tool tdai_memory_search")).stream,
+        status: 200,
+        headers: new Headers({ "content-type": "text/event-stream" }),
+      }),
+    });
+
+    const decision = await coordinator.handleRound(roundInput(byteStream(nativeFixture()).stream));
+
+    expect(decision).toMatchObject({ kind: "error", code: "native_tool_state_unavailable" });
+    expect(decoder.decode(decision.bytes)).not.toContain("tdai_memory_search");
   });
 
   it("feeds a structured Native failure back as an Anthropic error result", async () => {
@@ -389,6 +470,25 @@ describe("AnthropicToolLoopCoordinator", () => {
     });
   });
 
+  it("renews the parent Client-result lease before every recursive model re-entry", async () => {
+    const beforeReenter = vi.fn(async () => {});
+    let reentryRound = 0;
+    const { coordinator, reenter } = coordinatorHarness({
+      beforeReenter,
+      reenter: async () => ({
+        stream: byteStream(++reentryRound === 1 ? nativeFixture() : finalFixture()).stream,
+        status: 200,
+        headers: new Headers({ "content-type": "text/event-stream" }),
+      }),
+    });
+
+    const decision = await coordinator.handleRound(roundInput(byteStream(nativeFixture()).stream));
+
+    expect(decision.kind).toBe("final");
+    expect(reenter).toHaveBeenCalledTimes(2);
+    expect(beforeReenter).toHaveBeenCalledTimes(2);
+  });
+
   it("dispatches only Client calls at message_stop for an interleaved mixed round", async () => {
     const releases = new Map<string, (result: NativeToolResult) => void>();
     const { coordinator, storage, execute, reenter } = coordinatorHarness({
@@ -427,19 +527,46 @@ describe("AnthropicToolLoopCoordinator", () => {
   });
 
   it("persists a Client-only continuation produced after a hidden Native round", async () => {
+    const beforeClientDispatch = vi.fn(async () => {});
+    let storageAtParentCommit:
+      | Awaited<ReturnType<InMemoryToolExecutionStorageAdapter["get"]>>
+      | undefined;
+    const parentStateKey = { ...scope(), toolBatchId: "parent-batch" };
+    const onClientDispatchPrepared = vi.fn(async (dispatch: {
+      stateKey: import("../types.js").ToolExecutionStateKey;
+    }) => {
+      storageAtParentCommit = await storage.get(dispatch.stateKey);
+    });
     const { coordinator, storage, reenter } = coordinatorHarness({
       reenter: async () => ({
         stream: byteStream(clientFixture()).stream,
         status: 200,
         headers: new Headers({ "content-type": "text/event-stream" }),
       }),
+      beforeClientDispatch,
+      onClientDispatchPrepared,
     });
 
-    const decision = await coordinator.handleRound(roundInput(byteStream(nativeFixture()).stream));
+    const decision = await coordinator.handleRound(roundInput(byteStream(nativeFixture()).stream, {
+      parentStateKey,
+      parentReentryAttempt: 3,
+    }));
 
     expect(decision.kind).toBe("client_dispatch");
     if (decision.kind !== "client_dispatch") throw new Error("expected Client dispatch");
     expect(reenter).toHaveBeenCalledTimes(1);
+    expect(beforeClientDispatch).toHaveBeenCalledTimes(1);
+    expect(onClientDispatchPrepared).toHaveBeenCalledTimes(1);
+    expect(storageAtParentCommit).toMatchObject({
+      clientDispatchStatus: "pending",
+      parentStateKey,
+      parentReentryAttempt: 3,
+      clientDispatchOutcome: {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+        bodyBase64: expect.any(String),
+      },
+    });
     expect(visibleToolStarts(decision.bytes)).toEqual([{ index: 0, id: "client-1" }]);
     const states = await storage.findActiveBySession(scope());
     expect(states).toHaveLength(2);
@@ -448,9 +575,65 @@ describe("AnthropicToolLoopCoordinator", () => {
       totalCalls: 1,
       responseStreamStatus: "completed",
       clientDispatchStatus: "dispatched",
+      parentStateKey,
+      parentReentryAttempt: 3,
+      clientDispatchOutcome: {
+        status: 200,
+        bodyBase64: expect.any(String),
+      },
       slots: [{ callId: "client-1", owner: "client", status: "pending" }],
+      upstreamSnapshot: {
+        nativeLeakMarkers: [{
+          callId: "proxy-1",
+          toolName: "tdai_memory_search",
+          input: { query: "rules-1" },
+        }],
+      },
     });
     expect(states[1].upstreamSnapshot.baseMessages).toHaveLength(3);
+  });
+
+  it("does not persist an internal Client continuation after its parent fence is lost", async () => {
+    const { coordinator, storage } = coordinatorHarness({
+      reenter: async () => ({
+        stream: byteStream(clientFixture()).stream,
+        status: 200,
+        headers: new Headers({ "content-type": "text/event-stream" }),
+      }),
+      beforeClientDispatch: async () => { throw new Error("parent lease lost"); },
+    });
+
+    await expect(coordinator.handleRound(roundInput(byteStream(nativeFixture()).stream)))
+      .resolves.toMatchObject({ kind: "error" });
+    const states = await storage.findActiveBySession(scope());
+    expect(states).toHaveLength(1);
+    expect(states[0].slots).toEqual([
+      expect.objectContaining({ callId: "proxy-1", owner: "proxy" }),
+    ]);
+  });
+
+  it("does not commit a parent continuation before its Client-visible bytes pass leak scanning", async () => {
+    const onClientDispatchPrepared = vi.fn(async () => {});
+    const unsafeClient = concat(
+      messageStart(),
+      toolFrames(0, "client-unsafe", "client_shell", { command: "tdai_memory_search" }),
+      messageStop(),
+    );
+    const { coordinator, storage } = coordinatorHarness({
+      reenter: async () => ({
+        stream: byteStream(unsafeClient).stream,
+        status: 200,
+        headers: new Headers({ "content-type": "text/event-stream" }),
+      }),
+      onClientDispatchPrepared,
+    });
+
+    const decision = await coordinator.handleRound(roundInput(byteStream(nativeFixture()).stream));
+
+    expect(decision).toMatchObject({ kind: "error", code: "native_tool_leak_detected" });
+    expect(onClientDispatchPrepared).not.toHaveBeenCalled();
+    const states = await storage.findActiveBySession(scope());
+    expect(states.at(-1)).toMatchObject({ clientDispatchStatus: "none" });
   });
 
   it("enforces per-round, total-call, and round limits before offending execution", async () => {

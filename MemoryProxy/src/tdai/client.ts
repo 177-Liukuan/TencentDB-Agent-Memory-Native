@@ -81,6 +81,12 @@ export interface AclCheckResult {
   reason?: string;
 }
 
+export interface TdaiConversationWriteOptions {
+  idempotencyKey?: string;
+  /** Durable outboxes need transport and envelope failures to be observable. */
+  requireSuccess?: boolean;
+}
+
 export class TdaiClient {
   constructor(private config: TdaiMemoryConfig) {}
 
@@ -88,8 +94,15 @@ export class TdaiClient {
     return this.config.enabled && !!this.config.endpoint;
   }
 
-  async addConversation(identity: TdaiIdentity, messages: TdaiMessage[]): Promise<void> {
-    if (!this.isEnabled() || !this.config.writeL0 || messages.length === 0) return;
+  async addConversation(
+    identity: TdaiIdentity,
+    messages: TdaiMessage[],
+    options: TdaiConversationWriteOptions = {},
+  ): Promise<void> {
+    if (!this.isEnabled() || !this.config.writeL0 || messages.length === 0) {
+      if (options.requireSuccess) throw new Error("TDAI durable write is unavailable");
+      return;
+    }
 
     const chunkedMessages = chunkConversationMessages(messages);
     log.info("tdai-recorder:write-l0", {
@@ -118,7 +131,14 @@ export class TdaiClient {
         },
         identity.sessionId,
         identity.taskId,
-        { includeSession: true, includeTask: true },
+        {
+          includeSession: true,
+          includeTask: true,
+          requireSuccess: options.requireSuccess,
+          ...(options.idempotencyKey
+            ? { idempotencyKey: `${options.idempotencyKey}:${offset / TDAI_CONVERSATION_MAX_MESSAGES}` }
+            : {}),
+        },
       );
     }
   }
@@ -267,7 +287,12 @@ export class TdaiClient {
     body: Record<string, unknown>,
     sessionId: string,
     taskId: string | undefined,
-    options: { includeSession: boolean; includeTask: boolean } = { includeSession: true, includeTask: true },
+    options: {
+      includeSession: boolean;
+      includeTask: boolean;
+      idempotencyKey?: string;
+      requireSuccess?: boolean;
+    } = { includeSession: true, includeTask: true },
   ): Promise<T> {
     const base = this.config.endpoint.replace(/\/$/, "");
     const controller = new AbortController();
@@ -283,6 +308,7 @@ export class TdaiClient {
       };
       if (options.includeSession && sessionId) headers["x-tdai-session-id"] = sessionId;
       if (options.includeTask && taskId) headers["x-tdai-task-id"] = taskId;
+      if (options.idempotencyKey) headers["Idempotency-Key"] = options.idempotencyKey;
 
       const res = await fetch(`${base}${path}`, {
         method: "POST",
@@ -290,11 +316,20 @@ export class TdaiClient {
         headers,
         body: JSON.stringify(stripUndefined(body)),
       });
-      if (!res.ok) return {} as T;
+      if (!res.ok) {
+        if (options.requireSuccess) throw new Error("TDAI durable write failed");
+        return {} as T;
+      }
       const envelope = await res.json() as TdaiEnvelope<T>;
-      if (typeof envelope.code === "number" && envelope.code !== 0) return {} as T;
+      if (typeof envelope.code === "number" && envelope.code !== 0) {
+        if (options.requireSuccess) throw new Error("TDAI durable write failed");
+        return {} as T;
+      }
       return (envelope.data ?? {}) as T;
-    } catch {
+    } catch (error) {
+      if (options.requireSuccess) {
+        throw new Error("TDAI durable write failed", { cause: error });
+      }
       return {} as T;
     } finally {
       clearTimeout(timer);

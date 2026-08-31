@@ -1,6 +1,10 @@
+import { Buffer } from "node:buffer";
 import { randomUUID } from "node:crypto";
 
-import type { ToolExecutionStorageAdapter } from "../db/tool-execution-storage-adapter.js";
+import {
+  isReplaySafeResponseHeader,
+  type ToolExecutionStorageAdapter,
+} from "../db/tool-execution-storage-adapter.js";
 import {
   AnthropicStreamParser,
   type AnthropicStreamSnapshot,
@@ -13,17 +17,23 @@ import {
   buildClientVisibleAnthropicSse,
   buildToolResultMessage,
   replayAnthropicBytes,
+  assertNoNativeToolLeak,
+  buildNativeRegistryLeakMarkers,
+  mergeNativeToolLeakMarkers,
 } from "./anthropic-response-rebuilder.js";
 import type { NativeProxyToolDispatcher } from "./native-proxy-tool-dispatcher.js";
 import type { NativeProxyToolRegistry } from "./tool-registry.js";
+import { nativeToolLeaseDurationMs } from "./types.js";
 import type {
   JsonValue,
   NativeProxyToolsConfig,
   NativeToolResult,
+  NativeToolLeakMarker,
   ToolCallSlot,
   ToolExecutionContext,
   ToolExecutionScope,
   ToolExecutionStateKey,
+  PersistedResponseSnapshot,
   UpstreamRequestSnapshot,
 } from "./types.js";
 
@@ -46,6 +56,9 @@ export interface ToolLoopRoundInput extends UpstreamRound {
   upstreamSnapshot: UpstreamRequestSnapshot;
   round: number;
   totalCalls: number;
+  /** Durable parent link for a continuation produced while resuming Client results. */
+  parentStateKey?: ToolExecutionStateKey;
+  parentReentryAttempt?: number;
 }
 
 interface ToolLoopBytesDecision {
@@ -57,7 +70,11 @@ interface ToolLoopBytesDecision {
 
 export type ToolLoopDecision =
   | ({ kind: "replay" } & ToolLoopBytesDecision)
-  | ({ kind: "final" } & ToolLoopBytesDecision)
+  | ({
+      kind: "final";
+      /** Last Native batch that durably owns logical-turn writeback. */
+      observationStateKey?: ToolExecutionStateKey;
+    } & ToolLoopBytesDecision)
   | ({
       kind: "client_dispatch";
       stateKey: ToolExecutionStateKey;
@@ -77,6 +94,18 @@ export interface AnthropicToolLoopCoordinatorOptions {
   now?: () => Date;
   createId?: () => string;
   maxStorageAttempts?: number;
+  trackBackgroundOperation?(operation: () => Promise<void>): Promise<void>;
+  /** Fence and extend a parent Client-result lease before each model re-entry. */
+  beforeReenter?(): Promise<void>;
+  /** Fence the parent lease before exposing a newly persisted Client batch. */
+  beforeClientDispatch?(): Promise<void>;
+  /** Commit the parent outbox before a prepared child continuation is dispatchable. */
+  onClientDispatchPrepared?(dispatch: {
+    stateKey: ToolExecutionStateKey;
+    bytes: Uint8Array;
+    status: number;
+    headers: Headers;
+  }): Promise<void>;
 }
 
 class CoordinatorFailure extends Error {
@@ -87,6 +116,21 @@ class CoordinatorFailure extends Error {
   ) {
     super(message);
     this.name = "CoordinatorFailure";
+  }
+}
+
+function assertSafeClientDispatch(
+  bytes: Uint8Array,
+  markers: readonly NativeToolLeakMarker[],
+): void {
+  try {
+    assertNoNativeToolLeak(bytes, markers);
+  } catch {
+    throw new CoordinatorFailure(
+      "native_tool_leak_detected",
+      "Native Proxy Tool response could not be returned safely",
+      500,
+    );
   }
 }
 
@@ -133,6 +177,23 @@ function genericExecutionError(): NativeToolResult {
   };
 }
 
+function persistResponseSnapshot(
+  bytes: Uint8Array,
+  status: number,
+  sourceHeaders: Headers,
+): PersistedResponseSnapshot {
+  const headers: Record<string, string> = {};
+  for (const [rawName, value] of sourceHeaders.entries()) {
+    const name = rawName.toLowerCase();
+    if (isReplaySafeResponseHeader(name)) headers[name] = value;
+  }
+  return {
+    status,
+    headers,
+    bodyBase64: Buffer.from(bytes).toString("base64"),
+  };
+}
+
 function appendBytes(left: Uint8Array, right: Uint8Array): Uint8Array {
   if (left.byteLength === 0) return right.slice();
   if (right.byteLength === 0) return left;
@@ -145,12 +206,14 @@ function appendBytes(left: Uint8Array, right: Uint8Array): Uint8Array {
 function findSseFrameBoundary(bytes: Uint8Array): number {
   let lineStart = 0;
   for (let index = 0; index < bytes.byteLength; index++) {
-    if (bytes[index] !== 0x0a) continue;
-    const contentEnd = index > lineStart && bytes[index - 1] === 0x0d
-      ? index - 1
-      : index;
-    if (contentEnd === lineStart) return index + 1;
-    lineStart = index + 1;
+    const byte = bytes[index];
+    if (byte !== 0x0a && byte !== 0x0d) continue;
+    const terminatorEnd = byte === 0x0d && bytes[index + 1] === 0x0a
+      ? index + 2
+      : index + 1;
+    if (index === lineStart) return terminatorEnd;
+    lineStart = terminatorEnd;
+    index = terminatorEnd - 1;
   }
   return -1;
 }
@@ -179,6 +242,18 @@ class AnthropicSseFrameFeeder {
   }
 }
 
+async function drainStream(stream: ReadableStream<Uint8Array>): Promise<void> {
+  const reader = stream.getReader();
+  try {
+    while (true) {
+      const next = await reader.read();
+      if (next.done) break;
+    }
+  } finally {
+    reader.releaseLock();
+  }
+}
+
 export class AnthropicToolLoopCoordinator {
   private readonly now: () => Date;
   private readonly createId: () => string;
@@ -190,14 +265,72 @@ export class AnthropicToolLoopCoordinator {
     this.maxStorageAttempts = options.maxStorageAttempts ?? 8;
   }
 
-  handleRound(input: ToolLoopRoundInput): Promise<ToolLoopDecision> {
-    return this.handleRoundInternal(input, false);
+  async handleRound(input: ToolLoopRoundInput): Promise<ToolLoopDecision> {
+    const decision = await this.handleRoundInternal(input, false);
+    try {
+      assertNoNativeToolLeak(
+        decision.bytes,
+        buildNativeRegistryLeakMarkers(this.options.registry),
+      );
+    } catch {
+      return this.errorDecision(
+        new CoordinatorFailure(
+          "native_tool_leak_detected",
+          "Native Proxy Tool response could not be returned safely",
+          500,
+        ),
+        input,
+        new AnthropicStreamParser(this.options.registry).snapshot(),
+      );
+    }
+    if (decision.kind === "final" && decision.observationStateKey) {
+      const prepared = await this.prepareObservation(
+        decision.observationStateKey,
+        persistResponseSnapshot(decision.bytes, decision.status, decision.headers),
+      ).catch(() => false);
+      if (!prepared) {
+        return this.errorDecision(
+          new CoordinatorFailure(
+            "native_tool_state_unavailable",
+            "Native Proxy Tool observation could not be prepared",
+            503,
+          ),
+          input,
+          new AnthropicStreamParser(this.options.registry).snapshot(),
+        );
+      }
+    }
+    return decision;
   }
 
   private async handleRoundInternal(
     input: ToolLoopRoundInput,
     internalRound: boolean,
   ): Promise<ToolLoopDecision> {
+    if (input.status < 200 || input.status >= 300) {
+      try {
+        await drainStream(input.stream);
+        return this.errorDecision(
+          new CoordinatorFailure(
+            "upstream_non_2xx",
+            "Anthropic upstream returned an error response",
+            input.status,
+          ),
+          input,
+          new AnthropicStreamParser(this.options.registry).snapshot(),
+        );
+      } catch {
+        return this.errorDecision(
+          new CoordinatorFailure(
+            "upstream_stream_interrupted",
+            "Anthropic upstream error response was interrupted",
+            502,
+          ),
+          input,
+          new AnthropicStreamParser(this.options.registry).snapshot(),
+        );
+      }
+    }
     const parser = new AnthropicStreamParser(this.options.registry);
     const feeder = new AnthropicSseFrameFeeder();
     const executionTasks = new Map<string, Promise<void>>();
@@ -267,7 +400,10 @@ export class AnthropicToolLoopCoordinator {
                   input.totalCalls + nativeCalls.length,
                 );
               }
-              const task = this.executeAndPersist(event.call, input.scope, stateKey).catch(() => {});
+              const persistOperation = () => this.executeAndPersist(event.call, input.scope, stateKey!);
+              const task = (this.options.trackBackgroundOperation
+                ? this.options.trackBackgroundOperation(persistOperation)
+                : persistOperation()).catch(() => {});
               executionTasks.set(event.call.callId, task);
             }
             if (event.type === "tool_call_completed" && event.call.owner === "client" && stateKey) {
@@ -312,9 +448,29 @@ export class AnthropicToolLoopCoordinator {
       const clientCalls = snapshot.toolCalls.filter((call) => call.owner === "client");
       if (nativeCalls.length === 0) {
         if (internalRound && clientCalls.length > 0) {
+          await this.options.beforeClientDispatch?.();
           stateKey = await this.createBatch(input, snapshot);
           await this.persistSnapshot(stateKey, snapshot, "completed", input.totalCalls);
-          const pending = await this.transitionClientDispatch(stateKey, "none", "pending");
+          const bytes = replayAnthropicBytes(snapshot);
+          const headers = new Headers(input.headers);
+          assertSafeClientDispatch(bytes, [
+            ...(input.upstreamSnapshot.nativeLeakMarkers ?? []),
+            ...buildNativeRegistryLeakMarkers(this.options.registry),
+          ]);
+          const pending = await this.transitionClientDispatch(
+            stateKey,
+            "none",
+            "pending",
+            persistResponseSnapshot(bytes, input.status, headers),
+          );
+          if (pending) {
+            await this.options.onClientDispatchPrepared?.({
+              stateKey,
+              bytes,
+              status: input.status,
+              headers: new Headers(headers),
+            });
+          }
           const dispatched = pending
             && await this.transitionClientDispatch(stateKey, "pending", "dispatched");
           if (!dispatched) {
@@ -327,9 +483,9 @@ export class AnthropicToolLoopCoordinator {
           return {
             kind: "client_dispatch",
             stateKey,
-            bytes: replayAnthropicBytes(snapshot),
+            bytes,
             status: input.status,
-            headers: new Headers(input.headers),
+            headers,
             rounds: [snapshot],
           };
         }
@@ -351,10 +507,34 @@ export class AnthropicToolLoopCoordinator {
         );
       }
       const totalCalls = input.totalCalls + nativeCalls.length;
+      if (clientCalls.length > 0) await this.options.beforeClientDispatch?.();
       await this.persistSnapshot(stateKey, snapshot, "completed", totalCalls);
 
       if (clientCalls.length > 0) {
-        const pending = await this.transitionClientDispatch(stateKey, "none", "pending");
+        const bytes = buildClientVisibleAnthropicSse(
+          snapshot,
+          new Set(nativeCalls.map((call) => call.contentBlockIndex)),
+        );
+        const headers = new Headers(input.headers);
+        assertSafeClientDispatch(bytes, [
+          ...(input.upstreamSnapshot.nativeLeakMarkers ?? []),
+          ...nativeCalls,
+          ...buildNativeRegistryLeakMarkers(this.options.registry),
+        ]);
+        const pending = await this.transitionClientDispatch(
+          stateKey,
+          "none",
+          "pending",
+          persistResponseSnapshot(bytes, input.status, headers),
+        );
+        if (pending) {
+          await this.options.onClientDispatchPrepared?.({
+            stateKey,
+            bytes,
+            status: input.status,
+            headers: new Headers(headers),
+          });
+        }
         const dispatched = pending
           && await this.transitionClientDispatch(stateKey, "pending", "dispatched");
         if (!dispatched) {
@@ -367,12 +547,9 @@ export class AnthropicToolLoopCoordinator {
         return {
           kind: "client_dispatch",
           stateKey,
-          bytes: buildClientVisibleAnthropicSse(
-            snapshot,
-            new Set(nativeCalls.map((call) => call.contentBlockIndex)),
-          ),
+          bytes,
           status: input.status,
-          headers: new Headers(input.headers),
+          headers,
           rounds: [snapshot],
         };
       }
@@ -395,6 +572,7 @@ export class AnthropicToolLoopCoordinator {
         asToolResultMessage(completedState.slots),
       ];
       const nextRoundNumber = input.round + 1;
+      await this.options.beforeReenter?.();
       const nextRound = await this.options.reenter({
         upstreamSnapshot: structuredClone(input.upstreamSnapshot),
         messages: structuredClone(messages),
@@ -404,6 +582,16 @@ export class AnthropicToolLoopCoordinator {
       const nextSnapshot: UpstreamRequestSnapshot = {
         ...structuredClone(input.upstreamSnapshot),
         baseMessages: structuredClone(messages),
+        nativeLeakMarkers: mergeNativeToolLeakMarkers(
+          input.upstreamSnapshot.nativeLeakMarkers ?? [],
+          completedState.slots
+            .filter((slot) => slot.owner === "proxy")
+            .map((slot) => ({
+              callId: slot.callId,
+              toolName: slot.toolName,
+              ...(slot.input !== undefined ? { input: structuredClone(slot.input) } : {}),
+            })),
+        ),
       };
       const nextDecision = await this.handleRoundInternal({
         ...nextRound,
@@ -412,8 +600,23 @@ export class AnthropicToolLoopCoordinator {
         upstreamSnapshot: nextSnapshot,
         round: nextRoundNumber,
         totalCalls,
+        ...(input.parentStateKey && input.parentReentryAttempt !== undefined
+          ? {
+              parentStateKey: input.parentStateKey,
+              parentReentryAttempt: input.parentReentryAttempt,
+            }
+          : {}),
       }, true);
-      return this.prependRound(snapshot, nextDecision);
+      assertNoNativeToolLeak(
+        nextDecision.bytes,
+        completedState.slots.filter((slot) => slot.owner === "proxy"),
+      );
+      const observableDecision = nextDecision.kind === "final"
+        && !input.parentStateKey
+        && !nextDecision.observationStateKey
+        ? { ...nextDecision, observationStateKey: stateKey }
+        : nextDecision;
+      return this.prependRound(snapshot, observableDecision);
     } catch (error) {
       const failure = error instanceof CoordinatorFailure
         ? error
@@ -466,6 +669,12 @@ export class AnthropicToolLoopCoordinator {
       slots: slotsFromSnapshot(snapshot),
       responseStreamStatus: "streaming",
       clientDispatchStatus: "none",
+      ...(input.parentStateKey && input.parentReentryAttempt !== undefined
+        ? {
+            parentStateKey: structuredClone(input.parentStateKey),
+            parentReentryAttempt: input.parentReentryAttempt,
+          }
+        : {}),
       upstreamSnapshot: structuredClone(input.upstreamSnapshot),
       revision: 0,
       expiresAt: new Date(
@@ -522,7 +731,7 @@ export class AnthropicToolLoopCoordinator {
   ): Promise<void> {
     const leaseOwner = `native-tool-worker-${this.createId()}`;
     const leaseUntil = new Date(
-      this.now().getTime() + Math.max(1_000, this.options.limits.toolTimeoutMs * 2),
+      this.now().getTime() + nativeToolLeaseDurationMs(this.options.limits.toolTimeoutMs),
     ).toISOString();
     let claimed = false;
     for (let attempt = 0; attempt < this.maxStorageAttempts; attempt++) {
@@ -570,6 +779,7 @@ export class AnthropicToolLoopCoordinator {
     key: ToolExecutionStateKey,
     expectedStatus: ToolExecutionContext["clientDispatchStatus"],
     nextStatus: ToolExecutionContext["clientDispatchStatus"],
+    dispatchOutcome?: PersistedResponseSnapshot,
   ): Promise<boolean> {
     for (let attempt = 0; attempt < this.maxStorageAttempts; attempt++) {
       const current = await this.options.storage.get(key);
@@ -581,6 +791,27 @@ export class AnthropicToolLoopCoordinator {
         expectedRevision: current.revision,
         expectedStatus,
         nextStatus,
+        ...(dispatchOutcome ? { dispatchOutcome } : {}),
+      })) return true;
+    }
+    return false;
+  }
+
+  private async prepareObservation(
+    key: ToolExecutionStateKey,
+    outcome: PersistedResponseSnapshot,
+  ): Promise<boolean> {
+    for (let attempt = 0; attempt < this.maxStorageAttempts; attempt++) {
+      const current = await this.options.storage.get(key);
+      if (!current) return false;
+      if (current.observationStatus === "pending") {
+        return JSON.stringify(current.observationOutcome) === JSON.stringify(outcome);
+      }
+      if (current.observationStatus && current.observationStatus !== "none") return false;
+      if (await this.options.storage.prepareObservation({
+        key,
+        expectedRevision: current.revision,
+        outcome,
       })) return true;
     }
     return false;
@@ -604,6 +835,7 @@ export class AnthropicToolLoopCoordinator {
       type: "error",
       error: {
         type: failure.status >= 500 ? "api_error" : "invalid_request_error",
+        code: failure.code,
         message: failure.message,
       },
     }));

@@ -91,6 +91,8 @@ export class NativeProxyToolsInjector implements InjectionHook {
     if (!this.options.enabled || ctx.metadata.protocol !== "anthropic" || !ctx.metadata.stream) {
       return false;
     }
+    const custom = ctx.metadata.custom as Record<string, unknown> | undefined;
+    if (custom?.nativeProxyEligible === false) return false;
     return true;
   }
 

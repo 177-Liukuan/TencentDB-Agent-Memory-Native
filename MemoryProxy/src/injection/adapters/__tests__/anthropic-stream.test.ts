@@ -129,6 +129,36 @@ describe("AnthropicStreamParser", () => {
     ]);
   });
 
+  it("incrementally parses legal CR-only SSE frame separators", () => {
+    const parser = new AnthropicStreamParser(registry);
+    const bytes = concat(
+      frame("content_block_start", {
+        type: "content_block_start",
+        index: 0,
+        content_block: {
+          type: "tool_use",
+          id: "cr-call",
+          name: "tdai_memory_search",
+          input: {},
+        },
+      }, "\r"),
+      frame("content_block_delta", {
+        type: "content_block_delta",
+        index: 0,
+        delta: { type: "input_json_delta", partial_json: "{\"query\":\"rules\"}" },
+      }, "\r"),
+      frame("content_block_stop", { type: "content_block_stop", index: 0 }, "\r"),
+      frame("message_stop", { type: "message_stop" }, "\r"),
+    );
+
+    expect(parser.push(bytes)).toContainEqual(expect.objectContaining({
+      type: "tool_call_completed",
+      call: expect.objectContaining({ callId: "cr-call", input: { query: "rules" } }),
+    }));
+    expect(parser.finish()).not.toContainEqual(expect.objectContaining({ type: "protocol_error" }));
+    expect(parser.snapshot().messageCompleted).toBe(true);
+  });
+
   it("assembles text and thinking while preserving opaque Provider deltas", () => {
     const parser = new AnthropicStreamParser(registry);
     const bytes = concat(

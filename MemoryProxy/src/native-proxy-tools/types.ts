@@ -69,6 +69,43 @@ export interface PersistedForwardTarget {
   authSource: "client" | "global" | "agent" | "extension";
 }
 
+/** Native protocol identifiers and inputs that must never reach the client. */
+export interface NativeToolLeakMarker {
+  callId: string;
+  toolName: string;
+  input?: JsonValue;
+  additionalSentinels?: string[];
+  /** Accepted by the runtime scanner but intentionally omitted from persistence. */
+  result?: JsonValue;
+}
+
+export type PersistedNativeToolLeakMarker = Pick<
+  NativeToolLeakMarker,
+  "callId" | "toolName" | "input"
+>;
+
+/**
+ * Allowlisted, credential-free writeback intent captured on the first request.
+ * Replays must use this immutable identity and policy instead of mutable retry
+ * request metadata.
+ */
+export interface PersistedToolObservationIntent {
+  version: 1;
+  agentSource: string;
+  identity: {
+    spaceId: string;
+    teamId: string;
+    userId: string;
+    agentId: string;
+    sessionId: string;
+    taskId?: string;
+  };
+  effects: {
+    tdai: boolean;
+    skill: boolean;
+  };
+}
+
 /**
  * Replay-safe data captured after request preparation and routing have
  * completed. Credentials and request headers intentionally have no field in
@@ -77,6 +114,14 @@ export interface PersistedForwardTarget {
 export interface UpstreamRequestSnapshot {
   protocol: "anthropic";
   baseMessages: JsonValue[];
+  /** Original client-visible history used only for ordinary telemetry/writeback. */
+  logicalBaseMessages?: JsonValue[];
+  /** Cumulative hidden Native calls from earlier rounds in this logical turn. */
+  nativeLeakMarkers?: PersistedNativeToolLeakMarker[];
+  /** Stable digest of the client-visible logical request before Native injection. */
+  requestFingerprint?: string;
+  /** Original, allowlisted identity and enabled effects for durable writeback. */
+  observationIntent?: PersistedToolObservationIntent;
   system?: JsonValue;
   tools?: JsonValue[];
   requestParameters: { [key: string]: JsonValue };
@@ -89,7 +134,25 @@ export type ClientDispatchStatus =
   | "none"
   | "pending"
   | "dispatched"
+  | "resuming"
   | "completed";
+
+export type ReentryOutcomeKind = "replay" | "final" | "client_dispatch" | "error";
+
+export type ToolObservationStatus = "none" | "pending" | "running" | "completed";
+
+/** Safe, bounded response bytes that can be replayed after a process restart. */
+export interface PersistedResponseSnapshot {
+  status: number;
+  headers: { [name: string]: string };
+  bodyBase64: string;
+}
+
+/** Durable response produced after accepting a Client Tool Result batch. */
+export interface PersistedReentryOutcome extends PersistedResponseSnapshot {
+  kind: ReentryOutcomeKind;
+  childStateKey?: ToolExecutionStateKey;
+}
 
 /** Persisted state for one assistant tool-call batch. */
 export interface ToolExecutionContext {
@@ -102,6 +165,23 @@ export interface ToolExecutionContext {
   slots: ToolCallSlot[];
   responseStreamStatus: ResponseStreamStatus;
   clientDispatchStatus: ClientDispatchStatus;
+  /** Parent Client-result batch that caused this continuation, when present. */
+  parentStateKey?: ToolExecutionStateKey;
+  parentReentryAttempt?: number;
+  /** Exact client-visible response prepared before the dispatch is committed. */
+  clientDispatchOutcome?: PersistedResponseSnapshot;
+  /** Durable lease for handing a persisted Client-result batch back upstream. */
+  reentryLeaseOwner?: string;
+  reentryLeaseUntil?: string;
+  reentryAttempt?: number;
+  reentryOutcome?: PersistedReentryOutcome;
+  /** Durable outbox for final logical-turn L0/Skill writeback. */
+  observationStatus?: ToolObservationStatus;
+  observationLeaseOwner?: string;
+  observationLeaseUntil?: string;
+  observationAttempt?: number;
+  /** Final client-visible bytes consumed by the durable writeback outbox. */
+  observationOutcome?: PersistedResponseSnapshot;
   upstreamSnapshot: UpstreamRequestSnapshot;
   revision: number;
   expiresAt: string;
@@ -112,4 +192,9 @@ export interface ToolExecutionContext {
 export interface NativeToolResult {
   value: JsonValue;
   isError: boolean;
+}
+
+/** Execution leases must survive ordinary request timeouts and process restarts. */
+export function nativeToolLeaseDurationMs(toolTimeoutMs: number): number {
+  return Math.max(10_000, toolTimeoutMs * 2);
 }

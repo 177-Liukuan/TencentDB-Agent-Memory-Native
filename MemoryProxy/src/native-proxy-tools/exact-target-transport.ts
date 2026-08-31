@@ -9,6 +9,7 @@ import type {
 import type {
   JsonValue,
   PersistedForwardTarget,
+  PersistedToolObservationIntent,
   UpstreamRequestSnapshot,
 } from "./types.js";
 
@@ -53,6 +54,9 @@ export interface BuildUpstreamRequestSnapshotInput {
   url: string;
   model: string;
   authSource: PersistedForwardTarget["authSource"];
+  requestFingerprint?: string;
+  observationIntent?: PersistedToolObservationIntent;
+  logicalBaseMessages?: unknown[];
 }
 
 export interface ExactTargetTransportOptions {
@@ -68,6 +72,7 @@ export interface RetainedExactTargetTransportOptions extends ExactTargetTranspor
 
 export interface RestartExactTargetTransportOptions extends ExactTargetTransportOptions {
   config: ProxyConfig;
+  currentModel: string;
   agentSource: string;
   requestPath: string;
   sessionId: string;
@@ -87,6 +92,20 @@ function asJsonValue(value: unknown): JsonValue {
 function asJsonArray(value: unknown, field: string): JsonValue[] {
   if (!Array.isArray(value)) throw new TypeError(`${field} must be an array`);
   return asJsonValue(value) as JsonValue[];
+}
+
+function canonicalJson(value: JsonValue): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  return `{${Object.keys(value).sort().map((name) => (
+    `${JSON.stringify(name)}:${canonicalJson(value[name])}`
+  )).join(",")}}`;
+}
+
+/** Digest the complete client-visible logical request before hidden Tool injection. */
+export function fingerprintAnthropicLogicalRequest(body: Record<string, unknown>): string {
+  const normalized = asJsonValue(body);
+  return `sha256:${createHash("sha256").update(canonicalJson(normalized)).digest("hex")}`;
 }
 
 export function createPersistedForwardTarget(input: {
@@ -112,9 +131,20 @@ export function buildUpstreamRequestSnapshot(
     requestParameters[name] = asJsonValue(value);
   }
 
+  const baseMessages = asJsonArray(input.body.messages, "messages");
+  const logicalBaseMessages = input.logicalBaseMessages === undefined
+    ? baseMessages
+    : asJsonArray(input.logicalBaseMessages, "logicalBaseMessages");
   return {
     protocol: "anthropic",
-    baseMessages: asJsonArray(input.body.messages, "messages"),
+    baseMessages,
+    logicalBaseMessages: cloneJson(logicalBaseMessages),
+    ...(input.requestFingerprint !== undefined
+      ? { requestFingerprint: input.requestFingerprint }
+      : {}),
+    ...(input.observationIntent !== undefined
+      ? { observationIntent: structuredClone(input.observationIntent) }
+      : {}),
     ...(input.body.system !== undefined
       ? { system: asJsonValue(input.body.system) }
       : {}),
@@ -248,29 +278,41 @@ interface RestartCandidate {
 function restartCandidates(options: RestartExactTargetTransportOptions): RestartCandidate[] {
   const candidates: RestartCandidate[] = [];
   const agent = options.config.upstream.agents[options.agentSource];
+  const endpoints = [
+    options.config.costGuard.anthropicUpstream?.url,
+    options.config.upstream.url,
+  ].filter((value): value is string => typeof value === "string" && value.length > 0);
   if (agent) {
+    const agentAuthSource = agent.apiKey ? "agent" : "client";
     candidates.push({
       url: joinUrl(agent.url, options.requestPath),
-      authSource: agent.apiKey ? "agent" : "client",
+      authSource: agentAuthSource,
       apiKey: agent.apiKey ?? "",
     });
+    // A routed request can retry on either configured default endpoint while
+    // deliberately keeping the per-agent/client credential selected for the
+    // first attempt. Persisted target identity, not endpoint class, decides.
+    for (const endpoint of endpoints) {
+      candidates.push({
+        url: joinUrl(endpoint, options.requestPath),
+        authSource: agentAuthSource,
+        apiKey: agent.apiKey ?? "",
+      });
+    }
   }
 
   const globalAuthSource = options.config.upstream.apiKey ? "global" : "client";
   const globalApiKey = options.config.upstream.apiKey;
-  if (options.config.costGuard.anthropicUpstream?.url) {
+  for (const endpoint of endpoints) {
     candidates.push({
-      url: joinUrl(options.config.costGuard.anthropicUpstream.url, options.requestPath),
+      url: joinUrl(endpoint, options.requestPath),
       authSource: globalAuthSource,
       apiKey: globalApiKey,
     });
   }
-  candidates.push({
-    url: joinUrl(options.config.upstream.url, options.requestPath),
-    authSource: globalAuthSource,
-    apiKey: globalApiKey,
-  });
-  return candidates;
+  return candidates.filter((candidate, index) => candidates.findIndex((entry) => (
+    entry.url === candidate.url && entry.authSource === candidate.authSource
+  )) === index);
 }
 
 function restartHeaders(
@@ -297,6 +339,7 @@ export function createRestartExactTargetTransport(
     validateSnapshot(snapshot);
     if (
       snapshot.target.authSource === "extension"
+      || snapshot.target.model !== options.currentModel
     ) {
       throw new NativeToolTargetUnavailableError();
     }

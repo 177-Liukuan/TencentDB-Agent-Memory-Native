@@ -9,7 +9,19 @@ import {
   createDefaultNativeProxyToolRegistry,
   type NativeProxyToolRegistry,
 } from "./tool-registry.js";
-import type { NativeToolResult, ToolExecutionScope } from "./types.js";
+import type {
+  NativeToolResult,
+  ToolExecutionScope,
+  ToolExecutionStateKey,
+} from "./types.js";
+import type { NativeReentryRequest, UpstreamRound } from "./tool-loop-coordinator.js";
+
+export type NativeReentryTransport = (
+  request: NativeReentryRequest,
+) => Promise<UpstreamRound>;
+
+/** Hard bound for credential-bearing exact-target transports retained in-process. */
+export const NATIVE_RETAINED_TARGET_LIMIT = 1_024;
 
 export interface NativeProxyToolExecutor {
   execute(call: UnifiedToolCall, scope: ToolExecutionScope): Promise<NativeToolResult>;
@@ -28,6 +40,16 @@ export interface NativeProxyToolRuntime {
   dispatcher: NativeProxyToolExecutor | null;
   ready(): Promise<void>;
   readiness(): NativeProxyToolRuntimeReadiness;
+  retainExactTarget(
+    key: ToolExecutionStateKey,
+    transport: NativeReentryTransport,
+  ): void;
+  getRetainedExactTarget(
+    key: ToolExecutionStateKey,
+  ): NativeReentryTransport | undefined;
+  releaseExactTarget(key: ToolExecutionStateKey): void;
+  runOperation<T>(operation: () => Promise<T>): Promise<T>;
+  trackBackgroundOperation<T>(operation: () => Promise<T>): Promise<T>;
   close(): Promise<void>;
 }
 
@@ -38,6 +60,7 @@ export interface NativeProxyToolRuntimeDependencies {
     config: ProxyConfig;
     registry: NativeProxyToolRegistry;
   }): NativeProxyToolExecutor;
+  now?(): Date;
 }
 
 class NativeProxyToolRuntimeUnavailableError extends Error {
@@ -69,6 +92,17 @@ function runtimeKey(config: ProxyConfig): string {
     .digest("hex");
 }
 
+function retainedTargetKey(key: ToolExecutionStateKey): string {
+  return JSON.stringify([
+    key.spaceId,
+    key.userId,
+    key.agentSource,
+    key.sessionId,
+    key.contextVersion,
+    key.toolBatchId,
+  ]);
+}
+
 export function createNativeProxyToolRuntime(
   config: ProxyConfig,
   dependencies: NativeProxyToolRuntimeDependencies = {},
@@ -82,6 +116,11 @@ export function createNativeProxyToolRuntime(
       dispatcher: null,
       ready: async () => {},
       readiness: () => ({ ready: true, failed: false }),
+      retainExactTarget: () => {},
+      getRetainedExactTarget: () => undefined,
+      releaseExactTarget: () => {},
+      runOperation: (operation) => operation(),
+      trackBackgroundOperation: (operation) => operation(),
       close: async () => {},
     };
   }
@@ -91,10 +130,23 @@ export function createNativeProxyToolRuntime(
   const baseDispatcher = dependencies.createDispatcher?.({ config, registry })
     ?? new NativeProxyToolDispatcher({ config, registry });
   const pendingExecutions = new Set<Promise<NativeToolResult>>();
+  const pendingOperations = new Set<Promise<unknown>>();
+  const retainedTargets = new Map<string, {
+    transport: NativeReentryTransport;
+    expiresAt: number;
+  }>();
+  const now = dependencies.now ?? (() => new Date());
+  const sweepRetainedTargets = (currentTime: number): void => {
+    for (const [key, retained] of retainedTargets) {
+      if (retained.expiresAt <= currentTime) retainedTargets.delete(key);
+    }
+  };
   let initialization: Promise<void> | undefined;
   let initialized = false;
   let failed = false;
   let closed = false;
+  let admitting = true;
+  let closing: Promise<void> | undefined;
 
   const dispatcher: NativeProxyToolExecutor = {
     execute(call, scope) {
@@ -110,9 +162,9 @@ export function createNativeProxyToolRuntime(
   };
 
   const ready = async (): Promise<void> => {
-    if (closed) throw new NativeProxyToolRuntimeUnavailableError();
+    if (closed || !admitting) throw new NativeProxyToolRuntimeUnavailableError();
     if (!initialization) {
-      initialization = storage.initializeAndProbe().then(
+      const probe = storage.initializeAndProbe().then(
         () => {
           initialized = true;
           failed = false;
@@ -123,8 +175,53 @@ export function createNativeProxyToolRuntime(
           throw new NativeProxyToolRuntimeUnavailableError();
         },
       );
+      initialization = probe;
+      void probe.catch(() => {
+        if (initialization === probe) initialization = undefined;
+      });
     }
     await initialization;
+  };
+
+  const trackOperation = <T>(
+    operation: () => Promise<T>,
+    requireAdmission: boolean,
+  ): Promise<T> => {
+    if (closed || (requireAdmission && !admitting)) {
+      return Promise.reject(new NativeProxyToolRuntimeUnavailableError());
+    }
+    let running: Promise<T>;
+    try {
+      running = operation();
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    pendingOperations.add(running);
+    void running.then(
+      () => pendingOperations.delete(running),
+      () => pendingOperations.delete(running),
+    );
+    return running;
+  };
+  const runOperation = <T>(operation: () => Promise<T>): Promise<T> => (
+    trackOperation(operation, true)
+  );
+  const close = (): Promise<void> => {
+    if (closing) return closing;
+    admitting = false;
+    closing = (async () => {
+      await initialization?.catch(() => {});
+      while (pendingOperations.size > 0) {
+        await Promise.allSettled([...pendingOperations]);
+      }
+      while (pendingExecutions.size > 0) {
+        await Promise.allSettled([...pendingExecutions]);
+      }
+      retainedTargets.clear();
+      closed = true;
+      await storage.close();
+    })();
+    return closing;
   };
 
   return {
@@ -140,15 +237,39 @@ export function createNativeProxyToolRuntime(
         ? { message: "Native Proxy Tool state storage is unavailable" }
         : {}),
     }),
-    close: async () => {
-      if (closed) return;
-      closed = true;
-      await initialization?.catch(() => {});
-      while (pendingExecutions.size > 0) {
-        await Promise.allSettled([...pendingExecutions]);
+    retainExactTarget: (key, transport) => {
+      if (!admitting || closed) return;
+      const currentTime = now().getTime();
+      sweepRetainedTargets(currentTime);
+      const serializedKey = retainedTargetKey(key);
+      retainedTargets.delete(serializedKey);
+      while (retainedTargets.size >= NATIVE_RETAINED_TARGET_LIMIT) {
+        const oldestKey = retainedTargets.keys().next().value as string | undefined;
+        if (oldestKey === undefined) break;
+        retainedTargets.delete(oldestKey);
       }
-      await storage.close();
+      retainedTargets.set(serializedKey, {
+        transport,
+        expiresAt: currentTime + config.nativeProxyTools.stateTtlSeconds * 1_000,
+      });
     },
+    getRetainedExactTarget: (stateKey) => {
+      const currentTime = now().getTime();
+      sweepRetainedTargets(currentTime);
+      const key = retainedTargetKey(stateKey);
+      const retained = retainedTargets.get(key);
+      if (!retained) return undefined;
+      return retained.transport;
+    },
+    releaseExactTarget: (stateKey) => {
+      retainedTargets.delete(retainedTargetKey(stateKey));
+    },
+    runOperation,
+    // A coordinator admitted before shutdown may discover Native work only
+    // after content_block_stop. Admit that child operation and let close()
+    // drain it; new top-level requests still fail through runOperation().
+    trackBackgroundOperation: (operation) => trackOperation(operation, false),
+    close,
   };
 }
 

@@ -347,14 +347,6 @@ export async function executeMemoryBridge(
   }
 
   const inboundBody = input.body;
-  const modelSessionId =
-    typeof inboundBody.session_id === "string" && inboundBody.session_id.trim()
-      ? inboundBody.session_id.trim()
-      : undefined;
-  const modelTaskId =
-    typeof inboundBody.task_id === "string" && inboundBody.task_id.trim()
-      ? inboundBody.task_id.trim()
-      : undefined;
 
   const upstreamUrl = `${input.config.coreSkill.endpoint.replace(/\/$/, "")}/v3/${sub}`;
   const upstreamToken =
@@ -369,14 +361,13 @@ export async function executeMemoryBridge(
 
   const resolveContexts = deps.resolveMemoryContexts ?? resolveMemoryCtxs;
   const ctxs = await resolveContexts(input.config, ids, input.sessionId);
-  const effectiveTaskId = modelTaskId ?? ids.task_id;
   const makeOutbound = (target: FixedAssetCtx): Record<string, unknown> => ({
     ...inboundBody,
     user_id: target.userId,
     team_id: target.teamId,
     agent_id: target.agentId,
-    ...(modelSessionId ? { session_id: modelSessionId } : {}),
-    ...(effectiveTaskId ? { task_id: effectiveTaskId } : {}),
+    session_id: ids.session_id,
+    ...(ids.task_id ? { task_id: ids.task_id } : {}),
   });
   const fetcher = deps.fetcher ?? globalThis.fetch.bind(globalThis);
   const emitTelemetry = deps.emitTelemetry ?? emitBridgeToolCallTelemetry;
@@ -461,6 +452,14 @@ export async function executeMemoryBridge(
     console.log(
       `${TAG} sub=${sub} multi targets=${ctxs.length} ok=${okCount} ${resultKey}=${collected.length} elapsed=${now() - t0}ms`,
     );
+    if (okCount === 0) {
+      return executionEnvelope(
+        50301,
+        `${TAG} upstream unavailable`,
+        502,
+        now,
+      );
+    }
     const searchedAgents = ctxs.map((ctx) => ({
       agent_id: ctx.agentId,
       name: ctx.agentName,
@@ -488,7 +487,7 @@ export async function executeMemoryBridge(
     console.warn(`${TAG} upstream fetch failed sub=${sub} err=${(err as Error).message}`);
     return executionEnvelope(
       50301,
-      `${TAG} upstream unavailable: ${(err as Error).message}`,
+      `${TAG} upstream unavailable`,
       502,
       now,
     );

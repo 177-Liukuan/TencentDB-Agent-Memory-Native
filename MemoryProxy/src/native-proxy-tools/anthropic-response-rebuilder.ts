@@ -2,7 +2,40 @@ import type {
   AnthropicSseFrame,
   AnthropicStreamSnapshot,
 } from "../injection/adapters/anthropic-stream.js";
-import type { JsonValue, ToolCallSlot } from "./types.js";
+import type {
+  JsonValue,
+  NativeToolLeakMarker,
+  PersistedNativeToolLeakMarker,
+  ToolCallSlot,
+} from "./types.js";
+import type { NativeProxyToolRegistry } from "./tool-registry.js";
+
+export type { NativeToolLeakMarker } from "./types.js";
+
+function cloneJsonValue(value: unknown): JsonValue {
+  const encoded = JSON.stringify(value);
+  if (encoded === undefined) throw new Error("Native Proxy Tool schema is not JSON serializable");
+  return JSON.parse(encoded) as JsonValue;
+}
+
+/** Build sentinels for definitions injected by the Proxy, even if no call was emitted. */
+export function buildNativeRegistryLeakMarkers(
+  registry: NativeProxyToolRegistry,
+): NativeToolLeakMarker[] {
+  return registry.list().map((definition) => ({
+    callId: "",
+    toolName: definition.name,
+    input: cloneJsonValue(definition.inputSchema),
+    additionalSentinels: [
+      definition.description,
+      JSON.stringify({
+        name: definition.name,
+        description: definition.description,
+        input_schema: definition.inputSchema,
+      }),
+    ],
+  }));
+}
 
 export interface AnthropicAssistantMessage {
   role: "assistant";
@@ -12,7 +45,7 @@ export interface AnthropicAssistantMessage {
 export interface AnthropicToolResultBlock {
   type: "tool_result";
   tool_use_id: string;
-  content: string;
+  content: JsonValue;
   is_error?: true;
 }
 
@@ -44,6 +77,52 @@ function joinBytes(chunks: readonly Uint8Array[]): Uint8Array {
     offset += chunk.byteLength;
   }
   return output;
+}
+
+export function mergeNativeToolLeakMarkers(
+  ...groups: ReadonlyArray<readonly NativeToolLeakMarker[]>
+): PersistedNativeToolLeakMarker[] {
+  const seen = new Set<string>();
+  const merged: PersistedNativeToolLeakMarker[] = [];
+  for (const group of groups) {
+    for (const marker of group) {
+      const signature = `${marker.callId}\u0000${marker.toolName}\u0000${
+        marker.input === undefined ? "undefined" : JSON.stringify(marker.input)
+      }`;
+      if (seen.has(signature)) continue;
+      seen.add(signature);
+      merged.push({
+        callId: marker.callId,
+        toolName: marker.toolName,
+        ...(marker.input !== undefined ? { input: structuredClone(marker.input) } : {}),
+      });
+    }
+  }
+  return merged;
+}
+
+export function assertNoNativeToolLeak(
+  bytes: Uint8Array,
+  calls: readonly NativeToolLeakMarker[],
+): void {
+  const text = new TextDecoder().decode(bytes);
+  for (const call of calls) {
+    const sentinels = [call.callId, call.toolName, ...(call.additionalSentinels ?? [])];
+    // Result content is intentionally available to the model and may be used
+    // verbatim in its answer. Only protocol identity and hidden input payloads
+    // are forbidden in the client-visible transport.
+    for (const value of [call.input]) {
+      if (value === undefined) continue;
+      const serialized = JSON.stringify(value);
+      sentinels.push(serialized, JSON.stringify(serialized).slice(1, -1));
+    }
+    for (const value of call.additionalSentinels ?? []) {
+      sentinels.push(JSON.stringify(value).slice(1, -1));
+    }
+    if (sentinels.some((sentinel) => sentinel.length > 0 && text.includes(sentinel))) {
+      throw new Error("Client-visible Anthropic response contains hidden Native Tool data");
+    }
+  }
 }
 
 /** Find and replace only a top-level JSON object's integer `index` value. */
@@ -169,7 +248,12 @@ export function buildClientVisibleAnthropicSse(
     }
     output.push(rewriteVisibleFrame(frame, nextIndex));
   }
-  return joinBytes(output);
+  const visible = joinBytes(output);
+  assertNoNativeToolLeak(
+    visible,
+    snapshot.toolCalls.filter((call) => nativeIndexes.has(call.contentBlockIndex)),
+  );
+  return visible;
 }
 
 export function buildFullAssistantMessage(
@@ -191,11 +275,18 @@ export function buildToolResultMessage(
     role: "user",
     content: [...slots]
       .sort((left, right) => left.slotIndex - right.slotIndex)
-      .map((slot) => ({
-        type: "tool_result",
-        tool_use_id: slot.callId,
-        content: JSON.stringify(slot.result ?? null),
-        ...(slot.isError ? { is_error: true as const } : {}),
-      })),
+      .map((slot) => {
+        const result = slot.result ?? null;
+        const preserveClientWireShape = slot.owner === "client"
+          && (typeof result === "string" || Array.isArray(result));
+        return {
+          type: "tool_result",
+          tool_use_id: slot.callId,
+          content: preserveClientWireShape
+            ? structuredClone(result)
+            : JSON.stringify(result),
+          ...(slot.isError ? { is_error: true as const } : {}),
+        };
+      }),
   };
 }

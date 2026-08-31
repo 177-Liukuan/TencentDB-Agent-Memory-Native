@@ -68,6 +68,7 @@ describe("executeMemoryBridge", () => {
         team_id: "attacker",
         agent_id: "agent-1",
         session_id: "model-session",
+        task_id: "model-task",
       },
       sessionId: "session-1",
       spaceId: "space-1",
@@ -79,7 +80,7 @@ describe("executeMemoryBridge", () => {
       user_id: "user-1",
       team_id: "team-1",
       agent_id: "agent-1",
-      session_id: "model-session",
+      session_id: "session-1",
       task_id: "task-1",
     });
     expect(new Headers(upstreamHeaders).get("authorization")).toBe("Bearer tdai-secret");
@@ -132,6 +133,26 @@ describe("executeMemoryBridge", () => {
         ],
       },
     });
+  });
+
+  it("returns an unavailable error when every fan-out target fails", async () => {
+    const result = await executeMemoryBridge({
+      config: config(),
+      subpath: "atomic/search",
+      body: { query: "rules", limit: 5 },
+      sessionId: "session-1",
+      spaceId: "space-1",
+    }, deps({
+      fetcher: (async () => { throw new Error("private network detail"); }) as typeof fetch,
+      resolveMemoryContexts: async () => [
+        { teamId: "team-1", userId: "user-1", agentId: "agent-1", agentName: "Self", isSelf: true },
+        { teamId: "team-1", userId: "user-2", agentId: "agent-2", agentName: "Imported", isSelf: false },
+      ],
+    }));
+
+    expect(result.status).toBe(502);
+    expect(JSON.parse(result.text)).toMatchObject({ code: 50301 });
+    expect(result.text).not.toContain("private network detail");
   });
 
   it("rejects an uninitialized Session without contacting upstream", async () => {

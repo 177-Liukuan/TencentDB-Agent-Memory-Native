@@ -6,6 +6,8 @@ import {
 } from "../../db/in-memory-tool-execution-storage-adapter.js";
 import type { UnifiedToolCall } from "../../injection/adapters/interface.js";
 import {
+  completeClientToolReentry,
+  createPersistedClientReentryOutcome,
   extractAnthropicClientToolResults,
   resumeClientToolResults,
   type ClientToolResumeInput,
@@ -270,8 +272,8 @@ describe("resumeClientToolResults", () => {
       role: "user",
       content: [
         { type: "tool_result", tool_use_id: "p1", content: "{\"memories\":[\"p1-result\"]}" },
-        { type: "tool_result", tool_use_id: "c1", content: "\"first output\"" },
-        { type: "tool_result", tool_use_id: "c2", content: "[{\"type\":\"text\",\"text\":\"second output\"}]" },
+        { type: "tool_result", tool_use_id: "c1", content: "first output" },
+        { type: "tool_result", tool_use_id: "c2", content: [{ type: "text", text: "second output" }] },
         { type: "tool_result", tool_use_id: "p2", content: "{\"memories\":[\"p2-result\"]}" },
       ],
     });
@@ -325,7 +327,7 @@ describe("resumeClientToolResults", () => {
         {
           type: "tool_result",
           tool_use_id: "c1",
-          content: "\"permission denied\"",
+          content: "permission denied",
           is_error: true,
         },
       ]),
@@ -393,7 +395,7 @@ describe("resumeClientToolResults", () => {
     expect(unrelatedDecision).toEqual({ kind: "not_applicable" });
   });
 
-  it("accepts Client results exactly once under concurrent resumes", async () => {
+  it("accepts identical Client results idempotently and claims re-entry exactly once", async () => {
     const state = mixedState({
       p1: { status: "succeeded", result: "p1", isError: false },
     });
@@ -402,12 +404,205 @@ describe("resumeClientToolResults", () => {
 
     const decisions = await Promise.all([
       resumeClientToolResults(harness.input()),
-      resumeClientToolResults(harness.input()),
+      resumeClientToolResults(harness.input(resultBody([
+        { callId: "c1", content: "first output" },
+        { callId: "c2", content: [{ type: "text", text: "second output" }] },
+      ]))),
     ]);
 
     expect(decisions.filter((decision) => decision.kind === "reentered")).toHaveLength(1);
     expect(decisions.filter((decision) => decision.kind === "error")).toHaveLength(1);
     expect(harness.reenter).toHaveBeenCalledTimes(1);
+  });
+
+  it("retries identical persisted results after a failed re-entry lease expires", async () => {
+    let currentTime = fixedNow.getTime();
+    const now = () => new Date(currentTime);
+    const storage = new InMemoryToolExecutionStorageAdapter({ now });
+    const first = resumeHarness({
+      storage,
+      now,
+      reenter: async () => { throw new Error("upstream reset"); },
+    });
+    const state = mixedState({
+      p1: { status: "succeeded", result: "p1", isError: false },
+    });
+    await storage.create(state);
+
+    await expect(resumeClientToolResults(first.input())).resolves.toMatchObject({
+      kind: "error",
+      code: "native_tool_reentry_failed",
+    });
+    await expect(storage.get(state.key)).resolves.toMatchObject({
+      clientDispatchStatus: "resuming",
+      reentryAttempt: 1,
+    });
+
+    await expect(resumeClientToolResults(first.input())).resolves.toMatchObject({
+      kind: "error",
+      code: "native_tool_reentry_in_progress",
+    });
+
+    currentTime += 10_001;
+    const second = resumeHarness({ storage, now });
+    const decision = await resumeClientToolResults(second.input());
+    expect(decision).toMatchObject({ kind: "reentered", reentryLeaseOwner: expect.any(String) });
+    if (decision.kind !== "reentered") throw new Error("expected re-entry");
+    await completeClientToolReentry(
+      storage,
+      decision.stateKey,
+      decision.reentryLeaseOwner,
+      createPersistedClientReentryOutcome({
+        kind: "final",
+        status: 200,
+        headers: new Headers({ "content-type": "text/event-stream" }),
+        bytes: encoder.encode("final"),
+      }),
+    );
+    await expect(storage.get(state.key)).resolves.toMatchObject({
+      clientDispatchStatus: "completed",
+      reentryAttempt: 2,
+    });
+  });
+
+  it("replays an atomically persisted re-entry outcome after delivery is interrupted", async () => {
+    const state = mixedState({
+      p1: { status: "succeeded", result: "p1", isError: false },
+    });
+    const harness = resumeHarness();
+    await harness.storage.create(state);
+
+    const first = await resumeClientToolResults(harness.input());
+    expect(first.kind).toBe("reentered");
+    if (first.kind !== "reentered") throw new Error("expected re-entry");
+    const outcome = createPersistedClientReentryOutcome({
+      kind: "client_dispatch",
+      status: 200,
+      headers: new Headers({
+        "content-type": "text/event-stream",
+        "set-cookie": "must-not-persist=1",
+      }),
+      bytes: encoder.encode("event: message_stop\ndata: replay-me\n\n"),
+      childStateKey: { ...scope(), toolBatchId: "child-batch" },
+    });
+    const childState = mixedState({
+      dispatchStatus: "pending",
+      p1: { status: "succeeded", result: "p1", isError: false },
+      c1: { callId: "child-c1" },
+      c2: { callId: "child-c2" },
+    });
+    childState.key = { ...scope(), toolBatchId: "child-batch" };
+    childState.parentStateKey = state.key;
+    childState.parentReentryAttempt = 1;
+    childState.clientDispatchOutcome = {
+      status: outcome.status,
+      headers: structuredClone(outcome.headers),
+      bodyBase64: outcome.bodyBase64,
+    };
+    await harness.storage.create(childState);
+    await completeClientToolReentry(
+      harness.storage,
+      first.stateKey,
+      first.reentryLeaseOwner,
+      outcome,
+    );
+
+    const retry = await resumeClientToolResults(harness.input());
+
+    expect(retry).toMatchObject({
+      kind: "replay",
+      status: 200,
+      outcomeKind: "client_dispatch",
+      childStateKey: { toolBatchId: "child-batch" },
+    });
+    if (retry.kind !== "replay") throw new Error("expected durable replay");
+    expect(new TextDecoder().decode(retry.bytes)).toContain("replay-me");
+    expect(retry.headers.get("content-type")).toBe("text/event-stream");
+    expect(retry.headers.has("set-cookie")).toBe(false);
+    expect(harness.reenter).toHaveBeenCalledTimes(1);
+    await expect(harness.storage.get(childState.key)).resolves.toMatchObject({
+      clientDispatchStatus: "dispatched",
+    });
+  });
+
+  it("does not let a stale lease owner accept another owner's completed outcome", async () => {
+    const state = mixedState({
+      dispatchStatus: "resuming",
+      p1: { status: "succeeded", result: "p1", isError: false },
+    });
+    state.reentryLeaseOwner = "winning-owner";
+    state.reentryLeaseUntil = new Date(fixedNow.getTime() + 30_000).toISOString();
+    const harness = resumeHarness();
+    await harness.storage.create(state);
+    const outcome = createPersistedClientReentryOutcome({
+      kind: "final",
+      status: 200,
+      headers: new Headers({ "content-type": "text/event-stream" }),
+      bytes: encoder.encode("winner"),
+    });
+
+    await completeClientToolReentry(
+      harness.storage,
+      state.key,
+      "winning-owner",
+      outcome,
+    );
+    await expect(completeClientToolReentry(
+      harness.storage,
+      state.key,
+      "stale-owner",
+      outcome,
+    )).rejects.toThrow(/lease|dispatchable/i);
+    await expect(completeClientToolReentry(
+      harness.storage,
+      state.key,
+      "winning-owner",
+      { ...outcome, bodyBase64: Buffer.from("different").toString("base64") },
+    )).rejects.toThrow(/outcome|dispatchable/i);
+    await expect(completeClientToolReentry(
+      harness.storage,
+      state.key,
+      "winning-owner",
+      outcome,
+    )).resolves.toBeUndefined();
+  });
+
+  it("separates full hidden re-entry history from logical observation history", async () => {
+    const state = mixedState({
+      p1: { status: "succeeded", result: "p1", isError: false },
+    });
+    state.upstreamSnapshot.baseMessages = [
+      { role: "user", content: "original question" },
+      { role: "assistant", content: [{ type: "tool_use", id: "old-native" }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "old-native", content: "hidden" }] },
+    ];
+    state.upstreamSnapshot.logicalBaseMessages = [{ role: "user", content: "original question" }];
+    state.upstreamSnapshot.nativeLeakMarkers = [{
+      callId: "ancestor-native",
+      toolName: "tdai_memory_search",
+      input: { query: "ancestor-secret" },
+    }];
+    const harness = resumeHarness();
+    await harness.storage.create(state);
+
+    const decision = await resumeClientToolResults(harness.input());
+
+    expect(decision).toMatchObject({
+      kind: "reentered",
+      logicalMessages: [{ role: "user", content: "original question" }],
+      nativeLeakMarkers: expect.arrayContaining([
+        expect.objectContaining({ callId: "ancestor-native", toolName: "tdai_memory_search" }),
+        expect.objectContaining({ callId: "p1", toolName: "tdai_memory_search" }),
+      ]),
+      upstreamSnapshot: {
+        nativeLeakMarkers: expect.arrayContaining([
+          expect.objectContaining({ callId: "ancestor-native" }),
+          expect.objectContaining({ callId: "p1" }),
+        ]),
+      },
+    });
+    if (decision.kind !== "reentered") throw new Error("expected re-entry");
+    expect(decision.messages).toHaveLength(5);
   });
 
   it("fails closed for an unknown or cross-scope call inside a known batch", async () => {

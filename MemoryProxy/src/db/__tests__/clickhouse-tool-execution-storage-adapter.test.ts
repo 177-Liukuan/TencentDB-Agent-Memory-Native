@@ -85,6 +85,7 @@ class RecordingClickHouseClient implements ToolStateClickHouseClient {
   readonly rows = new Map<string, ToolExecutionStateRow>();
   discardUpdates = false;
   failNextCommand?: Error;
+  schemaDdl = createToolExecutionStateTableDdl("native_tool_state_test");
 
   async command(command: ToolStateClickHouseCommand): Promise<void> {
     this.commands.push(structuredClone(command));
@@ -105,6 +106,7 @@ class RecordingClickHouseClient implements ToolStateClickHouseClient {
       session_id: String(params.sessionId),
       context_version: String(params.contextVersion),
       tool_batch_id: String(params.toolBatchId),
+      schema_version: row.schema_version ?? 1,
       turn_seq: Number(params.nextTurnSeq),
       protocol: String(params.nextProtocol),
       round: Number(params.nextRound),
@@ -114,6 +116,18 @@ class RecordingClickHouseClient implements ToolStateClickHouseClient {
       slots_json: String(params.nextSlotsJson),
       response_stream_status: String(params.nextResponseStreamStatus),
       client_dispatch_status: String(params.nextClientDispatchStatus),
+      parent_state_key_json: String(params.nextParentStateKeyJson ?? ""),
+      parent_reentry_attempt: Number(params.nextParentReentryAttempt ?? 0),
+      client_dispatch_outcome_json: String(params.nextClientDispatchOutcomeJson ?? ""),
+      reentry_lease_owner: String(params.nextReentryLeaseOwner ?? ""),
+      reentry_lease_until: String(params.nextReentryLeaseUntil ?? ""),
+      reentry_attempt: Number(params.nextReentryAttempt ?? 0),
+      reentry_outcome_json: String(params.nextReentryOutcomeJson ?? ""),
+      observation_status: String(params.nextObservationStatus ?? "none"),
+      observation_lease_owner: String(params.nextObservationLeaseOwner ?? ""),
+      observation_lease_until: String(params.nextObservationLeaseUntil ?? ""),
+      observation_attempt: Number(params.nextObservationAttempt ?? 0),
+      observation_outcome_json: String(params.nextObservationOutcomeJson ?? ""),
       upstream_snapshot_json: String(params.nextUpstreamSnapshotJson),
       revision: Number(params.nextRevision),
       mutation_token: String(params.mutationToken),
@@ -139,6 +153,9 @@ class RecordingClickHouseClient implements ToolStateClickHouseClient {
 
   async query(query: ToolStateClickHouseQuery) {
     this.queries.push(structuredClone(query));
+    if (query.query.includes("FROM system.tables")) {
+      return { json: async () => [{ create_table_query: this.schemaDdl }] };
+    }
     const params = query.query_params ?? {};
     let rows = [...this.rows.values()];
     if (params.toolBatchId !== undefined) {
@@ -199,9 +216,16 @@ describe("ClickHouseToolExecutionStorageAdapter", () => {
     expect(ddl).toContain("slots_json String");
     expect(ddl).toContain("upstream_snapshot_json String");
     expect(ddl).toContain("mutation_token String");
+    expect(ddl).toContain("schema_version UInt16 DEFAULT 1");
+    expect(ddl).toContain("reentry_lease_owner String");
+    expect(ddl).toContain("reentry_outcome_json String");
+    expect(ddl).toContain("parent_state_key_json String");
+    expect(ddl).toContain("client_dispatch_outcome_json String");
+    expect(ddl).toContain("observation_status LowCardinality(String)");
     expect(ddl).toContain("TTL expires_at DELETE");
     expect(ddl).toContain("enable_block_number_column = 1");
     expect(ddl).toContain("enable_block_offset_column = 1");
+    expect(ddl).toContain("non_replicated_deduplication_window = 1000");
   });
 
   it("round-trips a row without storing credentials", async () => {
@@ -219,6 +243,10 @@ describe("ClickHouseToolExecutionStorageAdapter", () => {
     const serializedInsert = JSON.stringify(client.inserts);
     expect(serializedInsert).not.toContain("super-secret-password");
     expect(serializedInsert).not.toContain("authorization");
+    expect(client.inserts[0].clickhouse_settings).toMatchObject({
+      insert_deduplicate: 1,
+      insert_deduplication_token: expect.stringMatching(/^[a-f0-9]{64}$/),
+    });
   });
 
   it("uses revision predicates, parameters, and strict Lightweight UPDATE settings", async () => {
@@ -304,6 +332,22 @@ describe("ClickHouseToolExecutionStorageAdapter", () => {
     }
   });
 
+  it("adds the dispatchability predicate exactly once for Client Result lookup", async () => {
+    const client = new RecordingClickHouseClient();
+    const adapter = new ClickHouseToolExecutionStorageAdapter(config(), {
+      client,
+      now: () => fixedNow,
+      createMutationToken: tokenSequence(),
+    });
+    await adapter.create(context());
+
+    await adapter.findByCallId(context().key, "p1", { dispatchableOnly: true });
+
+    const lookup = client.queries.at(-1)?.query ?? "";
+    expect(lookup.match(/client_dispatch_status IN/g)).toHaveLength(1);
+    expect(lookup.match(/response_stream_status = 'completed'/g)).toHaveLength(1);
+  });
+
   it("decodes numeric strings and rejects corrupt JSON", () => {
     const original = context();
     const row: ToolExecutionStateRow = {
@@ -322,6 +366,10 @@ describe("ClickHouseToolExecutionStorageAdapter", () => {
       slots_json: JSON.stringify(original.slots),
       response_stream_status: "streaming",
       client_dispatch_status: "none",
+      reentry_lease_owner: "",
+      reentry_lease_until: "",
+      reentry_attempt: 0,
+      reentry_outcome_json: "",
       upstream_snapshot_json: JSON.stringify(original.upstreamSnapshot),
       revision: "0",
       mutation_token: "insert-1",
@@ -332,6 +380,8 @@ describe("ClickHouseToolExecutionStorageAdapter", () => {
 
     expect(decodeToolExecutionStateRow(row).context).toEqual(original);
     expect(() => decodeToolExecutionStateRow({ ...row, slots_json: "{bad" }))
+      .toThrow(/corrupt/);
+    expect(() => decodeToolExecutionStateRow({ ...row, schema_version: 2 }))
       .toThrow(/corrupt/);
   });
 
@@ -353,6 +403,18 @@ describe("ClickHouseToolExecutionStorageAdapter", () => {
     expect(thrown).toBeInstanceOf(NativeToolStateCapabilityError);
     expect((thrown as Error).message).toBe("ClickHouse Native Tool state capability probe failed");
     expect((thrown as Error).message).not.toContain("super-secret-password");
+  });
+
+  it("fails closed when an existing table lacks required TTL or update settings", async () => {
+    const client = new RecordingClickHouseClient();
+    client.schemaDdl = "CREATE TABLE native_tool_state_test (tool_batch_id String) ENGINE=MergeTree ORDER BY tool_batch_id";
+    const adapter = new ClickHouseToolExecutionStorageAdapter(config(), {
+      client,
+      now: () => fixedNow,
+      createMutationToken: tokenSequence(),
+    });
+
+    await expect(adapter.initializeAndProbe()).rejects.toBeInstanceOf(NativeToolStateCapabilityError);
   });
 });
 

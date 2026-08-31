@@ -6,6 +6,7 @@ import {
   buildUpstreamRequestSnapshot,
   createRestartExactTargetTransport,
   createRetainedExactTargetTransport,
+  fingerprintAnthropicLogicalRequest,
 } from "../exact-target-transport.js";
 
 const encoder = new TextEncoder();
@@ -40,6 +41,54 @@ function sentBody(): Record<string, unknown> {
 }
 
 describe("exact Anthropic target transport", () => {
+  it("fingerprints logical requests canonically and persists the explicit original payload", () => {
+    const first = {
+      model: "claude-test",
+      stream: true,
+      messages: [{ role: "user", content: "question" }],
+      metadata: { z: 2, a: 1 },
+    };
+    const reordered = {
+      metadata: { a: 1, z: 2 },
+      messages: [{ content: "question", role: "user" }],
+      stream: true,
+      model: "claude-test",
+    };
+    expect(fingerprintAnthropicLogicalRequest(first))
+      .toBe(fingerprintAnthropicLogicalRequest(reordered));
+    expect(fingerprintAnthropicLogicalRequest({ ...first, max_tokens: 2 }))
+      .not.toBe(fingerprintAnthropicLogicalRequest(first));
+
+    const intent = {
+      version: 1 as const,
+      agentSource: "claude-code",
+      identity: {
+        spaceId: "space-1",
+        teamId: "team-1",
+        userId: "user-1",
+        agentId: "agent-1",
+        sessionId: "session-1",
+      },
+      effects: { tdai: true, skill: false },
+    };
+    const fingerprint = fingerprintAnthropicLogicalRequest(first);
+    const snapshot = buildUpstreamRequestSnapshot({
+      body: sentBody(),
+      logicalBaseMessages: first.messages,
+      requestFingerprint: fingerprint,
+      observationIntent: intent,
+      url: "https://upstream.example/v1/messages",
+      model: "claude-test",
+      authSource: "agent",
+    });
+    expect(snapshot).toMatchObject({
+      logicalBaseMessages: first.messages,
+      requestFingerprint: fingerprint,
+      observationIntent: intent,
+    });
+    expect(JSON.stringify(snapshot)).not.toContain("userKey");
+  });
+
   it("snapshots only replay-safe request fields and reuses retained transport exactly", async () => {
     const snapshot = buildUpstreamRequestSnapshot({
       body: sentBody(),
@@ -84,6 +133,7 @@ describe("exact Anthropic target transport", () => {
       temperature: 0.2,
       stream: true,
     });
+    expect(snapshot.logicalBaseMessages).toEqual(snapshot.baseMessages);
     expect(snapshot.target.id).toMatch(/^sha256:/);
     expect(fetchImpl).toHaveBeenCalledTimes(1);
     const [url, init] = fetchImpl.mock.calls[0];
@@ -122,6 +172,7 @@ describe("exact Anthropic target transport", () => {
     }));
     const reenter = createRestartExactTargetTransport({
       config,
+      currentModel: "claude-test",
       agentSource: "claude-code",
       requestPath: "/messages",
       sessionId: "session-1",
@@ -149,6 +200,50 @@ describe("exact Anthropic target transport", () => {
     expect(JSON.stringify(init?.headers)).not.toContain("client-secret");
   });
 
+  it("reconstructs an agent credential retained across a retry to the configured default URL", async () => {
+    const config = structuredClone(DEFAULT_CONFIG);
+    config.upstream.url = "https://global.example/v1";
+    config.upstream.apiKey = "global-secret";
+    config.upstream.agents["claude-code"] = {
+      url: "https://agent.example/v1",
+      apiKey: "agent-secret",
+    };
+    const snapshot = buildUpstreamRequestSnapshot({
+      body: sentBody(),
+      url: "https://global.example/v1/messages",
+      model: "claude-test",
+      authSource: "agent",
+    });
+    const fetchImpl = vi.fn<typeof fetch>(async () => new Response(responseStream(), {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    }));
+    const reenter = createRestartExactTargetTransport({
+      config,
+      currentModel: "claude-test",
+      agentSource: "claude-code",
+      requestPath: "/messages",
+      sessionId: "session-1",
+      currentRequestHeaders: { "x-api-key": "client-secret" },
+      timeoutMs: 5_000,
+      fetchImpl,
+    });
+
+    await reenter({
+      upstreamSnapshot: snapshot,
+      messages: snapshot.baseMessages,
+      round: 2,
+      totalCalls: 1,
+    });
+
+    expect(fetchImpl).toHaveBeenCalledWith(
+      "https://global.example/v1/messages",
+      expect.objectContaining({
+        headers: expect.objectContaining({ "x-api-key": "agent-secret" }),
+      }),
+    );
+  });
+
   it.each([
     ["an extension-owned credential", "extension" as const, "https://agent.example/v1/messages", "claude-test"],
     ["a substituted URL", "agent" as const, "https://attacker.example/v1/messages", "claude-test"],
@@ -168,6 +263,7 @@ describe("exact Anthropic target transport", () => {
     const fetchImpl = vi.fn<typeof fetch>();
     const reenter = createRestartExactTargetTransport({
       config,
+      currentModel: "claude-test",
       agentSource: "claude-code",
       requestPath: "/messages",
       sessionId: "session-1",

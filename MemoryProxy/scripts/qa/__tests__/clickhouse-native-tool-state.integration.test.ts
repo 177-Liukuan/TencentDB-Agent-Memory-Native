@@ -140,6 +140,100 @@ describeIntegration("real ClickHouse Native Tool state", () => {
     expect(stored?.slots[0]).toMatchObject({ status: "running", executionAttempt: 1 });
   }, 30_000);
 
+  it("admits one creator under concurrent duplicate batch inserts", async () => {
+    const state = testContext(randomUUID());
+
+    const settled = await Promise.allSettled([
+      primary.create(structuredClone(state)),
+      secondary.create(structuredClone(state)),
+    ]);
+
+    expect(settled.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    expect(settled.filter((result) => result.status === "rejected")).toHaveLength(1);
+    expect(await primary.get(state.key)).toMatchObject({ key: state.key, revision: 0 });
+  }, 30_000);
+
+  it("leases and completes Client-result re-entry across Adapter instances", async () => {
+    const state = testContext(randomUUID());
+    state.responseStreamStatus = "completed";
+    state.clientDispatchStatus = "dispatched";
+    state.slots = [{
+      ...state.slots[0],
+      callId: `client-${state.key.toolBatchId}`,
+      toolName: "client_shell",
+      owner: "client",
+      status: "succeeded",
+      result: "/workspace",
+      isError: false,
+    }];
+    await primary.create(state);
+    const leaseUntil = new Date(Date.now() + 20_000).toISOString();
+
+    const claims = await Promise.all([
+      primary.tryClaimReentry({
+        key: state.key,
+        expectedRevision: 0,
+        leaseOwner: "integration-reentry-a",
+        leaseUntil,
+      }),
+      secondary.tryClaimReentry({
+        key: state.key,
+        expectedRevision: 0,
+        leaseOwner: "integration-reentry-b",
+        leaseUntil,
+      }),
+    ]);
+
+    expect(claims.filter(Boolean)).toHaveLength(1);
+    const claimed = (await primary.get(state.key))!;
+    expect(claimed).toMatchObject({ clientDispatchStatus: "resuming", reentryAttempt: 1 });
+    const renewedUntil = new Date(Date.now() + 30_000).toISOString();
+    expect(await primary.renewReentry({
+      key: state.key,
+      expectedRevision: claimed.revision,
+      leaseOwner: claimed.reentryLeaseOwner!,
+      leaseUntil: renewedUntil,
+    })).toBe(true);
+    const renewed = (await secondary.get(state.key))!;
+    expect(renewed).toMatchObject({ reentryLeaseUntil: renewedUntil });
+    expect(await secondary.completeReentry({
+      key: state.key,
+      expectedRevision: renewed.revision,
+      leaseOwner: claimed.reentryLeaseOwner!,
+      outcome: {
+        kind: "final",
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+        bodyBase64: "ZmluYWw=",
+      },
+    })).toBe(true);
+    expect(await primary.get(state.key)).toMatchObject({
+      clientDispatchStatus: "completed",
+      reentryOutcome: { bodyBase64: "ZmluYWw=" },
+      observationStatus: "pending",
+      observationOutcome: { status: 200, bodyBase64: "ZmluYWw=" },
+    });
+    const pendingObservation = (await primary.get(state.key))!;
+    const observationLeaseUntil = new Date(Date.now() + 20_000).toISOString();
+    expect(await secondary.tryClaimObservation({
+      key: state.key,
+      expectedRevision: pendingObservation.revision,
+      leaseOwner: "integration-observer",
+      leaseUntil: observationLeaseUntil,
+    })).toBe(true);
+    const runningObservation = (await primary.get(state.key))!;
+    expect(runningObservation).toMatchObject({
+      observationStatus: "running",
+      observationAttempt: 1,
+    });
+    expect(await primary.completeObservation({
+      key: state.key,
+      expectedRevision: runningObservation.revision,
+      leaseOwner: "integration-observer",
+    })).toBe(true);
+    expect(await secondary.get(state.key)).toMatchObject({ observationStatus: "completed" });
+  }, 30_000);
+
   it("merges a stream snapshot racing a Native result without losing either", async () => {
     const batchId = randomUUID();
     const state = testContext(batchId);

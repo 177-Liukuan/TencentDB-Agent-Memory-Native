@@ -8,6 +8,7 @@
  */
 
 import type { Context } from "hono";
+import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
 import { writeLog, createPipeline } from "./logger.js";
 import {
@@ -59,17 +60,42 @@ import {
 } from "./rate-limit/guard.js";
 import { describeNativeProxyToolInjectionFailure } from "./native-proxy-tools/native-proxy-tools-injector.js";
 import { getNativeProxyToolRuntime } from "./native-proxy-tools/runtime.js";
+import type { NativeProxyToolRegistry } from "./native-proxy-tools/tool-registry.js";
 import { AnthropicToolLoopCoordinator, type ToolLoopDecision } from "./native-proxy-tools/tool-loop-coordinator.js";
-import { resumeClientToolResults } from "./native-proxy-tools/client-tool-resume.js";
+import {
+  completeClientToolReentry,
+  createPersistedClientReentryOutcome,
+  renewClientToolReentry,
+  resumeClientToolResults,
+} from "./native-proxy-tools/client-tool-resume.js";
 import {
   buildUpstreamRequestSnapshot,
   createRestartExactTargetTransport,
   createRetainedExactTargetTransport,
+  fingerprintAnthropicLogicalRequest,
 } from "./native-proxy-tools/exact-target-transport.js";
 import type {
   PersistedForwardTarget,
+  PersistedToolObservationIntent,
+  ToolExecutionContext,
   ToolExecutionScope,
+  ToolExecutionStateKey,
 } from "./native-proxy-tools/types.js";
+import { nativeToolLeaseDurationMs } from "./native-proxy-tools/types.js";
+import {
+  assertNoNativeToolLeak,
+  buildNativeRegistryLeakMarkers,
+  buildClientVisibleAnthropicSse,
+  mergeNativeToolLeakMarkers,
+} from "./native-proxy-tools/anthropic-response-rebuilder.js";
+import { isLogicalFinalToolLoopDecision } from "./native-proxy-tools/observation-policy.js";
+import {
+  claimToolObservation,
+  completeToolObservation,
+  ToolObservationOutboxError,
+} from "./native-proxy-tools/observation-outbox.js";
+import { extractAnthropicLogicalResponse } from "./native-proxy-tools/anthropic-logical-response.js";
+import type { ToolExecutionStorageAdapter } from "./db/tool-execution-storage-adapter.js";
 
 const SKIP_REQUEST_HEADERS = new Set([
   "host",
@@ -137,6 +163,14 @@ function nativeToolScope(input: {
   };
 }
 
+function nativeReentryLeaseWindowMs(config: ProxyConfig): number {
+  const configuredForward = config.server.forwardTimeoutMs ?? 600_000;
+  const forwardWindow = configuredForward > 0
+    ? configuredForward
+    : config.nativeProxyTools.stateTtlSeconds * 1_000;
+  return forwardWindow + nativeToolLeaseDurationMs(config.nativeProxyTools.toolTimeoutMs);
+}
+
 function successfulAuthSource(input: {
   retried: boolean;
   target: ForwardTarget;
@@ -167,6 +201,261 @@ function createTdaiClient(config: ProxyConfig, spaceId?: string): TdaiClient | n
     l1Limit: config.tdai.memory.l1Limit,
     l2Limit: config.tdai.memory.l2Limit,
     timeoutMs: config.tdai.memory.timeoutMs,
+  });
+}
+
+async function flushDurableNativeToolObservation(input: {
+  storage: ToolExecutionStorageAdapter;
+  stateKey: ToolExecutionStateKey;
+  bytes?: Uint8Array;
+  leaseMs: number;
+  config: ProxyConfig;
+}): Promise<void> {
+  const persisted = await input.storage.get(input.stateKey);
+  if (!persisted) {
+    throw new ToolObservationOutboxError(
+      "native_tool_observation_state_unavailable",
+      "Native Tool observation state is unavailable",
+    );
+  }
+  if (persisted.observationStatus === undefined
+    || persisted.observationStatus === "none"
+    || persisted.observationStatus === "completed") return;
+
+  const intent = persisted.upstreamSnapshot.observationIntent;
+  const outcome = persisted.observationOutcome;
+  const logicalMessages = persisted.upstreamSnapshot.logicalBaseMessages;
+  if (!intent || !outcome || !logicalMessages) {
+    throw new ToolObservationOutboxError(
+      "native_tool_observation_payload_unavailable",
+      "Native Tool observation payload is unavailable",
+    );
+  }
+  const responseBytes = new Uint8Array(Buffer.from(outcome.bodyBase64, "base64"));
+  if (input.bytes && !Buffer.from(input.bytes).equals(Buffer.from(responseBytes))) {
+    throw new ToolObservationOutboxError(
+      "native_tool_observation_payload_mismatch",
+      "Native Tool observation payload does not match persisted state",
+    );
+  }
+  const response = extractAnthropicLogicalResponse(responseBytes);
+  const sessionInfo: Record<string, unknown> = {
+    space_id: intent.identity.spaceId,
+    team_id: intent.identity.teamId,
+    user_id: intent.identity.userId,
+    agent_id: intent.identity.agentId,
+    session_id: intent.identity.sessionId,
+    ...(intent.identity.taskId ? { task_id: intent.identity.taskId } : {}),
+  };
+  const tdaiIdentity: TdaiIdentity = {
+    teamId: intent.identity.teamId,
+    userId: intent.identity.userId,
+    agentId: intent.identity.agentId,
+    sessionId: intent.identity.sessionId,
+    ...(intent.identity.taskId ? { taskId: intent.identity.taskId } : {}),
+  };
+  const tdaiUserMessage = extractLatestUserMessage(logicalMessages);
+  const tdaiClient = intent.effects.tdai
+    ? createTdaiClient(input.config, intent.identity.spaceId)
+    : null;
+  if (intent.effects.tdai && (
+    !tdaiClient
+    || !tdaiUserMessage
+    || !input.config.tdai.memory.writeL0
+  )) {
+    throw new ToolObservationOutboxError(
+      "native_tool_observation_dependency_unavailable",
+      "Native Tool memory writeback dependency is unavailable",
+    );
+  }
+  if (intent.effects.skill && (
+    !input.config.coreSkill?.endpoint
+    || !input.config.coreSkill?.serviceToken
+  )) {
+    throw new ToolObservationOutboxError(
+      "native_tool_observation_dependency_unavailable",
+      "Native Tool skill writeback dependency is unavailable",
+    );
+  }
+
+  const claim = await claimToolObservation({
+    storage: input.storage,
+    key: input.stateKey,
+    leaseMs: input.leaseMs,
+  });
+  if (intent.effects.tdai) {
+    await withL0Retry(() => recordTdaiTurn(
+      tdaiClient!,
+      tdaiIdentity,
+      tdaiUserMessage,
+      response.outputText || null,
+      {
+        idempotencyKey: claim.idempotencyKey,
+        requireSuccess: true,
+      },
+    ));
+  }
+
+  if (intent.effects.skill) {
+    await triggerSkillExtractIfReady({
+      config: input.config,
+      sessionKey: intent.identity.sessionId,
+      agentSource: intent.agentSource,
+      sessionInfo,
+      inputMessages: logicalMessages,
+      assistantMessage: response.outputText
+        ? { role: "assistant", content: response.outputText }
+        : null,
+      protocol: "anthropic",
+      toolCallCountOverride: response.toolUseCount,
+      idempotencyKey: claim.idempotencyKey,
+      throwOnError: true,
+    });
+  }
+  await completeToolObservation(
+    input.storage,
+    input.stateKey,
+    claim.leaseOwner,
+  );
+}
+
+function buildPersistedToolObservationIntent(input: {
+  config: ProxyConfig;
+  scope: ToolExecutionScope;
+  requestKind: CcRequestKind;
+  tdaiIdentity: TdaiIdentity | null;
+  logicalMessages: unknown[];
+  assetCapabilities?: import("./injection/types.js").AssetCapabilityFlags;
+}): PersistedToolObservationIntent | undefined {
+  const identity = input.tdaiIdentity;
+  if (!identity) return undefined;
+  const isMain = input.requestKind === "main";
+  const tdai = isMain
+    && input.assetCapabilities?.chat_memory !== false
+    && input.config.tdai.enabled
+    && input.config.tdai.memory.enabled
+    && input.config.tdai.memory.writeL0
+    && Boolean(input.config.tdai.endpoint)
+    && isExtractionAllowed(input.config, "tdai-memory")
+    && extractLatestUserMessage(input.logicalMessages) !== null;
+  const skill = isMain
+    && input.assetCapabilities?.skill !== false
+    && Boolean(input.config.coreSkill?.endpoint)
+    && Boolean(input.config.coreSkill?.serviceToken)
+    && isExtractionAllowed(input.config, "skill");
+  return {
+    version: 1,
+    agentSource: input.scope.agentSource,
+    identity: {
+      spaceId: input.scope.spaceId,
+      teamId: identity.teamId,
+      userId: identity.userId,
+      agentId: identity.agentId,
+      sessionId: identity.sessionId,
+      ...(identity.taskId ? { taskId: identity.taskId } : {}),
+    },
+    effects: { tdai, skill },
+  };
+}
+
+async function findRecoverableNativeObservation(input: {
+  storage: ToolExecutionStorageAdapter;
+  scope: ToolExecutionScope;
+  requestFingerprint: string;
+}): Promise<ToolExecutionContext | null> {
+  const contexts = await input.storage.findActiveBySession(input.scope);
+  return contexts
+    .filter((context) => (
+      context.responseStreamStatus === "completed"
+      && context.clientDispatchStatus === "none"
+      && context.upstreamSnapshot.requestFingerprint === input.requestFingerprint
+      && context.observationOutcome !== undefined
+      && ["pending", "running", "completed"].includes(context.observationStatus ?? "none")
+    ))
+    .sort((left, right) => (
+      right.turnSeq - left.turnSeq
+      || Date.parse(right.updatedAt) - Date.parse(left.updatedAt)
+    ))[0] ?? null;
+}
+
+async function replayRecoverableNativeObservation(input: {
+  storage: ToolExecutionStorageAdapter;
+  registry: NativeProxyToolRegistry;
+  scope: ToolExecutionScope;
+  requestFingerprint: string;
+  leaseMs: number;
+  config: ProxyConfig;
+  traceId: string;
+}): Promise<Response | null> {
+  let recoverable: ToolExecutionContext | null;
+  try {
+    recoverable = await findRecoverableNativeObservation(input);
+  } catch {
+    return nativeToolErrorResponse(
+      503,
+      "native_tool_observation_state_unavailable",
+      "Native Tool observation state is unavailable",
+    );
+  }
+  if (!recoverable?.observationOutcome) return null;
+  const recoveryBytes = new Uint8Array(Buffer.from(
+    recoverable.observationOutcome.bodyBase64,
+    "base64",
+  ));
+  const persistedMarkers = mergeNativeToolLeakMarkers(
+    recoverable.upstreamSnapshot.nativeLeakMarkers ?? [],
+    recoverable.slots
+      .filter((slot) => slot.owner === "proxy")
+      .map((slot) => ({
+        callId: slot.callId,
+        toolName: slot.toolName,
+        ...(slot.input !== undefined ? { input: structuredClone(slot.input) } : {}),
+      })),
+  );
+  try {
+    assertNoNativeToolLeak(recoveryBytes, [
+      ...persistedMarkers,
+      ...buildNativeRegistryLeakMarkers(input.registry),
+    ]);
+  } catch {
+    return nativeToolErrorResponse(
+      500,
+      "native_tool_leak_detected",
+      "Persisted Native Proxy Tool response could not be replayed safely",
+    );
+  }
+  try {
+    await flushDurableNativeToolObservation({
+      storage: input.storage,
+      stateKey: recoverable.key,
+      bytes: recoveryBytes,
+      leaseMs: input.leaseMs,
+      config: input.config,
+    });
+  } catch (error) {
+    const code = error instanceof ToolObservationOutboxError
+      ? error.code
+      : "native_tool_observation_failed";
+    return nativeToolErrorResponse(
+      503,
+      code,
+      "Native Tool logical-turn writeback is pending and must be retried",
+    );
+  }
+  const recoveryHeaders = new Headers(recoverable.observationOutcome.headers);
+  const recoveryPipe = createPipeline(
+    input.config,
+    input.traceId,
+    recoverable.upstreamSnapshot.target.model,
+  );
+  const recoveryIsSse = recoveryHeaders.get("content-type")
+    ?.toLowerCase().includes("text/event-stream");
+  const recoveryOutput = recoveryIsSse
+    ? streamFromBytes(recoveryBytes).pipeThrough(createSseThinkingFixStream(recoveryPipe))
+    : streamFromBytes(recoveryBytes);
+  return new Response(recoveryOutput, {
+    status: recoverable.observationOutcome.status,
+    headers: recoveryHeaders,
   });
 }
 
@@ -651,6 +940,35 @@ export async function handleAnthropicMessages(
   const modelAliasApplied = typeof body.model === "string" && modelId !== requestedModel;
   if (modelAliasApplied) body.model = modelId;
 
+  const isStream = body.stream === true;
+  const nativeToolRuntime = config.nativeProxyTools.enabled && isStream
+    ? getNativeProxyToolRuntime(config)
+    : null;
+  // Capture the client-visible logical request before session/injection
+  // mutations. This digest is the restart-replay key and must not depend on
+  // mutable recovered session metadata.
+  const nativeLogicalRequestFingerprint = nativeToolRuntime
+    ? fingerprintAnthropicLogicalRequest(body)
+    : undefined;
+  const nativeLogicalBaseMessages = nativeToolRuntime && Array.isArray(body.messages)
+    ? structuredClone(body.messages)
+    : undefined;
+  const reservedClientTool = Array.isArray(body.tools)
+    ? body.tools.find((tool) => (
+        tool !== null
+        && typeof tool === "object"
+        && typeof (tool as Record<string, unknown>).name === "string"
+        && nativeToolRuntime?.registry.owns((tool as Record<string, unknown>).name as string)
+      )) as Record<string, unknown> | undefined
+    : undefined;
+  if (reservedClientTool) {
+    return nativeToolErrorResponse(
+      400,
+      "reserved_native_proxy_tool_name",
+      `Tool name '${String(reservedClientTool.name)}' is reserved by the proxy`,
+    );
+  }
+
   // ── System-user short-circuit ────────────────────────────────────────────
   // Internal service accounts (see `systemUsers` config) bypass the entire
   // pipeline: no session-init, no injection, no routing. Matching key is
@@ -669,11 +987,8 @@ export async function handleAnthropicMessages(
   }
 
   let messages = Array.isArray(body.messages) ? body.messages : [];
-  const isStream = body.stream === true;
   let hasTools = Array.isArray(body.tools) && body.tools.length > 0;
-  const nativeToolRuntime = config.nativeProxyTools.enabled && isStream
-    ? getNativeProxyToolRuntime(config)
-    : null;
+  let nativeToolDefinitionInjected = false;
   if (nativeToolRuntime) {
     try {
       await nativeToolRuntime.ready();
@@ -728,6 +1043,33 @@ export async function handleAnthropicMessages(
 
   // sk-mem key（用于 TDAI ACL / MetadataClient 的 x-tdai-user-key）就是入口的 apiKey。
   const callerUserKey = apiKey || null;
+
+  // Restart replay must run before session-init. If the session store is
+  // temporarily missing or has changed, the original persisted observation
+  // identity still owns writeback and the retry must not fall into a new form.
+  const earlyNativeStorage = nativeToolRuntime?.storage;
+  if (earlyNativeStorage && nativeLogicalRequestFingerprint) {
+    const earlyObservationScope = nativeToolScope({
+      spaceId,
+      userId,
+      agentSource,
+      sessionKey,
+      sessionInfo: undefined,
+      config,
+    });
+    const recoveredResponse = await nativeToolRuntime.runOperation(() => (
+      replayRecoverableNativeObservation({
+        storage: earlyNativeStorage,
+        registry: nativeToolRuntime.registry,
+        scope: earlyObservationScope,
+        requestFingerprint: nativeLogicalRequestFingerprint,
+        leaseMs: nativeReentryLeaseWindowMs(config),
+        config,
+        traceId,
+      })
+    ));
+    if (recoveredResponse) return recoveredResponse;
+  }
 
   // Activate Redis storage early — must run BEFORE session init.
   if (config.redis?.enabled) {
@@ -954,8 +1296,11 @@ export async function handleAnthropicMessages(
     && nativeToolRuntime.dispatcher
     && toolExecutionScope
   ) {
+    const nativeStorage = nativeToolRuntime.storage;
+    const nativeDispatcher = nativeToolRuntime.dispatcher;
     const restartReentry = createRestartExactTargetTransport({
       config,
+      currentModel: modelId,
       agentSource,
       requestPath: "/messages",
       sessionId: sessionKey,
@@ -970,37 +1315,190 @@ export async function handleAnthropicMessages(
         });
       },
     });
-    const resume = await resumeClientToolResults({
+    let selectedReentry: typeof restartReentry | undefined;
+    const resumeExactReentry = (
+      request: Parameters<typeof restartReentry>[0],
+      stateKey: Parameters<typeof nativeToolRuntime.getRetainedExactTarget>[0],
+    ) => {
+      selectedReentry ??= nativeToolRuntime.getRetainedExactTarget(
+        stateKey,
+      ) ?? restartReentry;
+      return selectedReentry(request);
+    };
+    const exactReentry: typeof restartReentry = (request) => (
+      (selectedReentry ?? restartReentry)(request)
+    );
+    const reentryLeaseMs = nativeReentryLeaseWindowMs(config);
+
+    // A pure-Native final response has no Client Tool Result request to drive
+    // recovery. Locate its durable outbox by the immutable logical request
+    // digest, flush it, and replay the exact persisted client-visible bytes.
+    if (nativeLogicalRequestFingerprint) {
+      const recoveredResponse = await nativeToolRuntime.runOperation(() => (
+        replayRecoverableNativeObservation({
+          storage: nativeStorage,
+          registry: nativeToolRuntime.registry,
+          scope: toolExecutionScope,
+          requestFingerprint: nativeLogicalRequestFingerprint,
+          leaseMs: reentryLeaseMs,
+          config,
+          traceId,
+        })
+      ));
+      if (recoveredResponse) return recoveredResponse;
+    }
+
+    const resume = await nativeToolRuntime.runOperation(() => resumeClientToolResults({
       body,
       scope: toolExecutionScope,
-      storage: nativeToolRuntime.storage,
-      dispatcher: nativeToolRuntime.dispatcher,
+      storage: nativeStorage,
+      dispatcher: nativeDispatcher,
       limits: config.nativeProxyTools,
-      reenter: restartReentry,
-    });
+      reentryLeaseMs,
+      reenter: resumeExactReentry,
+    }));
     if (resume.kind === "error") {
       return nativeToolErrorResponse(resume.status, resume.code, resume.message);
     }
+    if (resume.kind === "replay") {
+      try {
+        assertNoNativeToolLeak(resume.bytes, [
+          ...resume.nativeLeakMarkers,
+          ...buildNativeRegistryLeakMarkers(nativeToolRuntime.registry),
+        ]);
+      } catch {
+        return nativeToolErrorResponse(
+          500,
+          "native_tool_leak_detected",
+          "Persisted Native Proxy Tool response could not be replayed safely",
+        );
+      } finally {
+        nativeToolRuntime.releaseExactTarget(resume.stateKey);
+      }
+      if (isLogicalFinalToolLoopDecision(resume.outcomeKind)) {
+        try {
+          await nativeToolRuntime.runOperation(() => flushDurableNativeToolObservation({
+            storage: nativeStorage,
+            stateKey: resume.stateKey,
+            bytes: resume.bytes,
+            leaseMs: reentryLeaseMs,
+            config,
+          }));
+        } catch (error) {
+          const code = error instanceof ToolObservationOutboxError
+            ? error.code
+            : "native_tool_observation_failed";
+          return nativeToolErrorResponse(
+            503,
+            code,
+            "Native Tool logical-turn writeback is pending and must be retried",
+          );
+        }
+      }
+      const replayHeaders = new Headers(resume.headers);
+      const replayPipe = createPipeline(config, traceId, modelId);
+      const replayIsSse = replayHeaders.get("content-type")
+        ?.toLowerCase().includes("text/event-stream");
+      const replayOutput = replayIsSse
+        ? streamFromBytes(resume.bytes).pipeThrough(createSseThinkingFixStream(replayPipe))
+        : streamFromBytes(resume.bytes);
+      return new Response(replayOutput, { status: resume.status, headers: replayHeaders });
+    }
     if (resume.kind === "reentered") {
+      const renewParentReentry = () => renewClientToolReentry(
+        nativeStorage,
+        resume.stateKey,
+        resume.reentryLeaseOwner,
+        reentryLeaseMs,
+      );
+      await nativeToolRuntime.runOperation(renewParentReentry);
       const resumePipe = createPipeline(config, traceId, resume.upstreamSnapshot.target.model);
       resumePipe.requestReceived(resume.messages.length, true);
       resumePipe.forwardStart();
       resumePipe.forwardDone(resume.upstreamRound.status);
+      let parentContinuationCommitted = false;
       const coordinator = new AnthropicToolLoopCoordinator({
         registry: nativeToolRuntime.registry,
-        storage: nativeToolRuntime.storage,
-        dispatcher: nativeToolRuntime.dispatcher,
+        storage: nativeStorage,
+        dispatcher: nativeDispatcher,
         limits: config.nativeProxyTools,
-        reenter: restartReentry,
+        reenter: exactReentry,
+        trackBackgroundOperation: (operation) => nativeToolRuntime.trackBackgroundOperation(operation),
+        beforeReenter: renewParentReentry,
+        beforeClientDispatch: renewParentReentry,
+        onClientDispatchPrepared: async (dispatch) => {
+          await completeClientToolReentry(
+            nativeStorage,
+            resume.stateKey,
+            resume.reentryLeaseOwner,
+            createPersistedClientReentryOutcome({
+              kind: "client_dispatch",
+              status: dispatch.status,
+              headers: dispatch.headers,
+              bytes: dispatch.bytes,
+              childStateKey: dispatch.stateKey,
+            }),
+          );
+          parentContinuationCommitted = true;
+        },
       });
-      const decision = await coordinator.handleRound({
+      const decision = await nativeToolRuntime.runOperation(() => coordinator.handleRound({
         ...resume.upstreamRound,
         scope: toolExecutionScope,
         turnSeq: resume.turnSeq,
         upstreamSnapshot: resume.upstreamSnapshot,
         round: resume.round,
         totalCalls: resume.totalCalls,
-      });
+        parentStateKey: resume.stateKey,
+        parentReentryAttempt: resume.reentryAttempt,
+      }));
+      try {
+        assertNoNativeToolLeak(decision.bytes, [
+          ...resume.nativeLeakMarkers,
+          ...buildNativeRegistryLeakMarkers(nativeToolRuntime.registry),
+        ]);
+      } catch {
+        return nativeToolErrorResponse(
+          500,
+          "native_tool_leak_detected",
+          "Native Proxy Tool response could not be returned safely",
+        );
+      }
+      if (parentContinuationCommitted && decision.kind !== "client_dispatch") {
+        nativeToolRuntime.releaseExactTarget(resume.stateKey);
+        return nativeToolErrorResponse(
+          503,
+          "native_tool_child_dispatch_incomplete",
+          "Client Tool continuation was persisted and must be retried",
+        );
+      }
+      if (decision.kind === "client_dispatch" && selectedReentry) {
+        nativeToolRuntime.retainExactTarget(decision.stateKey, selectedReentry);
+      }
+      try {
+        if (!parentContinuationCommitted) {
+          await completeClientToolReentry(
+            nativeStorage,
+            resume.stateKey,
+            resume.reentryLeaseOwner,
+            createPersistedClientReentryOutcome({
+              kind: decision.kind,
+              status: decision.status,
+              headers: decision.headers,
+              bytes: decision.bytes,
+              ...(decision.kind === "client_dispatch"
+                ? { childStateKey: decision.stateKey }
+                : {}),
+            }),
+          );
+        }
+      } catch (error) {
+        if (decision.kind === "client_dispatch") {
+          nativeToolRuntime.releaseExactTarget(decision.stateKey);
+        }
+        throw error;
+      }
+      nativeToolRuntime.releaseExactTarget(resume.stateKey);
 
       const resumeTags = [
         `agent_source:${agentSource}`,
@@ -1009,6 +1507,13 @@ export async function handleAnthropicMessages(
         `session:${sessionKey}`,
         "native-tool-resume",
       ];
+      const resumeObservationBody: Record<string, unknown> = {
+        ...resume.upstreamSnapshot.requestParameters,
+        messages: resume.logicalMessages,
+        ...(resume.upstreamSnapshot.system !== undefined
+          ? { system: resume.upstreamSnapshot.system }
+          : {}),
+      };
       const resumeLf: LangfuseTurnContext = {
         traceId: langfuseTurnTraceId(sessionKey, resume.turnSeq),
         turnSeq: resume.turnSeq,
@@ -1021,14 +1526,8 @@ export async function handleAnthropicMessages(
           config,
           lcHeaders,
           c.req.path,
-          {
-            ...resume.upstreamSnapshot.requestParameters,
-            messages: resume.upstreamSnapshot.baseMessages,
-            ...(resume.upstreamSnapshot.system !== undefined
-              ? { system: resume.upstreamSnapshot.system }
-              : {}),
-          },
-          resume.upstreamSnapshot.baseMessages,
+          resumeObservationBody,
+          resume.logicalMessages,
         ),
       };
       const resumeForkTraceId = opikCreateTrace(config, {
@@ -1038,7 +1537,7 @@ export async function handleAnthropicMessages(
         startTime,
         input: {
           messages: flattenAnthropicMessagesForOpik(
-            resume.upstreamSnapshot.baseMessages,
+            resume.logicalMessages,
             resume.upstreamSnapshot.system,
           ),
         },
@@ -1061,11 +1560,11 @@ export async function handleAnthropicMessages(
         sessionKey,
         userKey: callerUserKey,
       });
-      const resumeInputMessages = resume.upstreamSnapshot.baseMessages;
+      const resumeInputMessages = resume.logicalMessages;
       const resumeDebug = config.langfuse.debug === true;
       const resumeDebugMetadata = buildRequestDebugMetadata({
         debug: resumeDebug,
-        body,
+        body: resumeObservationBody,
         headers: reqHeaders,
         agentSource,
         requestKind,
@@ -1074,6 +1573,26 @@ export async function handleAnthropicMessages(
         requestPath: c.req.path,
         protocol: "anthropic",
       });
+      if (isLogicalFinalToolLoopDecision(decision.kind)) {
+        try {
+          await nativeToolRuntime.runOperation(() => flushDurableNativeToolObservation({
+            storage: nativeStorage,
+            stateKey: resume.stateKey,
+            bytes: decision.bytes,
+            leaseMs: reentryLeaseMs,
+            config,
+          }));
+        } catch (error) {
+          const code = error instanceof ToolObservationOutboxError
+            ? error.code
+            : "native_tool_observation_failed";
+          return nativeToolErrorResponse(
+            503,
+            code,
+            "Native Tool logical-turn writeback is pending and must be retried",
+          );
+        }
+      }
       observeNativeToolDecision(decision, {
         config,
         modelId: resume.upstreamSnapshot.target.model,
@@ -1100,7 +1619,8 @@ export async function handleAnthropicMessages(
         lf: resumeLf,
         spaceId,
         upstreamRequestId: decision.headers.get("x-request-id") ?? "",
-        requestKind,
+        // Durable outbox above exclusively owns L0/Skill for resumed turns.
+        requestKind: "fork",
         langfuseDebug: resumeDebug,
         debugMetadata: resumeDebugMetadata,
         preparedStats: null,
@@ -1268,6 +1788,7 @@ export async function handleAnthropicMessages(
     && config.injection.injectors.length > 0;
   const nativeToolInjectionEnabled = config.nativeProxyTools.enabled
     && isStream
+    && requestKind === "main"
     && config.tdai.enabled
     && config.tdai.memory.enabled;
   if (!injectedSkipped && !skipInjection && (legacyInjectionEnabled || nativeToolInjectionEnabled)) {
@@ -1290,12 +1811,25 @@ export async function handleAnthropicMessages(
         // 透传原始请求路径 —— AssetReflectionInjector 用它判断 `/analyse` marker。
         // 其它 injector 不依赖此字段。
         requestPath: c.req.path,
-        custom: sessionInfo ? { session: sessionInfo, userKey: callerUserKey ?? undefined, assetCapabilities } : undefined,
+        custom: {
+          ...(sessionInfo
+            ? { session: sessionInfo, userKey: callerUserKey ?? undefined, assetCapabilities }
+            : {}),
+          nativeProxyEligible: requestKind === "main",
+        },
         readOnly: requestKind === "fork",
       });
       body = injectedBody;
       messages = Array.isArray(injectedBody.messages) ? injectedBody.messages : messages;
       hasTools = Array.isArray(body.tools) && body.tools.length > 0;
+      nativeToolDefinitionInjected = requestKind === "main"
+        && Array.isArray(body.tools)
+        && body.tools.some((tool) => (
+          tool !== null
+          && typeof tool === "object"
+          && typeof (tool as Record<string, unknown>).name === "string"
+          && nativeToolRuntime?.registry.owns((tool as Record<string, unknown>).name as string)
+        ));
     } catch (err: unknown) {
       console.error("[injection] anthropic pipeline error:", err instanceof Error ? err.message : String(err));
       const nativeFailure = describeNativeProxyToolInjectionFailure(err);
@@ -1389,6 +1923,9 @@ export async function handleAnthropicMessages(
   const debugMetadata = buildRequestDebugMetadata({
     debug: langfuseDebug,
     body: body as Record<string, unknown>,
+    ...(nativeToolRuntime
+      ? { hiddenToolNames: nativeToolRuntime.registry.list().map((tool) => tool.name) }
+      : {}),
     headers: reqHeaders,
     agentSource,
     requestKind,
@@ -1546,11 +2083,39 @@ export async function handleAnthropicMessages(
       return new Response(null, { status: upstreamResp.status, headers: respHeaders });
     }
 
-    // Log error body for 4xx
-    if (!retried && upstreamResp.status >= 400 && upstreamResp.status < 500) {
+    // Anthropic error responses are ordinary JSON, not SSE. Preserve every
+    // non-2xx status/body exactly (including a retry result) before the Native
+    // coordinator is allowed to acquire the sole successful-SSE consumer.
+    if (upstreamResp.status < 200 || upstreamResp.status >= 300) {
       const errBytes = new Uint8Array(await upstreamResp.arrayBuffer());
       const errText = new TextDecoder().decode(errBytes);
-      pipe.error("UPSTREAM_4xx", `status=${upstreamResp.status} body=${errText.slice(0, 1000)}`);
+      const sentErrorBody = retried ? retryBody : upstreamBody;
+      const sentNativeToolDefinition = nativeToolDefinitionInjected
+        && nativeToolRuntime !== null
+        && Array.isArray(sentErrorBody.tools)
+        && sentErrorBody.tools.some((tool) => (
+          tool !== null
+          && typeof tool === "object"
+          && typeof (tool as Record<string, unknown>).name === "string"
+          && nativeToolRuntime.registry.owns((tool as Record<string, unknown>).name as string)
+        ));
+      if (sentNativeToolDefinition) {
+        try {
+          assertNoNativeToolLeak(
+            errBytes,
+            buildNativeRegistryLeakMarkers(nativeToolRuntime.registry),
+          );
+        } catch {
+          pipe.error("NATIVE_TOOL_LEAK", "upstream error response echoed Native Tool data");
+          pipe.streamDone(null);
+          return nativeToolErrorResponse(
+            500,
+            "native_tool_leak_detected",
+            "Anthropic upstream error response could not be returned safely",
+          );
+        }
+      }
+      pipe.error("UPSTREAM_NON_2XX", `status=${upstreamResp.status} body=${errText.slice(0, 1000)}`);
       writeLog(config, {
         timestamp: new Date().toISOString(),
         event: "usage",
@@ -1579,13 +2144,23 @@ export async function handleAnthropicMessages(
       return new Response(errBytes, { status: upstreamResp.status, headers: respHeaders });
     }
 
+    const successfulBody = retried ? retryBody : upstreamBody;
+    const sentNativeToolDefinition = nativeToolDefinitionInjected
+      && Array.isArray(successfulBody.tools)
+      && successfulBody.tools.some((tool) => (
+        tool !== null
+        && typeof tool === "object"
+        && typeof (tool as Record<string, unknown>).name === "string"
+        && nativeToolRuntime?.registry.owns((tool as Record<string, unknown>).name as string)
+      ));
     if (
       nativeToolRuntime
       && nativeToolRuntime.storage
       && nativeToolRuntime.dispatcher
       && toolExecutionScope
+      && sentNativeToolDefinition
     ) {
-      const successfulBody = retried ? retryBody : upstreamBody;
+      const nativeStream = upstreamResp.body;
       const successfulUrl = retried && target.retryTarget
         ? target.retryTarget.url
         : target.url;
@@ -1601,10 +2176,23 @@ export async function handleAnthropicMessages(
         : effectiveModel;
       let upstreamSnapshot;
       try {
+        const logicalMessages = nativeLogicalBaseMessages ?? messages;
         upstreamSnapshot = buildUpstreamRequestSnapshot({
           body: successfulBody,
           url: successfulUrl,
           model: successfulModel,
+          ...(nativeLogicalRequestFingerprint
+            ? { requestFingerprint: nativeLogicalRequestFingerprint }
+            : {}),
+          logicalBaseMessages: logicalMessages,
+          observationIntent: buildPersistedToolObservationIntent({
+            config,
+            scope: toolExecutionScope,
+            requestKind,
+            tdaiIdentity,
+            logicalMessages,
+            assetCapabilities,
+          }),
           authSource: successfulAuthSource({
             retried,
             target,
@@ -1639,9 +2227,10 @@ export async function handleAnthropicMessages(
         dispatcher: nativeToolRuntime.dispatcher,
         limits: config.nativeProxyTools,
         reenter,
+        trackBackgroundOperation: (operation) => nativeToolRuntime.trackBackgroundOperation(operation),
       });
-      const decision = await coordinator.handleRound({
-        stream: upstreamResp.body,
+      const decision = await nativeToolRuntime.runOperation(() => coordinator.handleRound({
+        stream: nativeStream,
         status: upstreamResp.status,
         headers: respHeaders,
         scope: toolExecutionScope,
@@ -1649,7 +2238,32 @@ export async function handleAnthropicMessages(
         upstreamSnapshot,
         round: 1,
         totalCalls: 0,
-      });
+      }));
+      if (decision.kind === "client_dispatch") {
+        nativeToolRuntime.retainExactTarget(decision.stateKey, reenter);
+      }
+      if (decision.kind === "final" && decision.observationStateKey) {
+        const observationStateKey = decision.observationStateKey;
+        const observationStorage = nativeToolRuntime.storage;
+        try {
+          await nativeToolRuntime.runOperation(() => flushDurableNativeToolObservation({
+            storage: observationStorage,
+            stateKey: observationStateKey,
+            bytes: decision.bytes,
+            leaseMs: nativeReentryLeaseWindowMs(config),
+            config,
+          }));
+        } catch (error) {
+          const code = error instanceof ToolObservationOutboxError
+            ? error.code
+            : "native_tool_observation_failed";
+          return nativeToolErrorResponse(
+            503,
+            code,
+            "Native Tool logical-turn writeback is pending and must be retried",
+          );
+        }
+      }
 
       observeNativeToolDecision(decision, {
         config,
@@ -1677,7 +2291,9 @@ export async function handleAnthropicMessages(
         lf,
         spaceId,
         upstreamRequestId: decision.headers.get("x-request-id") ?? upstreamRequestId,
-        requestKind,
+        requestKind: decision.kind === "final" && decision.observationStateKey
+          ? "fork"
+          : requestKind,
         langfuseDebug,
         debugMetadata,
         preparedStats,
@@ -2163,13 +2779,27 @@ function observeNativeToolDecision(
       roundPipe.requestReceived(ctx.inputMessages.length, true);
     }
     roundPipe.streamStart();
-    consumeAnthropicStream(streamFromBytes(snapshot.rawBytes), {
+    const nativeIndexes = new Set(snapshot.toolCalls
+      .filter((call) => call.owner === "proxy")
+      .map((call) => call.contentBlockIndex));
+    let observationBytes = snapshot.rawBytes;
+    if (nativeIndexes.size > 0) {
+      try {
+        observationBytes = buildClientVisibleAnthropicSse(snapshot, nativeIndexes);
+      } catch {
+        // An incomplete/error snapshot cannot be safely rebuilt. Dropping its
+        // telemetry payload is preferable to exposing hidden Tool arguments.
+        roundPipe.streamDone(null);
+        return;
+      }
+    }
+    consumeAnthropicStream(streamFromBytes(observationBytes), {
       ...ctx,
       pipe: roundPipe,
       // Hidden Native rounds have accounting/Generation telemetry but never
       // run per-turn L0 or Skill writeback. Only the final visible response is
       // treated as the logical main-dialog response.
-      requestKind: index === lastIndex && decision.kind !== "error"
+      requestKind: index === lastIndex && isLogicalFinalToolLoopDecision(decision.kind)
         ? ctx.requestKind
         : "fork",
       logMeta: {

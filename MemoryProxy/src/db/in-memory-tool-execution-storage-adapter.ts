@@ -7,6 +7,7 @@ import {
   ToolExecutionConflictError,
   ToolExecutionStorageError,
   cloneToolExecutionContext,
+  extendToolExecutionExpiryForLease,
   isToolExecutionContextExpired,
   isValidClientDispatchTransition,
   mergeToolCallSlots,
@@ -14,6 +15,12 @@ import {
   serializeToolExecutionStateKey,
   validateToolExecutionContext,
   type ClientDispatchCas,
+  type ReentryClaim,
+  type ReentryCompletion,
+  type ReentryRenewal,
+  type ObservationClaim,
+  type ObservationCompletion,
+  type ObservationPreparation,
   type SlotExecutionClaim,
   type SlotResultCas,
   type StreamSnapshotCas,
@@ -74,7 +81,7 @@ export class InMemoryToolExecutionStorageAdapter implements ToolExecutionStorage
   async findByCallId(
     scope: ToolExecutionScope,
     callId: string,
-    options: { includeExpired?: boolean } = {},
+    options: { includeExpired?: boolean; dispatchableOnly?: boolean } = {},
   ): Promise<ToolExecutionContext | null> {
     this.assertOpen();
     const source = options.includeExpired
@@ -82,6 +89,10 @@ export class InMemoryToolExecutionStorageAdapter implements ToolExecutionStorage
       : this.activeRows(scope);
     const matches = source
       .filter((context) => context.slots.some((slot) => slot.callId === callId))
+      .filter((context) => !options.dispatchableOnly || (
+        context.responseStreamStatus === "completed"
+        && ["dispatched", "resuming", "completed"].includes(context.clientDispatchStatus)
+      ))
       .sort((left, right) => Date.parse(right.createdAt) - Date.parse(left.createdAt));
     return matches.length > 0 ? cloneToolExecutionContext(matches[0]) : null;
   }
@@ -120,6 +131,9 @@ export class InMemoryToolExecutionStorageAdapter implements ToolExecutionStorage
         || !isValidClientDispatchTransition(update.expectedStatus, update.nextStatus)
       ) return null;
       current.clientDispatchStatus = update.nextStatus;
+      if (update.dispatchOutcome !== undefined) {
+        current.clientDispatchOutcome = structuredClone(update.dispatchOutcome);
+      }
       return current;
     });
   }
@@ -159,6 +173,101 @@ export class InMemoryToolExecutionStorageAdapter implements ToolExecutionStorage
       slot.status = update.isError ? "failed" : "succeeded";
       slot.result = structuredClone(update.result);
       slot.isError = update.isError;
+      return current;
+    });
+  }
+
+  async tryClaimReentry(claim: ReentryClaim): Promise<boolean> {
+    if (!claim.leaseOwner || !Number.isFinite(Date.parse(claim.leaseUntil))) return false;
+    if (Date.parse(claim.leaseUntil) <= this.now().getTime()) return false;
+    return this.mutate(claim.key, claim.expectedRevision, (current) => {
+      const expiredLease = current.clientDispatchStatus === "resuming"
+        && (!current.reentryLeaseUntil
+          || Date.parse(current.reentryLeaseUntil) <= this.now().getTime());
+      if (current.clientDispatchStatus !== "dispatched" && !expiredLease) return null;
+      current.clientDispatchStatus = "resuming";
+      current.reentryAttempt = (current.reentryAttempt ?? 0) + 1;
+      current.reentryLeaseOwner = claim.leaseOwner;
+      current.reentryLeaseUntil = claim.leaseUntil;
+      current.expiresAt = extendToolExecutionExpiryForLease(current.expiresAt, claim.leaseUntil);
+      return current;
+    });
+  }
+
+  async renewReentry(renewal: ReentryRenewal): Promise<boolean> {
+    if (!renewal.leaseOwner || !Number.isFinite(Date.parse(renewal.leaseUntil))) return false;
+    if (Date.parse(renewal.leaseUntil) <= this.now().getTime()) return false;
+    return this.mutate(renewal.key, renewal.expectedRevision, (current) => {
+      if (
+        current.clientDispatchStatus !== "resuming"
+        || current.reentryLeaseOwner !== renewal.leaseOwner
+      ) return null;
+      current.reentryLeaseUntil = renewal.leaseUntil;
+      current.expiresAt = extendToolExecutionExpiryForLease(current.expiresAt, renewal.leaseUntil);
+      return current;
+    });
+  }
+
+  async completeReentry(completion: ReentryCompletion): Promise<boolean> {
+    return this.mutate(completion.key, completion.expectedRevision, (current) => {
+      if (
+        current.clientDispatchStatus !== "resuming"
+        || current.reentryLeaseOwner !== completion.leaseOwner
+      ) return null;
+      current.clientDispatchStatus = "completed";
+      current.reentryOutcome = structuredClone(completion.outcome);
+      if (completion.outcome.kind === "final" || completion.outcome.kind === "replay") {
+        current.observationStatus = "pending";
+        current.observationOutcome = {
+          status: completion.outcome.status,
+          headers: structuredClone(completion.outcome.headers),
+          bodyBase64: completion.outcome.bodyBase64,
+        };
+      } else {
+        current.observationStatus = "none";
+        delete current.observationOutcome;
+      }
+      return current;
+    });
+  }
+
+  async prepareObservation(preparation: ObservationPreparation): Promise<boolean> {
+    return this.mutate(preparation.key, preparation.expectedRevision, (current) => {
+      if (
+        current.responseStreamStatus !== "completed"
+        || current.clientDispatchStatus !== "none"
+        || (current.observationStatus !== undefined && current.observationStatus !== "none")
+      ) return null;
+      current.observationStatus = "pending";
+      current.observationOutcome = structuredClone(preparation.outcome);
+      return current;
+    });
+  }
+
+  async tryClaimObservation(claim: ObservationClaim): Promise<boolean> {
+    if (!claim.leaseOwner || !Number.isFinite(Date.parse(claim.leaseUntil))) return false;
+    if (Date.parse(claim.leaseUntil) <= this.now().getTime()) return false;
+    return this.mutate(claim.key, claim.expectedRevision, (current) => {
+      const expiredLease = current.observationStatus === "running"
+        && (!current.observationLeaseUntil
+          || Date.parse(current.observationLeaseUntil) <= this.now().getTime());
+      if (current.observationStatus !== "pending" && !expiredLease) return null;
+      current.observationStatus = "running";
+      current.observationAttempt = (current.observationAttempt ?? 0) + 1;
+      current.observationLeaseOwner = claim.leaseOwner;
+      current.observationLeaseUntil = claim.leaseUntil;
+      current.expiresAt = extendToolExecutionExpiryForLease(current.expiresAt, claim.leaseUntil);
+      return current;
+    });
+  }
+
+  async completeObservation(completion: ObservationCompletion): Promise<boolean> {
+    return this.mutate(completion.key, completion.expectedRevision, (current) => {
+      if (
+        current.observationStatus !== "running"
+        || current.observationLeaseOwner !== completion.leaseOwner
+      ) return null;
+      current.observationStatus = "completed";
       return current;
     });
   }

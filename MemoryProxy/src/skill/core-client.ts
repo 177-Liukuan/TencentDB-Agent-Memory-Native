@@ -230,6 +230,8 @@ export interface CoreSkillRequestOptions {
    * whenever the caller has a per-request spaceId available.
    */
   serviceId?: string;
+  /** Stable logical-turn key used by durable writeback retries. */
+  idempotencyKey?: string;
 }
 
 export class CoreSkillClient {
@@ -362,6 +364,7 @@ export class CoreSkillClient {
       "x-tdai-service-id": opts.serviceId || this.serviceId,
       "Content-Type": "application/json",
     };
+    if (opts.idempotencyKey) headers["Idempotency-Key"] = opts.idempotencyKey;
 
     let resp: Response;
     try {

@@ -1,7 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { DEFAULT_CONFIG } from "../config.js";
-import { InMemoryToolExecutionStorageAdapter } from "../db/in-memory-tool-execution-storage-adapter.js";
+import {
+  createInMemoryToolExecutionBackend,
+  InMemoryToolExecutionStorageAdapter,
+} from "../db/in-memory-tool-execution-storage-adapter.js";
 import { __resetInjectionPipelineForTests } from "../injection/index.js";
 import {
   __resetNativeProxyToolRuntimeForTests,
@@ -60,14 +63,17 @@ function nativeCallFixture(): string {
     + messageStop("tool_use");
 }
 
-function mixedCallFixture(): string {
+function mixedCallFixture(
+  nativeCallId = "native-call-1",
+  clientCallId = "client-call-1",
+): string {
   return messageStart("msg-mixed")
     + frame("content_block_start", {
       type: "content_block_start",
       index: 0,
       content_block: {
         type: "tool_use",
-        id: "native-call-1",
+        id: nativeCallId,
         name: "tdai_memory_search",
         input: {},
       },
@@ -83,7 +89,7 @@ function mixedCallFixture(): string {
       index: 1,
       content_block: {
         type: "tool_use",
-        id: "client-call-1",
+        id: clientCallId,
         name: "client_shell",
         input: {},
       },
@@ -118,7 +124,7 @@ function clientOnlyFixture(): string {
     + messageStop("tool_use");
 }
 
-function finalTextFixture(): string {
+function finalTextFixture(text = "final answer"): string {
   return messageStart("msg-final")
     + frame("content_block_start", {
       type: "content_block_start",
@@ -128,7 +134,7 @@ function finalTextFixture(): string {
     + frame("content_block_delta", {
       type: "content_block_delta",
       index: 0,
-      delta: { type: "text_delta", text: "final answer" },
+      delta: { type: "text_delta", text },
     })
     + frame("content_block_stop", { type: "content_block_stop", index: 0 })
     + messageStop("end_turn");
@@ -267,9 +273,10 @@ describe("Anthropic Native Proxy Tool handler", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it("uses the injected first request and exact successful target for internal re-entry", async () => {
+  it("uses the exact successful target and replays a pure-Native final after restart", async () => {
     const proxyConfig = config();
-    const storage = new InMemoryToolExecutionStorageAdapter();
+    const backend = createInMemoryToolExecutionBackend();
+    const storage = new InMemoryToolExecutionStorageAdapter({ backend });
     const execute = vi.fn(async () => ({
       isError: false,
       value: { items: [{ memory: "Use the project formatter" }] },
@@ -305,7 +312,7 @@ describe("Anthropic Native Proxy Tool handler", () => {
     }));
 
     const app = createApp(proxyConfig);
-    const response = await app.request("/claude-code/space-1/v1/messages", {
+    const requestInit = {
       method: "POST",
       headers: {
         "content-type": "application/json",
@@ -320,7 +327,8 @@ describe("Anthropic Native Proxy Tool handler", () => {
         system: [{ type: "text", text: "original system" }],
         messages: [{ role: "user", content: "What rules apply?" }],
       }),
-    });
+    };
+    const response = await app.request("/claude-code/space-1/v1/messages", requestInit);
     const responseText = await response.text();
 
     expect(response.status).toBe(200);
@@ -342,6 +350,130 @@ describe("Anthropic Native Proxy Tool handler", () => {
     expect(execute).toHaveBeenCalledTimes(1);
     expect(first.readers()).toBe(1);
     expect(second.readers()).toBe(1);
+    await expect(storage.findActiveBySession({
+      spaceId: "space-1",
+      userId: "user-1",
+      agentSource: "claude-code",
+      sessionId: "session-1",
+      contextVersion: "v1",
+    })).resolves.toEqual([
+      expect.objectContaining({
+        observationStatus: "completed",
+        observationAttempt: 1,
+        observationOutcome: expect.objectContaining({ status: 200 }),
+      }),
+    ]);
+
+    await shutdownNativeProxyToolRuntime();
+    __resetNativeProxyToolRuntimeForTests();
+    __resetSessionStoreForTests();
+    const restartedStorage = new InMemoryToolExecutionStorageAdapter({ backend });
+    const restartedRuntime = createNativeProxyToolRuntime(proxyConfig, {
+      createStorage: () => restartedStorage,
+      createDispatcher: () => ({ execute }),
+    });
+    await restartedRuntime.ready();
+    __setNativeProxyToolRuntimeForTests(restartedRuntime);
+
+    const replay = await app.request("/claude-code/space-1/v1/messages", requestInit);
+    expect(replay.status).toBe(200);
+    expect(await replay.text()).toContain("final answer");
+    expect(upstreamCalls).toHaveLength(2);
+    expect(execute).toHaveBeenCalledTimes(1);
+    await expect(restartedStorage.findActiveBySession({
+      spaceId: "space-1",
+      userId: "user-1",
+      agentSource: "claude-code",
+      sessionId: "session-1",
+      contextVersion: "v1",
+    })).resolves.toEqual([
+      expect.objectContaining({
+        observationStatus: "completed",
+        observationAttempt: 1,
+      }),
+    ]);
+  });
+
+  it("keeps a durable final pending when its original observation intent is missing", async () => {
+    const proxyConfig = config();
+    const backend = createInMemoryToolExecutionBackend();
+    const storage = new InMemoryToolExecutionStorageAdapter({ backend });
+    const prepareObservation = storage.prepareObservation.bind(storage);
+    vi.spyOn(storage, "prepareObservation").mockImplementation(async (preparation) => {
+      const prepared = await prepareObservation(preparation);
+      if (prepared) {
+        const persisted = [...backend.rows.values()].find((context) => (
+          context.key.toolBatchId === preparation.key.toolBatchId
+        ));
+        if (persisted) delete persisted.upstreamSnapshot.observationIntent;
+      }
+      return prepared;
+    });
+    const execute = vi.fn(async () => ({ isError: false, value: { items: [] } }));
+    const runtime = createNativeProxyToolRuntime(proxyConfig, {
+      createStorage: () => storage,
+      createDispatcher: () => ({ execute }),
+    });
+    await runtime.ready();
+    __setNativeProxyToolRuntimeForTests(runtime);
+    await installInitializedSession();
+
+    const responses = [
+      singleConsumerSse(nativeCallFixture()).response,
+      singleConsumerSse(finalTextFixture()).response,
+    ];
+    let upstreamCalls = 0;
+    vi.stubGlobal("fetch", vi.fn(async (url: string | URL | Request) => {
+      const href = String(url);
+      if (href === "https://tdai.example/v3/meta/config/user/get") {
+        return new Response(JSON.stringify({ code: 0, data: { items: [] } }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      if (href === "https://upstream.example/v1/messages") {
+        return responses[upstreamCalls++];
+      }
+      return new Response("not found", { status: 404 });
+    }));
+    const app = createApp(proxyConfig);
+    const requestInit = {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-api-key": "client-key",
+        "x-user-id": "user-1",
+        "x-conversation-id": "session-1",
+      },
+      body: JSON.stringify({
+        model: "claude-test",
+        max_tokens: 1_024,
+        stream: true,
+        messages: [{ role: "user", content: "What rules apply?" }],
+      }),
+    };
+
+    const first = await app.request("/claude-code/space-1/v1/messages", requestInit);
+    expect(first.status).toBe(503);
+    expect(await first.text()).toContain("native_tool_observation_payload_unavailable");
+    const retry = await app.request("/claude-code/space-1/v1/messages", requestInit);
+    expect(retry.status).toBe(503);
+    expect(await retry.text()).toContain("native_tool_observation_payload_unavailable");
+    expect(upstreamCalls).toBe(2);
+    expect(execute).toHaveBeenCalledTimes(1);
+    const pendingStates = await storage.findActiveBySession({
+      spaceId: "space-1",
+      userId: "user-1",
+      agentSource: "claude-code",
+      sessionId: "session-1",
+      contextVersion: "v1",
+    });
+    expect(pendingStates).toEqual([
+      expect.objectContaining({
+        observationStatus: "pending",
+      }),
+    ]);
+    expect(pendingStates[0]).not.toHaveProperty("observationAttempt");
   });
 
   it("buffers a pure Client Tool round through message_stop and replays it byte-for-byte", async () => {
@@ -402,6 +534,395 @@ describe("Anthropic Native Proxy Tool handler", () => {
       sessionId: "session-1",
       contextVersion: "v1",
     })).toEqual([]);
+  });
+
+  it("keeps retained client credentials isolated by batch during reverse-order resume", async () => {
+    const proxyConfig = config();
+    proxyConfig.upstream.agents = {};
+    proxyConfig.upstream.apiKey = "";
+    const storage = new InMemoryToolExecutionStorageAdapter();
+    const runtime = createNativeProxyToolRuntime(proxyConfig, {
+      createStorage: () => storage,
+      createDispatcher: () => ({
+        execute: async () => ({ isError: false, value: { items: [] } }),
+      }),
+    });
+    await runtime.ready();
+    __setNativeProxyToolRuntimeForTests(runtime);
+    await installInitializedSession();
+    const upstreamCalls: Array<{
+      apiKey: string | null;
+      body: Record<string, unknown>;
+    }> = [];
+    vi.stubGlobal("fetch", vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      const href = String(url);
+      if (href === "https://tdai.example/v3/meta/config/user/get") {
+        return new Response(JSON.stringify({ code: 0, data: { items: [] } }), { status: 200 });
+      }
+      if (href !== "https://upstream.example/v1/messages") {
+        return new Response("not found", { status: 404 });
+      }
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      upstreamCalls.push({ apiKey: new Headers(init?.headers).get("x-api-key"), body });
+      const messages = body.messages as Array<Record<string, unknown>>;
+      const latest = messages.at(-1);
+      const latestContent = latest?.content;
+      const toolResultId = Array.isArray(latestContent)
+        ? (latestContent.find((block) => (
+            block !== null
+            && typeof block === "object"
+            && (block as Record<string, unknown>).type === "tool_result"
+          )) as Record<string, unknown> | undefined)?.tool_use_id
+        : undefined;
+      if (toolResultId) return singleConsumerSse(finalTextFixture()).response;
+      const userText = typeof messages[0]?.content === "string"
+        ? messages[0].content
+        : JSON.stringify(messages[0]?.content ?? "");
+      const suffix = userText.includes("batch-a") ? "a" : "b";
+      return singleConsumerSse(mixedCallFixture(`native-${suffix}`, `client-${suffix}`)).response;
+    }));
+    const app = createApp(proxyConfig);
+    const baseBody = (label: string) => ({
+      model: "claude-test",
+      max_tokens: 256,
+      stream: true,
+      tools: [{ name: "client_shell", input_schema: { type: "object" } }],
+      messages: [{ role: "user", content: label }],
+    });
+    const initialRequest = (label: string, apiKey: string) => app.request(
+      "/claude-code/space-1/v1/messages",
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-api-key": apiKey,
+          "x-user-id": "user-1",
+          "x-conversation-id": "session-1",
+        },
+        body: JSON.stringify(baseBody(label)),
+      },
+    );
+    const [initialA, initialB] = await Promise.all([
+      initialRequest("batch-a", "initial-key-a"),
+      initialRequest("batch-b", "initial-key-b"),
+    ]);
+    expect(await initialA.text()).toContain("client-a");
+    expect(await initialB.text()).toContain("client-b");
+
+    const resumeRequest = (suffix: "a" | "b") => app.request(
+      "/claude-code/space-1/v1/messages",
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-api-key": "resume-placeholder",
+          "x-user-id": "user-1",
+          "x-conversation-id": "session-1",
+        },
+        body: JSON.stringify({
+          model: "claude-test",
+          max_tokens: 256,
+          stream: true,
+          messages: [
+            { role: "user", content: `batch-${suffix}` },
+            {
+              role: "assistant",
+              content: [{
+                type: "tool_use",
+                id: `client-${suffix}`,
+                name: "client_shell",
+                input: { command: "pwd" },
+              }],
+            },
+            {
+              role: "user",
+              content: [{
+                type: "tool_result",
+                tool_use_id: `client-${suffix}`,
+                content: `/workspace/${suffix}`,
+              }],
+            },
+          ],
+        }),
+      },
+    );
+    const resumedB = await resumeRequest("b");
+    const resumedA = await resumeRequest("a");
+    expect(await resumedB.text()).toContain("final answer");
+    expect(await resumedA.text()).toContain("final answer");
+
+    const resumedCalls = upstreamCalls.slice(-2);
+    expect(resumedCalls.map(({ apiKey, body }) => {
+      const messages = body.messages as Array<Record<string, unknown>>;
+      const result = (messages.at(-1)?.content as Array<Record<string, unknown>>)
+        .find((block) => (
+          block.type === "tool_result"
+          && typeof block.tool_use_id === "string"
+          && block.tool_use_id.startsWith("client-")
+        ));
+      return [result?.tool_use_id, apiKey];
+    })).toEqual([
+      ["client-b", "initial-key-b"],
+      ["client-a", "initial-key-a"],
+    ]);
+  });
+
+  it("does not execute a reserved-name upstream call when this request did not receive the Native definition", async () => {
+    const proxyConfig = config();
+    proxyConfig.tdai.memory.enabled = false;
+    const storage = new InMemoryToolExecutionStorageAdapter();
+    const execute = vi.fn(async () => ({ isError: false, value: null }));
+    const runtime = createNativeProxyToolRuntime(proxyConfig, {
+      createStorage: () => storage,
+      createDispatcher: () => ({ execute }),
+    });
+    await runtime.ready();
+    __setNativeProxyToolRuntimeForTests(runtime);
+    await installInitializedSession();
+    const upstream = singleConsumerSse(nativeCallFixture());
+    vi.stubGlobal("fetch", vi.fn(async (url: string | URL | Request) => {
+      const href = String(url);
+      if (href === "https://tdai.example/v3/meta/config/user/get") {
+        return new Response(JSON.stringify({ code: 0, data: { items: [] } }), { status: 200 });
+      }
+      if (href === "https://upstream.example/v1/messages") return upstream.response;
+      return new Response("not found", { status: 404 });
+    }));
+
+    const response = await createApp(proxyConfig).request("/claude-code/space-1/v1/messages", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-api-key": "client-key",
+        "x-user-id": "user-1",
+        "x-conversation-id": "session-1",
+      },
+      body: JSON.stringify({
+        model: "claude-test",
+        max_tokens: 128,
+        stream: true,
+        messages: [{ role: "user", content: "question" }],
+      }),
+    });
+
+    expect(await response.text()).toBe(nativeCallFixture());
+    expect(execute).not.toHaveBeenCalled();
+    expect(upstream.readers()).toBeLessThanOrEqual(1);
+  });
+
+  it("rejects a Client definition that uses a proxy-reserved tool name before forwarding", async () => {
+    const proxyConfig = config();
+    proxyConfig.tdai.memory.enabled = false;
+    const storage = new InMemoryToolExecutionStorageAdapter();
+    const runtime = createNativeProxyToolRuntime(proxyConfig, { createStorage: () => storage });
+    await runtime.ready();
+    __setNativeProxyToolRuntimeForTests(runtime);
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const response = await createApp(proxyConfig).request("/claude-code/space-1/v1/messages", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-conversation-id": "session-1" },
+      body: JSON.stringify({
+        model: "claude-test",
+        max_tokens: 128,
+        stream: true,
+        tools: [{ name: "tdai_memory_search", input_schema: { type: "object" } }],
+        messages: [{ role: "user", content: "question" }],
+      }),
+    });
+
+    expect(response.status).toBe(400);
+    expect(await response.text()).toContain("reserved by the proxy");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("passes a streaming upstream non-2xx response through exactly instead of parsing it as SSE", async () => {
+    const proxyConfig = config();
+    const storage = new InMemoryToolExecutionStorageAdapter();
+    const execute = vi.fn(async () => ({ isError: false, value: null }));
+    const runtime = createNativeProxyToolRuntime(proxyConfig, {
+      createStorage: () => storage,
+      createDispatcher: () => ({ execute }),
+    });
+    await runtime.ready();
+    __setNativeProxyToolRuntimeForTests(runtime);
+    await installInitializedSession();
+    const exactError = JSON.stringify({ type: "error", marker: "upstream-503" });
+    vi.stubGlobal("fetch", vi.fn(async (url: string | URL | Request) => {
+      const href = String(url);
+      if (href === "https://tdai.example/v3/meta/config/user/get") {
+        return new Response(JSON.stringify({ code: 0, data: { items: [] } }), { status: 200 });
+      }
+      if (href === "https://upstream.example/v1/messages") {
+        return new Response(exactError, {
+          status: 503,
+          headers: { "content-type": "application/json", "x-request-id": "upstream-error" },
+        });
+      }
+      return new Response("not found", { status: 404 });
+    }));
+
+    const response = await createApp(proxyConfig).request("/claude-code/space-1/v1/messages", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-api-key": "client-key",
+        "x-user-id": "user-1",
+        "x-conversation-id": "session-1",
+      },
+      body: JSON.stringify({
+        model: "claude-test",
+        max_tokens: 128,
+        stream: true,
+        messages: [{ role: "user", content: "question" }],
+      }),
+    });
+
+    expect(response.status).toBe(503);
+    expect(await response.text()).toBe(exactError);
+    expect(response.headers.get("x-request-id")).toBe("upstream-error");
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it("sanitizes a streaming upstream non-2xx response that echoes the injected Native Registry", async () => {
+    const proxyConfig = config();
+    const storage = new InMemoryToolExecutionStorageAdapter();
+    const execute = vi.fn(async () => ({ isError: false, value: null }));
+    const runtime = createNativeProxyToolRuntime(proxyConfig, {
+      createStorage: () => storage,
+      createDispatcher: () => ({ execute }),
+    });
+    await runtime.ready();
+    __setNativeProxyToolRuntimeForTests(runtime);
+    await installInitializedSession();
+    const leakedError = JSON.stringify({
+      type: "error",
+      marker: "tdai_memory_search",
+    });
+    vi.stubGlobal("fetch", vi.fn(async (url: string | URL | Request) => {
+      const href = String(url);
+      if (href === "https://tdai.example/v3/meta/config/user/get") {
+        return new Response(JSON.stringify({ code: 0, data: { items: [] } }), { status: 200 });
+      }
+      if (href === "https://upstream.example/v1/messages") {
+        return new Response(leakedError, {
+          status: 503,
+          headers: { "content-type": "application/json", "x-request-id": "upstream-error" },
+        });
+      }
+      return new Response("not found", { status: 404 });
+    }));
+
+    const response = await createApp(proxyConfig).request("/claude-code/space-1/v1/messages", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-api-key": "client-key",
+        "x-user-id": "user-1",
+        "x-conversation-id": "session-1",
+      },
+      body: JSON.stringify({
+        model: "claude-test",
+        max_tokens: 128,
+        stream: true,
+        messages: [{ role: "user", content: "question" }],
+      }),
+    });
+    const responseText = await response.text();
+
+    expect(response.status).toBe(500);
+    expect(responseText).toContain("native_tool_leak_detected");
+    expect(responseText).not.toContain("tdai_memory_search");
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["tool name", "tdai_memory_search"],
+    ["call ID", "native-call-1"],
+    ["serialized input", '{"query":"project rules"}'],
+  ])("fails closed when a mixed resume echoes the old Native %s", async (_label, leakedMarker) => {
+    const proxyConfig = config();
+    const storage = new InMemoryToolExecutionStorageAdapter();
+    const runtime = createNativeProxyToolRuntime(proxyConfig, {
+      createStorage: () => storage,
+      createDispatcher: () => ({
+        execute: async () => ({ isError: false, value: { items: [] } }),
+      }),
+    });
+    await runtime.ready();
+    __setNativeProxyToolRuntimeForTests(runtime);
+    await installInitializedSession();
+    const rounds = [
+      singleConsumerSse(mixedCallFixture()).response,
+      singleConsumerSse(finalTextFixture(leakedMarker)).response,
+    ];
+    let upstreamCalls = 0;
+    vi.stubGlobal("fetch", vi.fn(async (url: string | URL | Request) => {
+      const href = String(url);
+      if (href === "https://tdai.example/v3/meta/config/user/get") {
+        return new Response(JSON.stringify({ code: 0, data: { items: [] } }), { status: 200 });
+      }
+      if (href === "https://upstream.example/v1/messages") {
+        return rounds[upstreamCalls++] ?? new Response("unexpected", { status: 500 });
+      }
+      return new Response("not found", { status: 404 });
+    }));
+    const app = createApp(proxyConfig);
+    const headers = {
+      "content-type": "application/json",
+      "x-api-key": "client-key",
+      "x-user-id": "user-1",
+      "x-conversation-id": "session-1",
+    };
+    const initial = await app.request("/claude-code/space-1/v1/messages", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: "claude-test",
+        max_tokens: 256,
+        stream: true,
+        tools: [{ name: "client_shell", input_schema: { type: "object" } }],
+        messages: [{ role: "user", content: "question" }],
+      }),
+    });
+    expect((await initial.text())).toContain("client-call-1");
+
+    const resumed = await app.request("/claude-code/space-1/v1/messages", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: "claude-test",
+        max_tokens: 256,
+        stream: true,
+        messages: [
+          { role: "user", content: "question" },
+          {
+            role: "assistant",
+            content: [{
+              type: "tool_use",
+              id: "client-call-1",
+              name: "client_shell",
+              input: { command: "pwd" },
+            }],
+          },
+          {
+            role: "user",
+            content: [{
+              type: "tool_result",
+              tool_use_id: "client-call-1",
+              content: "/workspace",
+            }],
+          },
+        ],
+      }),
+    });
+    const responseText = await resumed.text();
+
+    expect(resumed.status).toBe(500);
+    expect(responseText).toContain("native_tool_leak_detected");
+    expect(responseText).not.toContain(leakedMarker);
+    expect(upstreamCalls).toBe(2);
   });
 
   it("waits for a later Native result when Client Tool Results arrive first", async () => {
@@ -465,35 +986,42 @@ describe("Anthropic Native Proxy Tool handler", () => {
     expect(firstText).not.toContain("tdai_memory_search");
     expect(upstreamCalls).toHaveLength(1);
 
+    // Same-process continuation must use the retained successful transport,
+    // even if live routing/auth configuration changes before Client results.
+    proxyConfig.upstream.agents = {};
+    proxyConfig.upstream.url = "https://changed.example/v1";
+    proxyConfig.upstream.apiKey = "changed-key";
+
+    const resumeBody = {
+      model: "claude-test",
+      max_tokens: 1_024,
+      stream: true,
+      system: "client continuation system must not replace persisted system",
+      messages: [
+        { role: "user", content: "What rules apply?" },
+        {
+          role: "assistant",
+          content: [{
+            type: "tool_use",
+            id: "client-call-1",
+            name: "client_shell",
+            input: { command: "pwd" },
+          }],
+        },
+        {
+          role: "user",
+          content: [{
+            type: "tool_result",
+            tool_use_id: "client-call-1",
+            content: "/workspace",
+          }],
+        },
+      ],
+    };
     const resumed = app.request("/claude-code/space-1/v1/messages", {
       method: "POST",
       headers,
-      body: JSON.stringify({
-        model: "claude-test",
-        max_tokens: 1_024,
-        stream: true,
-        system: "client continuation system must not replace persisted system",
-        messages: [
-          { role: "user", content: "What rules apply?" },
-          {
-            role: "assistant",
-            content: [{
-              type: "tool_use",
-              id: "client-call-1",
-              name: "client_shell",
-              input: { command: "pwd" },
-            }],
-          },
-          {
-            role: "user",
-            content: [{
-              type: "tool_result",
-              tool_use_id: "client-call-1",
-              content: "/workspace",
-            }],
-          },
-        ],
-      }),
+      body: JSON.stringify(resumeBody),
     });
     await new Promise((resolve) => setTimeout(resolve, 20));
     const callCountBeforeNativeResult = upstreamCalls.length;
@@ -516,5 +1044,26 @@ describe("Anthropic Native Proxy Tool handler", () => {
     expect(execute).toHaveBeenCalledTimes(1);
     expect(mixed.readers()).toBe(1);
     expect(final.readers()).toBe(1);
+    const completedParent = (await storage.findActiveBySession({
+      spaceId: "space-1",
+      userId: "user-1",
+      agentSource: "claude-code",
+      sessionId: "session-1",
+      contextVersion: "v1",
+    })).find((state) => state.slots.some((slot) => slot.callId === "client-call-1"));
+    expect(completedParent).toMatchObject({
+      clientDispatchStatus: "completed",
+      observationStatus: "completed",
+      observationAttempt: 1,
+    });
+
+    const replayedResponse = await app.request("/claude-code/space-1/v1/messages", {
+      method: "POST",
+      headers,
+      body: JSON.stringify(resumeBody),
+    });
+    expect(replayedResponse.status).toBe(200);
+    expect(await replayedResponse.text()).toBe(resumedText);
+    expect(upstreamCalls).toHaveLength(2);
   });
 });

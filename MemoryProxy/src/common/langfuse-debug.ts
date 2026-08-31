@@ -64,6 +64,8 @@ export interface RequestDebugMetadataInput {
   turnSeq?: number;
   requestPath?: string;
   protocol?: "anthropic" | "openai";
+  /** Tool names owned by the Proxy that must not enter external debug telemetry. */
+  hiddenToolNames?: readonly string[];
   debug: boolean;
 }
 
@@ -135,7 +137,13 @@ export function buildRequestDebugMetadata(
 
     // Tools 数组 —— 前 N 个的 name + desc（截断），足够指纹
     if (Array.isArray(b.tools)) {
-      const tools = b.tools as unknown[];
+      const hiddenToolNames = new Set(opts.hiddenToolNames ?? []);
+      const tools = (b.tools as unknown[]).filter((value) => {
+        const tool = value as Record<string, unknown> | undefined;
+        if (!tool) return true;
+        const fn = (tool.function as Record<string, unknown> | undefined) ?? tool;
+        return typeof fn.name !== "string" || !hiddenToolNames.has(fn.name);
+      });
       out.tools_len = tools.length;
       const summary: Array<{ name?: string; desc?: string }> = [];
       for (let i = 0; i < Math.min(tools.length, TOOLS_MAX); i++) {

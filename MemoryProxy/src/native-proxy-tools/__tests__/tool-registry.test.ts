@@ -157,6 +157,19 @@ describe("Native Proxy Tool injection", () => {
       .toEqual([]);
   });
 
+  it("does not expose the tool on a request explicitly marked ineligible", () => {
+    const injector = new NativeProxyToolsInjector({
+      enabled: true,
+      registry: createDefaultNativeProxyToolRegistry(),
+    });
+    const custom = {
+      ...structuredClone(metadata.custom!),
+      nativeProxyEligible: false,
+    };
+
+    expect(injector.execute(initializedAnthropicContext({ custom }))).toEqual([]);
+  });
+
   it("fails closed when a Client Tool already uses the proxy-owned name", async () => {
     const injector = new NativeProxyToolsInjector({
       enabled: true,

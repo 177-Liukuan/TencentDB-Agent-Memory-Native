@@ -3,6 +3,8 @@ import { describe, expect, it } from "vitest";
 import { AnthropicStreamParser } from "../../injection/adapters/anthropic-stream.js";
 import type { ToolCallSlot } from "../types.js";
 import {
+  assertNoNativeToolLeak,
+  buildNativeRegistryLeakMarkers,
   buildClientVisibleAnthropicSse,
   buildFullAssistantMessage,
   buildToolResultMessage,
@@ -264,5 +266,49 @@ describe("Anthropic response rebuilder", () => {
     expect(() => replayAnthropicBytes(incomplete)).toThrow(/message_stop/);
     expect(() => buildClientVisibleAnthropicSse(incomplete, new Set())).toThrow(/message_stop/);
     expect(() => buildFullAssistantMessage(incomplete)).toThrow(/message_stop/);
+  });
+
+  it("fails closed if an unowned Provider frame repeats hidden Native identifiers", () => {
+    const fixture = concat(
+      messageStart(),
+      blockStart(0, { type: "tool_use", id: "native-secret", name: "tdai_memory_search", input: {} }),
+      blockDelta(0, { type: "input_json_delta", partial_json: "{\"query\":\"private-rule\"}" }),
+      blockStop(0),
+      frame("ping", { type: "ping", provider_trace: "native-secret" }),
+      messageEnd(),
+    );
+
+    expect(() => buildClientVisibleAnthropicSse(parse(fixture), new Set([0])))
+      .toThrow(/hidden Native Tool data/);
+  });
+
+  it("allows the final answer to use a Native result without exposing protocol markers", () => {
+    const visible = encoder.encode('{"preference":"dark mode"}');
+
+    expect(() => assertNoNativeToolLeak(visible, [{
+      callId: "native-call-1",
+      toolName: "tdai_memory_search",
+      input: { query: "preference" },
+      result: { preference: "dark mode" },
+    }])).not.toThrow();
+  });
+
+  it("treats Registry names, descriptions, and schemas as hidden sentinels", () => {
+    const registry = createDefaultNativeProxyToolRegistry();
+    const markers = buildNativeRegistryLeakMarkers(registry);
+    const definition = registry.list()[0];
+
+    expect(() => assertNoNativeToolLeak(
+      encoder.encode(`visible ${definition.name}`),
+      markers,
+    )).toThrow(/hidden Native Tool data/);
+    expect(() => assertNoNativeToolLeak(
+      encoder.encode(JSON.stringify(definition.inputSchema)),
+      markers,
+    )).toThrow(/hidden Native Tool data/);
+    expect(() => assertNoNativeToolLeak(
+      encoder.encode(definition.description),
+      markers,
+    )).toThrow(/hidden Native Tool data/);
   });
 });
