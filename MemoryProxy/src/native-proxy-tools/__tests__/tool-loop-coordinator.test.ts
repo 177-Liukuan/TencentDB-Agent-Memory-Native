@@ -91,6 +91,32 @@ function clientFixture(): Uint8Array {
   );
 }
 
+function mixedFixture(): Uint8Array {
+  return concat(
+    messageStart(),
+    toolFrames(0, "p1", "tdai_memory_search", { query: "first" }),
+    toolFrames(1, "c1", "client_shell", { command: "first" }),
+    toolFrames(2, "c2", "client_shell", { command: "second" }),
+    toolFrames(3, "p2", "tdai_memory_search", { query: "second" }),
+    messageStop(),
+  );
+}
+
+function visibleToolStarts(bytes: Uint8Array): Array<{ index: number; id: string }> {
+  return decoder.decode(bytes)
+    .split(/\r?\n/)
+    .filter((line) => line.startsWith("data: "))
+    .map((line) => JSON.parse(line.slice(6)) as Record<string, unknown>)
+    .filter((payload) => (
+      payload.type === "content_block_start"
+      && (payload.content_block as Record<string, unknown> | undefined)?.type === "tool_use"
+    ))
+    .map((payload) => ({
+      index: payload.index as number,
+      id: (payload.content_block as Record<string, unknown>).id as string,
+    }));
+}
+
 function finalFixture(): Uint8Array {
   return concat(
     messageStart(),
@@ -361,6 +387,70 @@ describe("AnthropicToolLoopCoordinator", () => {
         { callId: "proxy-2", status: "succeeded" },
       ],
     });
+  });
+
+  it("dispatches only Client calls at message_stop for an interleaved mixed round", async () => {
+    const releases = new Map<string, (result: NativeToolResult) => void>();
+    const { coordinator, storage, execute, reenter } = coordinatorHarness({
+      execute: (call) => new Promise((resolve) => {
+        releases.set(call.callId, resolve);
+      }),
+    });
+
+    const decision = await coordinator.handleRound(roundInput(byteStream(mixedFixture()).stream));
+
+    expect(decision.kind).toBe("client_dispatch");
+    if (decision.kind !== "client_dispatch") throw new Error("expected Client dispatch");
+    expect(visibleToolStarts(decision.bytes)).toEqual([
+      { index: 0, id: "c1" },
+      { index: 1, id: "c2" },
+    ]);
+    expect(decoder.decode(decision.bytes)).not.toContain("tdai_memory_search");
+    expect(decoder.decode(decision.bytes)).not.toContain("\"p1\"");
+    expect(decoder.decode(decision.bytes)).not.toContain("\"p2\"");
+    expect(reenter).not.toHaveBeenCalled();
+    await eventually(() => expect(execute).toHaveBeenCalledTimes(2));
+    const state = await storage.get(decision.stateKey);
+    expect(state).toMatchObject({
+      responseStreamStatus: "completed",
+      clientDispatchStatus: "dispatched",
+      totalCalls: 2,
+      slots: [
+        { callId: "p1", slotIndex: 0, owner: "proxy" },
+        { callId: "c1", slotIndex: 1, owner: "client" },
+        { callId: "c2", slotIndex: 2, owner: "client" },
+        { callId: "p2", slotIndex: 3, owner: "proxy" },
+      ],
+    });
+    releases.get("p2")?.({ isError: false, value: { memories: ["p2"] } });
+    releases.get("p1")?.({ isError: false, value: { memories: ["p1"] } });
+  });
+
+  it("persists a Client-only continuation produced after a hidden Native round", async () => {
+    const { coordinator, storage, reenter } = coordinatorHarness({
+      reenter: async () => ({
+        stream: byteStream(clientFixture()).stream,
+        status: 200,
+        headers: new Headers({ "content-type": "text/event-stream" }),
+      }),
+    });
+
+    const decision = await coordinator.handleRound(roundInput(byteStream(nativeFixture()).stream));
+
+    expect(decision.kind).toBe("client_dispatch");
+    if (decision.kind !== "client_dispatch") throw new Error("expected Client dispatch");
+    expect(reenter).toHaveBeenCalledTimes(1);
+    expect(visibleToolStarts(decision.bytes)).toEqual([{ index: 0, id: "client-1" }]);
+    const states = await storage.findActiveBySession(scope());
+    expect(states).toHaveLength(2);
+    expect(states[1]).toMatchObject({
+      round: 2,
+      totalCalls: 1,
+      responseStreamStatus: "completed",
+      clientDispatchStatus: "dispatched",
+      slots: [{ callId: "client-1", owner: "client", status: "pending" }],
+    });
+    expect(states[1].upstreamSnapshot.baseMessages).toHaveLength(3);
   });
 
   it("enforces per-round, total-call, and round limits before offending execution", async () => {

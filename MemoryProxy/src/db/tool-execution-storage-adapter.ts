@@ -49,6 +49,7 @@ export interface ToolExecutionStorageAdapter {
   findByCallId(
     scope: ToolExecutionScope,
     callId: string,
+    options?: { includeExpired?: boolean },
   ): Promise<ToolExecutionContext | null>;
   findActiveBySession(scope: ToolExecutionScope): Promise<ToolExecutionContext[]>;
   compareAndSetStreamSnapshot(update: StreamSnapshotCas): Promise<boolean>;

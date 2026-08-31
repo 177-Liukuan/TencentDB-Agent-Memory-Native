@@ -324,17 +324,21 @@ export class ClickHouseToolExecutionStorageAdapter implements ToolExecutionStora
   async findByCallId(
     scope: ToolExecutionScope,
     callId: string,
+    options: { includeExpired?: boolean } = {},
   ): Promise<ToolExecutionContext | null> {
     this.assertOpen();
+    const expiryPredicate = options.includeExpired ? "" : "  AND expires_at > now64(3)\n";
     const rows = await this.queryRows(
       `${this.selectColumns()}\n`
         + `WHERE ${this.scopePredicate()}\n`
         + "  AND has(call_ids, {callId:String})\n"
-        + "  AND expires_at > now64(3)\n"
+        + expiryPredicate
         + "ORDER BY updated_at DESC\nLIMIT 1",
       { ...this.scopeParams(scope), callId },
     );
-    const decoded = this.decodeActiveRows(rows);
+    const decoded = options.includeExpired
+      ? rows.map(decodeToolExecutionStateRow)
+      : this.decodeActiveRows(rows);
     return decoded.length > 0 ? cloneToolExecutionContext(decoded[0].context) : null;
   }
 

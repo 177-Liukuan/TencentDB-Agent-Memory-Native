@@ -382,6 +382,8 @@ export function runToolExecutionStorageContract(
 
       await expect(harness.secondary.get(key)).resolves.toBeNull();
       await expect(harness.secondary.findByCallId(scope, "p1")).resolves.toBeNull();
+      await expect(harness.secondary.findByCallId(scope, "p1", { includeExpired: true }))
+        .resolves.toMatchObject({ key: { toolBatchId: "batch-1" } });
       await expect(harness.secondary.findActiveBySession(scope)).resolves.toEqual([]);
       await expect(harness.secondary.tryClaimSlotExecution({
         key,

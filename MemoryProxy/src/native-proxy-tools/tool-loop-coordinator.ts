@@ -311,6 +311,28 @@ export class AnthropicToolLoopCoordinator {
       const nativeCalls = snapshot.toolCalls.filter((call) => call.owner === "proxy");
       const clientCalls = snapshot.toolCalls.filter((call) => call.owner === "client");
       if (nativeCalls.length === 0) {
+        if (internalRound && clientCalls.length > 0) {
+          stateKey = await this.createBatch(input, snapshot);
+          await this.persistSnapshot(stateKey, snapshot, "completed", input.totalCalls);
+          const pending = await this.transitionClientDispatch(stateKey, "none", "pending");
+          const dispatched = pending
+            && await this.transitionClientDispatch(stateKey, "pending", "dispatched");
+          if (!dispatched) {
+            return fail(new CoordinatorFailure(
+              "client_tool_dispatch_conflict",
+              "Client Tool continuation has already been dispatched",
+              409,
+            ));
+          }
+          return {
+            kind: "client_dispatch",
+            stateKey,
+            bytes: replayAnthropicBytes(snapshot),
+            status: input.status,
+            headers: new Headers(input.headers),
+            rounds: [snapshot],
+          };
+        }
         const bytes = replayAnthropicBytes(snapshot);
         return {
           kind: internalRound ? "final" : "replay",

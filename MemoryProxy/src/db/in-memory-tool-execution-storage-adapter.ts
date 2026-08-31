@@ -74,9 +74,13 @@ export class InMemoryToolExecutionStorageAdapter implements ToolExecutionStorage
   async findByCallId(
     scope: ToolExecutionScope,
     callId: string,
+    options: { includeExpired?: boolean } = {},
   ): Promise<ToolExecutionContext | null> {
     this.assertOpen();
-    const matches = this.activeRows(scope)
+    const source = options.includeExpired
+      ? [...this.backend.rows.values()].filter((context) => sameToolExecutionScope(context.key, scope))
+      : this.activeRows(scope);
+    const matches = source
       .filter((context) => context.slots.some((slot) => slot.callId === callId))
       .sort((left, right) => Date.parse(right.createdAt) - Date.parse(left.createdAt));
     return matches.length > 0 ? cloneToolExecutionContext(matches[0]) : null;
