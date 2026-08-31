@@ -40,19 +40,19 @@ upstream:
   # 按 agent 名（URL 路径前缀 /{agent}/...）覆盖 url + apiKey。
   # Anthropic 和 OpenAI 协议共用同一张表。
   #
-  # 兜底规则（重要）——只有"没配这个 agent"才会走外层 upstream 兜底：
+  # 兜底规则（重要）——没配 agent 或只配 protocol 时走外层 upstream 兜底：
   #
   #   ┌────────────────────────────────┬────────────┬───────────────────────┐
   #   │ 该 agent 的配置                │ 用的 url   │ 用的 apiKey           │
   #   ├────────────────────────────────┼────────────┼───────────────────────┤
   #   │ 不在 agents 里                 │ upstream.url│ upstream.apiKey (兜底)│
+  #   │ 在 agents 里，只有 protocol    │ upstream.url│ upstream.apiKey (兜底)│
   #   │ 在 agents 里，只有 url         │ agent.url  │ 透传客户端请求的 key  │
   #   │ 在 agents 里，url + apiKey     │ agent.url  │ agent.apiKey          │
   #   └────────────────────────────────┴────────────┴───────────────────────┘
   #
-  # 中间一行是设计上刻意留的口子：一旦 agent 出现在这张表里，外层
-  # upstream.apiKey 的兜底就被切断，允许运营方在同一个 proxy 里让
-  # 一部分 agent 走服务端 key、另一部分透传客户端自己的 key。
+  # url-only 行是设计上刻意留的口子：agent 有独立 URL 时，外层 apiKey
+  # 兜底被切断，允许运营方让一部分 agent 透传客户端自己的 key。
   #
   # 完整优先级（高→低）：
   #   1. costGuard 内部路由自带的凭据（cheap-model 兜底）
@@ -63,6 +63,8 @@ upstream:
     # claude-code:                                        # 服务端 key 模式
     #   url: "https://claude-upstream.example.com/v1"
     #   apiKey: "sk-ant-agent-key"
+    # claude-code:                                        # Anthropic 客户端 → Responses 上游
+    #   protocol: responses                               # 仅改协议时继承外层 url + apiKey
     # codex:                                              # 客户端 key 透传模式
     #   url: "https://codex-upstream.example.com/v1"
     #   # 不写 apiKey → 透传客户端自己带上来的 key，不走外层兜底

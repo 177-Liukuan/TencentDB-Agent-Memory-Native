@@ -45,6 +45,10 @@ export interface ToolLoopProtocolCodec {
   assistantSkeleton(snapshot: ToolStreamSnapshot): JsonValue[];
   buildToolMessages(snapshot: ToolStreamSnapshot, slots: readonly ToolCallSlot[]): JsonValue[];
   buildClientVisibleSse(rawBytes: Uint8Array, proxyIndexes: ReadonlySet<number>): Uint8Array;
+  /** Convert an otherwise replayable successful upstream stream for the client. */
+  buildReplaySse?(rawBytes: Uint8Array): Uint8Array;
+  /** Override the protocol-specific error envelope returned to the client. */
+  buildError?(code: string, message: string, status: number): { bytes: Uint8Array; headers: Headers };
 }
 
 export type OpenAIToolLoopDecision =
@@ -184,7 +188,9 @@ export class OpenAIToolLoopCoordinator {
       const clientCalls = snapshot.toolCalls.filter((call) => call.owner === "client");
       if (nativeCalls.length === 0) {
         return {
-          kind: internal ? "final" : "replay", bytes: snapshot.rawBytes, status: input.status,
+          kind: internal ? "final" : "replay",
+          bytes: this.codec.buildReplaySse?.(snapshot.rawBytes) ?? snapshot.rawBytes,
+          status: input.status,
           headers: new Headers(input.headers), rounds: [snapshot],
         };
       }
@@ -312,10 +318,11 @@ export class OpenAIToolLoopCoordinator {
   }
 
   private error(code: string, message: string, status: number, rounds: ToolStreamSnapshot[]): OpenAIToolLoopDecision {
+    const custom = this.codec.buildError?.(code, message, status);
     return {
       kind: "error", code, message, status, rounds,
-      bytes: new TextEncoder().encode(JSON.stringify({ error: { type: status >= 500 ? "api_error" : "invalid_request_error", code, message } })),
-      headers: new Headers({ "content-type": "application/json" }),
+      bytes: custom?.bytes ?? new TextEncoder().encode(JSON.stringify({ error: { type: status >= 500 ? "api_error" : "invalid_request_error", code, message } })),
+      headers: custom?.headers ?? new Headers({ "content-type": "application/json" }),
     };
   }
 }

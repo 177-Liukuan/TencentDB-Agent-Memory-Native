@@ -22,6 +22,51 @@ afterEach(() => {
 });
 
 describe("Native Proxy Tool configuration", () => {
+  it("loads a Responses wire protocol for the Claude Code upstream", () => {
+    const config = buildConfigWithYaml({
+      upstream: {
+        agents: {
+          "claude-code": {
+            url: "https://api.deepseek.com",
+            apiKey: "server-key",
+            protocol: "responses",
+          },
+        },
+      },
+    });
+
+    expect(config.upstream.agents["claude-code"]).toEqual({
+      url: "https://api.deepseek.com",
+      apiKey: "server-key",
+      protocol: "responses",
+    });
+  });
+
+  it("retains a protocol-only agent entry so it can inherit the global upstream", () => {
+    const config = buildConfigWithYaml({
+      upstream: {
+        url: "https://api.deepseek.com",
+        apiKey: "server-key",
+        agents: { "claude-code": { protocol: "responses" } },
+      },
+    });
+
+    expect(config.upstream.agents["claude-code"]).toEqual({ protocol: "responses" });
+  });
+
+  it("rejects an unknown per-agent upstream protocol", () => {
+    expect(() => buildConfigWithYaml({
+      upstream: {
+        agents: {
+          "claude-code": {
+            url: "https://api.deepseek.com",
+            protocol: "chat_completions",
+          },
+        },
+      },
+    })).toThrow(/upstream\.agents\.claude-code\.protocol/);
+  });
+
   it("defaults to a disabled, bounded ClickHouse state backend", () => {
     expect(DEFAULT_CONFIG.nativeProxyTools).toEqual({
       enabled: false,

@@ -2,7 +2,7 @@
 
 import { readFileSync } from "node:fs";
 import { load as yamlLoad } from "js-yaml";
-import type { CostGuardConfig, ProxyConfig, RawYamlConfig } from "./types.js";
+import type { AgentUpstreamEntry, CostGuardConfig, ProxyConfig, RawYamlConfig } from "./types.js";
 
 const DEFAULT_UPSTREAM = "https://llm-upstream.example.com/v2/chat/completions";
 
@@ -246,24 +246,28 @@ function parseCostGuard(yaml: RawYamlConfig): CostGuardConfig {
 
 /**
  * Parse `upstream.agents` from raw YAML into the normalized `AgentUpstreamEntry`
- * map. Entries without a non-empty `url` are silently dropped — an empty url
- * would just fall back to the global upstream, so keeping the entry adds only
- * noise (and would make "did I configure this right?" harder to answer at
- * a glance).
+ * map. A protocol-only entry is retained so a client can inherit the global
+ * URL/key while changing only the upstream wire format.
  */
 function parseUpstreamAgents(
-  raw: Record<string, { url?: string; apiKey?: string } | null | undefined> | undefined,
-): Record<string, { url: string; apiKey?: string }> {
+  raw: NonNullable<RawYamlConfig["upstream"]>["agents"],
+): Record<string, AgentUpstreamEntry> {
   if (!raw || typeof raw !== "object") return {};
-  const out: Record<string, { url: string; apiKey?: string }> = {};
+  const out: Record<string, AgentUpstreamEntry> = {};
   for (const [name, entry] of Object.entries(raw)) {
     if (!entry || typeof entry !== "object") continue;
     const url = (entry as { url?: unknown }).url;
-    if (typeof url !== "string" || url.length === 0) continue;
     const apiKey = (entry as { apiKey?: unknown }).apiKey;
-    out[name] = typeof apiKey === "string" && apiKey.length > 0
-      ? { url, apiKey }
-      : { url };
+    const protocol = (entry as { protocol?: unknown }).protocol;
+    if (protocol !== undefined && protocol !== "native" && protocol !== "responses") {
+      throw new Error(`upstream.agents.${name}.protocol must be \"native\" or \"responses\"`);
+    }
+    if ((typeof url !== "string" || url.length === 0) && protocol === undefined) continue;
+    out[name] = {
+      ...(typeof url === "string" && url.length > 0 ? { url } : {}),
+      ...(typeof apiKey === "string" && apiKey.length > 0 ? { apiKey } : {}),
+      ...(protocol !== undefined ? { protocol } : {}),
+    };
   }
   return out;
 }

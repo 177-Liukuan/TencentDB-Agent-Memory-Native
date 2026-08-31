@@ -9,6 +9,17 @@
 
 ---
 
+## [Unreleased]
+
+### 🔁 Anthropic 客户端 / Responses 上游转码
+
+- `upstream.agents.<agent>.protocol: responses` 可让 Claude Code 继续使用
+  Anthropic Messages 接入，同时把模型侧切换到 OpenAI Responses API
+- 支持请求、流式/非流式响应、Native Proxy Tool 内部重入，以及 Client Tool
+  轮末下发与结果恢复的完整双向转码
+- 不可无损表达的请求字段和 Responses Provider Tool 输出采用 fail-closed，避免
+  跨协议静默丢失
+
 ## [2.0.1-beta.1] — 2026-08-13
 
 ### 🧠 冷启动开箱即用 · 默认 Agent + 预置 Skill

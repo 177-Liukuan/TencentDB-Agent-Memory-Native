@@ -200,6 +200,49 @@ describe("exact Anthropic target transport", () => {
     expect(JSON.stringify(init?.headers)).not.toContain("client-secret");
   });
 
+  it("reconstructs inherited global Responses auth for a protocol-only agent", async () => {
+    const config = structuredClone(DEFAULT_CONFIG);
+    config.upstream.url = "https://api.deepseek.com";
+    config.upstream.apiKey = "global-responses-secret";
+    config.upstream.agents["claude-code"] = { protocol: "responses" };
+    const snapshot = buildUpstreamRequestSnapshot({
+      protocol: "responses",
+      body: {
+        model: "deepseek-v4-flash",
+        stream: true,
+        max_output_tokens: 128,
+        input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "hello" }] }],
+      },
+      url: "https://api.deepseek.com/responses",
+      model: "deepseek-v4-flash",
+      authSource: "global",
+    });
+    const fetchImpl = vi.fn<typeof fetch>(async () => new Response(responseStream(), {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    }));
+    const reenter = createRestartExactTargetTransport({
+      config,
+      currentModel: "deepseek-v4-flash",
+      agentSource: "claude-code",
+      requestPath: "/responses",
+      sessionId: "session-1",
+      currentRequestHeaders: { "x-api-key": "memory-client-key" },
+      timeoutMs: 5_000,
+      fetchImpl,
+    });
+
+    await reenter({ upstreamSnapshot: snapshot, messages: snapshot.baseMessages, round: 2, totalCalls: 1 });
+
+    expect(fetchImpl).toHaveBeenCalledWith(
+      "https://api.deepseek.com/responses",
+      expect.objectContaining({
+        headers: expect.objectContaining({ authorization: "Bearer global-responses-secret" }),
+      }),
+    );
+    expect(JSON.stringify(fetchImpl.mock.calls[0][1]?.headers)).not.toContain("memory-client-key");
+  });
+
   it("reconstructs OpenAI Bearer auth and replay-safe Chat Completions parameters", async () => {
     const config = structuredClone(DEFAULT_CONFIG);
     config.upstream.agents.codebuddy = {

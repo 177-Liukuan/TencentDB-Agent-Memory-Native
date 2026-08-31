@@ -62,6 +62,8 @@ import { describeNativeProxyToolInjectionFailure } from "./native-proxy-tools/na
 import { getNativeProxyToolRuntime } from "./native-proxy-tools/runtime.js";
 import type { NativeProxyToolRegistry } from "./native-proxy-tools/tool-registry.js";
 import { AnthropicToolLoopCoordinator, type ToolLoopDecision } from "./native-proxy-tools/tool-loop-coordinator.js";
+import { AnthropicClientResponsesToolLoopCoordinator } from "./native-proxy-tools/anthropic-client-responses-tool-loop.js";
+import type { OpenAIToolLoopDecision } from "./native-proxy-tools/openai-tool-loop-coordinator.js";
 import {
   completeClientToolReentry,
   createPersistedClientReentryOutcome,
@@ -96,6 +98,16 @@ import {
 } from "./native-proxy-tools/observation-outbox.js";
 import { extractAnthropicLogicalResponse } from "./native-proxy-tools/anthropic-logical-response.js";
 import type { ToolExecutionStorageAdapter } from "./db/tool-execution-storage-adapter.js";
+import {
+  AnthropicResponsesConversionError,
+  convertAnthropicRequestToResponses,
+} from "./protocol-bridge/anthropic-responses-request.js";
+import {
+  convertResponsesSseBytesToAnthropic,
+  convertResponsesJsonToAnthropic,
+  createResponsesToAnthropicSseTransform,
+} from "./protocol-bridge/responses-anthropic-response.js";
+import { buildClientVisibleResponsesSse } from "./native-proxy-tools/responses-response-rebuilder.js";
 
 const SKIP_REQUEST_HEADERS = new Set([
   "host",
@@ -706,6 +718,24 @@ function buildUpstreamHeaders(
   return headers;
 }
 
+/** Adapt Anthropic client authentication/SDK headers to a Responses upstream. */
+function buildResponsesUpstreamHeaders(headers: Record<string, string>): Record<string, string> {
+  const result: Record<string, string> = {};
+  for (const [name, value] of Object.entries(headers)) {
+    const lower = name.toLowerCase();
+    if (
+      lower === "anthropic-version"
+      || lower === "anthropic-beta"
+      || lower.startsWith("x-stainless-")
+    ) continue;
+    result[lower] = value;
+  }
+  const apiKey = result["x-api-key"];
+  if (apiKey) result.authorization = `Bearer ${apiKey}`;
+  delete result["x-api-key"];
+  return result;
+}
+
 /**
  * Forward request to upstream and handle retry if retryTarget is set.
  */
@@ -1005,6 +1035,8 @@ export async function handleAnthropicMessages(
   const agentFromPath = pathParts[0] && !["v1", "proxy", "skill-bridge", "memory-bridge"].includes(pathParts[0])
     ? pathParts[0] : undefined;
   const agentSource = agentFromPath ?? "claude-code";
+  const configuredUpstreamProtocol = config.upstream.agents?.[agentSource]?.protocol ?? "native";
+  const usesResponsesUpstream = configuredUpstreamProtocol === "responses";
 
   // ── Identity inspection ──────────────────────────────────────────────────
   const reqHeaders: Record<string, string> = {};
@@ -1301,7 +1333,7 @@ export async function handleAnthropicMessages(
       config,
       currentModel: modelId,
       agentSource,
-      requestPath: "/messages",
+      requestPath: usesResponsesUpstream ? "/responses" : "/messages",
       sessionId: sessionKey,
       currentRequestHeaders: reqHeaders,
       timeoutMs: config.server.forwardTimeoutMs ?? 600_000,
@@ -1310,7 +1342,7 @@ export async function handleAnthropicMessages(
           config,
           instanceId: spaceId || undefined,
           modelId: reentryModel,
-          protocol: "anthropic",
+          protocol: usesResponsesUpstream ? "openai" : "anthropic",
         });
       },
     });
@@ -1416,16 +1448,21 @@ export async function handleAnthropicMessages(
       resumePipe.forwardStart();
       resumePipe.forwardDone(resume.upstreamRound.status);
       let parentContinuationCommitted = false;
-      const coordinator = new AnthropicToolLoopCoordinator({
+      const coordinatorOptions = {
         registry: nativeToolRuntime.registry,
         storage: nativeStorage,
         dispatcher: nativeDispatcher,
         limits: config.nativeProxyTools,
         reenter: exactReentry,
-        trackBackgroundOperation: (operation) => nativeToolRuntime.trackBackgroundOperation(operation),
+        trackBackgroundOperation: (operation: () => Promise<void>) => nativeToolRuntime.trackBackgroundOperation(operation),
         beforeReenter: renewParentReentry,
         beforeClientDispatch: renewParentReentry,
-        onClientDispatchPrepared: async (dispatch) => {
+        onClientDispatchPrepared: async (dispatch: {
+          stateKey: ToolExecutionStateKey;
+          bytes: Uint8Array;
+          status: number;
+          headers: Headers;
+        }) => {
           await completeClientToolReentry(
             nativeStorage,
             resume.stateKey,
@@ -1440,8 +1477,8 @@ export async function handleAnthropicMessages(
           );
           parentContinuationCommitted = true;
         },
-      });
-      const decision = await nativeToolRuntime.runOperation(() => coordinator.handleRound({
+      };
+      const resumedRoundInput = {
         ...resume.upstreamRound,
         scope: toolExecutionScope,
         turnSeq: resume.turnSeq,
@@ -1450,7 +1487,15 @@ export async function handleAnthropicMessages(
         totalCalls: resume.totalCalls,
         parentStateKey: resume.stateKey,
         parentReentryAttempt: resume.reentryAttempt,
-      }));
+      };
+      const decision: ToolLoopDecision | OpenAIToolLoopDecision = resume.upstreamSnapshot.protocol === "responses"
+        ? await nativeToolRuntime.runOperation(() => new AnthropicClientResponsesToolLoopCoordinator({
+            ...coordinatorOptions,
+            model: resume.upstreamSnapshot.target.model,
+          }).handleRound(resumedRoundInput))
+        : await nativeToolRuntime.runOperation(() => new AnthropicToolLoopCoordinator(
+            coordinatorOptions,
+          ).handleRound(resumedRoundInput));
       try {
         assertNoNativeToolLeak(decision.bytes, [
           ...resume.nativeLeakMarkers,
@@ -1592,7 +1637,7 @@ export async function handleAnthropicMessages(
           );
         }
       }
-      observeNativeToolDecision(decision, {
+      const resumeObservationContext: AnthropicTapContext = {
         config,
         modelId: resume.upstreamSnapshot.target.model,
         keyId,
@@ -1624,7 +1669,12 @@ export async function handleAnthropicMessages(
         langfuseDebug: resumeDebug,
         debugMetadata: resumeDebugMetadata,
         preparedStats: null,
-      });
+      };
+      if (resume.upstreamSnapshot.protocol === "responses") {
+        observeResponsesNativeToolDecision(decision as OpenAIToolLoopDecision, resumeObservationContext);
+      } else {
+        observeNativeToolDecision(decision as ToolLoopDecision, resumeObservationContext);
+      }
       const decisionHeaders = new Headers(decision.headers);
       const isSse = decisionHeaders.get("content-type")?.toLowerCase().includes("text/event-stream");
       const output = isSse
@@ -1853,7 +1903,9 @@ export async function handleAnthropicMessages(
     config.upstream.url;
   // Normalize the request path to the canonical upstream endpoint so the
   // extension's URL joining matches the host whitelist behavior.
-  const forwardEndpoint = matchWhitelistEndpoint(c.req.path)?.upstreamEndpoint ?? "/messages";
+  const forwardEndpoint = usesResponsesUpstream
+    ? "/responses"
+    : matchWhitelistEndpoint(c.req.path)?.upstreamEndpoint ?? "/messages";
   // Isolation key is user-namespaced (`${user}:${session}`) so two users that
   // share the same client session id can't contaminate each other's state /
   // turn counting. ClickHouse keeps the raw session_key (it has its own
@@ -1861,7 +1913,7 @@ export async function handleAnthropicMessages(
   const target: ForwardTarget = await resolveForwardTarget(config, {
     keyId: `${keyId}:${sessionKey}`,
     messages,
-    protocol: "anthropic",
+    protocol: usesResponsesUpstream ? "openai" : "anthropic",
     hasTools,
     body,
     modelId,
@@ -1895,6 +1947,7 @@ export async function handleAnthropicMessages(
   const traceTags: string[] = [
     `agent_source:${agentSource}`,
     "protocol:anthropic",
+    `upstream_protocol:${usesResponsesUpstream ? "responses" : "anthropic"}`,
     isStream ? "stream" : "non-stream",
     `session:${sessionKey}`,
   ];
@@ -1956,17 +2009,23 @@ export async function handleAnthropicMessages(
   writeRequestLog(config, body);
 
   // ── Build upstream request ───────────────────────────────────────────────
-  // Per-agent apiKey resolution — three cases:
-  //   (a) no entry in agents map           → global upstream.apiKey (兜底)
-  //   (b) entry present, apiKey empty      → "" (passthrough, keep client key)
-  //   (c) entry present, apiKey non-empty  → agent.apiKey (server-side key)
-  // The presence of an entry (case b/c) is what cuts the global fallback —
-  // this is the switch that lets one proxy serve mixed server-key / client-key
-  // agents from a single config.
-  const effectiveApiKey = agentUpstreamEntry
+  // Per-agent apiKey resolution — four cases:
+  //   (a) no entry in agents map             → global upstream.apiKey
+  //   (b) protocol-only entry                → global upstream.apiKey
+  //   (c) routed entry, apiKey empty         → passthrough client key
+  //   (d) routed entry, apiKey non-empty     → agent.apiKey
+  // A protocol-only entry changes the wire format while retaining the global
+  // URL/key. An entry that supplies a URL keeps the established semantics:
+  // omitting apiKey means client-key passthrough for that independently routed
+  // agent. This avoids copying the same secret just to switch wire protocols.
+  const protocolOnlyAgentEntry = agentUpstreamEntry !== undefined
+    && agentUpstreamEntry.url === undefined
+    && agentUpstreamEntry.apiKey === undefined;
+  const effectiveApiKey = agentUpstreamEntry && !protocolOnlyAgentEntry
     ? (agentUpstreamEntry.apiKey ?? "")
     : config.upstream.apiKey;
-  const upstreamHeaders = buildUpstreamHeaders(c, config, target, sessionKey, effectiveApiKey);
+  let upstreamHeaders = buildUpstreamHeaders(c, config, target, sessionKey, effectiveApiKey);
+  if (usesResponsesUpstream) upstreamHeaders = buildResponsesUpstreamHeaders(upstreamHeaders);
 
   // Optional private preparation stage. It rewrites `body` / `messages` in
   // place, so it has to land after every host-side mutation (injection, agent
@@ -1992,7 +2051,7 @@ export async function handleAnthropicMessages(
     lf,
   });
 
-  const { body: upstreamBody, sanitizedCount } = buildUpstreamBody(body, target);
+  const { body: anthropicUpstreamBody, sanitizedCount } = buildUpstreamBody(body, target);
   if (sanitizedCount > 0) {
     pipe.info(
       "FORWARD",
@@ -2019,8 +2078,35 @@ export async function handleAnthropicMessages(
     originalHeaders["x-api-key"] = effectiveApiKey;
     delete originalHeaders["authorization"];
   }
+  if (usesResponsesUpstream) {
+    const convertedHeaders = buildResponsesUpstreamHeaders(originalHeaders);
+    for (const name of Object.keys(originalHeaders)) delete originalHeaders[name];
+    Object.assign(originalHeaders, convertedHeaders);
+  }
 
-  const retryBody = buildRetryBody(body);
+  const anthropicRetryBody = buildRetryBody(body);
+  let upstreamBody: Record<string, unknown>;
+  let retryBody: Record<string, unknown>;
+  try {
+    upstreamBody = usesResponsesUpstream
+      ? convertAnthropicRequestToResponses(anthropicUpstreamBody)
+      : anthropicUpstreamBody;
+    retryBody = usesResponsesUpstream
+      ? convertAnthropicRequestToResponses(anthropicRetryBody)
+      : anthropicRetryBody;
+  } catch (error) {
+    if (error instanceof AnthropicResponsesConversionError) {
+      return c.json({
+        type: "error",
+        error: {
+          type: "invalid_request_error",
+          code: "anthropic_responses_conversion_failed",
+          message: error.message,
+        },
+      }, 400);
+    }
+    throw error;
+  }
 
   // ── Forward to upstream (with automatic retry if configured) ──────────────
   const forwardTimeoutMs = config.server.forwardTimeoutMs ?? 600_000;
@@ -2087,8 +2173,8 @@ export async function handleAnthropicMessages(
     // non-2xx status/body exactly (including a retry result) before the Native
     // coordinator is allowed to acquire the sole successful-SSE consumer.
     if (upstreamResp.status < 200 || upstreamResp.status >= 300) {
-      const errBytes = new Uint8Array(await upstreamResp.arrayBuffer());
-      const errText = new TextDecoder().decode(errBytes);
+      let errBytes = new Uint8Array(await upstreamResp.arrayBuffer());
+      let errText = new TextDecoder().decode(errBytes);
       const sentErrorBody = retried ? retryBody : upstreamBody;
       const sentNativeToolDefinition = nativeToolDefinitionInjected
         && nativeToolRuntime !== null
@@ -2113,6 +2199,19 @@ export async function handleAnthropicMessages(
             "native_tool_leak_detected",
             "Anthropic upstream error response could not be returned safely",
           );
+        }
+      }
+      if (usesResponsesUpstream) {
+        try {
+          const converted = convertResponsesJsonToAnthropic(JSON.parse(errText));
+          errText = JSON.stringify(converted);
+          errBytes = new TextEncoder().encode(errText);
+        } catch {
+          errText = JSON.stringify({
+            type: "error",
+            error: { type: "api_error", message: "Responses upstream returned an error" },
+          });
+          errBytes = new TextEncoder().encode(errText);
         }
       }
       pipe.error("UPSTREAM_NON_2XX", `status=${upstreamResp.status} body=${errText.slice(0, 1000)}`);
@@ -2178,6 +2277,7 @@ export async function handleAnthropicMessages(
       try {
         const logicalMessages = nativeLogicalBaseMessages ?? messages;
         upstreamSnapshot = buildUpstreamRequestSnapshot({
+          protocol: usesResponsesUpstream ? "responses" : "anthropic",
           body: successfulBody,
           url: successfulUrl,
           model: successfulModel,
@@ -2221,15 +2321,15 @@ export async function handleAnthropicMessages(
           });
         },
       });
-      const coordinator = new AnthropicToolLoopCoordinator({
+      const coordinatorOptions = {
         registry: nativeToolRuntime.registry,
         storage: nativeToolRuntime.storage,
         dispatcher: nativeToolRuntime.dispatcher,
         limits: config.nativeProxyTools,
         reenter,
-        trackBackgroundOperation: (operation) => nativeToolRuntime.trackBackgroundOperation(operation),
-      });
-      const decision = await nativeToolRuntime.runOperation(() => coordinator.handleRound({
+        trackBackgroundOperation: (operation: () => Promise<void>) => nativeToolRuntime.trackBackgroundOperation(operation),
+      };
+      const initialRoundInput = {
         stream: nativeStream,
         status: upstreamResp.status,
         headers: respHeaders,
@@ -2238,7 +2338,15 @@ export async function handleAnthropicMessages(
         upstreamSnapshot,
         round: 1,
         totalCalls: 0,
-      }));
+      };
+      const decision: ToolLoopDecision | OpenAIToolLoopDecision = usesResponsesUpstream
+        ? await nativeToolRuntime.runOperation(() => new AnthropicClientResponsesToolLoopCoordinator({
+            ...coordinatorOptions,
+            model: successfulModel,
+          }).handleRound(initialRoundInput))
+        : await nativeToolRuntime.runOperation(() => new AnthropicToolLoopCoordinator(
+            coordinatorOptions,
+          ).handleRound(initialRoundInput));
       if (decision.kind === "client_dispatch") {
         nativeToolRuntime.retainExactTarget(decision.stateKey, reenter);
       }
@@ -2265,7 +2373,7 @@ export async function handleAnthropicMessages(
         }
       }
 
-      observeNativeToolDecision(decision, {
+      const nativeObservationContext: AnthropicTapContext = {
         config,
         modelId: successfulModel,
         keyId,
@@ -2298,7 +2406,12 @@ export async function handleAnthropicMessages(
         langfuseDebug,
         debugMetadata,
         preparedStats,
-      });
+      };
+      if (usesResponsesUpstream) {
+        observeResponsesNativeToolDecision(decision as OpenAIToolLoopDecision, nativeObservationContext);
+      } else {
+        observeNativeToolDecision(decision as ToolLoopDecision, nativeObservationContext);
+      }
 
       const decisionHeaders = new Headers(decision.headers);
       const isSse = decisionHeaders.get("content-type")?.toLowerCase().includes("text/event-stream");
@@ -2311,7 +2424,10 @@ export async function handleAnthropicMessages(
       });
     }
 
-    const [rawClientStream, tapStream] = upstreamResp.body.tee();
+    const anthropicResponseStream = usesResponsesUpstream
+      ? upstreamResp.body.pipeThrough(createResponsesToAnthropicSseTransform({ model: effectiveModel }))
+      : upstreamResp.body;
+    const [rawClientStream, tapStream] = anthropicResponseStream.tee();
     pipe.streamStart();
 
     // Background: consume tap stream for Anthropic SSE → extract usage
@@ -2355,6 +2471,16 @@ export async function handleAnthropicMessages(
 
   // ── Non-streaming response ───────────────────────────────────────────────
   let respText = await upstreamResp.text();
+  if (usesResponsesUpstream) {
+    try {
+      respText = JSON.stringify(convertResponsesJsonToAnthropic(JSON.parse(respText)));
+    } catch {
+      respText = JSON.stringify({
+        type: "error",
+        error: { type: "api_error", message: "Responses upstream returned an invalid response" },
+      });
+    }
+  }
   const endTime = new Date().toISOString();
 
   let usage: Record<string, unknown> | null = null;
@@ -2812,6 +2938,52 @@ function observeNativeToolDecision(
         nativeToolDecision: decision.kind,
       },
     });
+  });
+}
+
+/** Observe Responses-native rounds after rebuilding their Anthropic client view. */
+function observeResponsesNativeToolDecision(
+  decision: OpenAIToolLoopDecision,
+  ctx: AnthropicTapContext,
+): void {
+  if (decision.rounds.length === 0) {
+    ctx.pipe.streamDone(null);
+    return;
+  }
+  const lastIndex = decision.rounds.length - 1;
+  decision.rounds.forEach((snapshot, index) => {
+    const roundPipe = index === lastIndex
+      ? ctx.pipe
+      : createPipeline(ctx.config, ctx.traceId, ctx.modelId);
+    if (index !== lastIndex) roundPipe.requestReceived(ctx.inputMessages.length, true);
+    roundPipe.streamStart();
+    const nativeIndexes = new Set(snapshot.toolCalls
+      .filter((call) => call.owner === "proxy")
+      .map((call) => call.contentBlockIndex));
+    try {
+      const responsesBytes = nativeIndexes.size > 0
+        ? buildClientVisibleResponsesSse(snapshot.rawBytes, nativeIndexes)
+        : snapshot.rawBytes;
+      const observationBytes = convertResponsesSseBytesToAnthropic(
+        [responsesBytes],
+        { model: ctx.modelId },
+      );
+      consumeAnthropicStream(streamFromBytes(observationBytes), {
+        ...ctx,
+        pipe: roundPipe,
+        requestKind: index === lastIndex && isLogicalFinalToolLoopDecision(decision.kind)
+          ? ctx.requestKind
+          : "fork",
+        logMeta: {
+          ...ctx.logMeta,
+          nativeToolRound: index + 1,
+          nativeToolDecision: decision.kind,
+          upstreamProtocol: "responses",
+        },
+      });
+    } catch {
+      roundPipe.streamDone(null);
+    }
   });
 }
 

@@ -45,6 +45,28 @@ $EDITOR .env
     claude --model <PROXY_UPSTREAM_MODEL 里配的模型>
     ```
 
+### Claude Code 使用 OpenAI Responses 上游
+
+Claude Code 到 MemoryProxy 的客户端协议仍是 Anthropic Messages；只需为
+`upstream.agents.claude-code` 设置 `protocol: responses`，Proxy 就会把请求、
+流式事件、Client Tool Result 和 Native Proxy Tool 内部重入双向转码：
+
+```yaml
+upstream:
+  url: https://api.deepseek.com
+  apiKey: <YOUR_DEEPSEEK_API_KEY>
+  agents:
+    claude-code:
+      protocol: responses
+```
+
+只配置 `protocol` 的 agent 会继承外层 `upstream.url` 和 `upstream.apiKey`；如果
+同时配置 agent 专属 `url`，则仍遵循原有规则：未写 agent `apiKey` 表示透传客户端 key。
+
+客户端启动命令不变。该模式要求上游真实支持 `/responses`；Responses 专属的
+Provider Tool 输出无法无损表达为 Anthropic Messages，因此 Proxy 会明确报错，
+不会静默丢块。`stop_sequences`、`top_k` 等 Responses 无等价字段也会在转发前拒绝。
+
 三个服务默认端口：
 
 | 服务 | 端口 | 用途 |

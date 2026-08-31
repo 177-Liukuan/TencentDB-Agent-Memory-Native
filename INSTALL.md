@@ -49,6 +49,32 @@ When it finishes, the script automatically:
     claude --model <whatever PROXY_UPSTREAM_MODEL is set to>
     ```
 
+### Claude Code with an OpenAI Responses upstream
+
+Claude Code still speaks Anthropic Messages to MemoryProxy. Set
+`protocol: responses` only on the `claude-code` upstream entry and the proxy
+will translate requests, streaming events, client tool results, and Native
+Proxy Tool internal re-entry in both directions:
+
+```yaml
+upstream:
+  url: https://api.deepseek.com
+  apiKey: <YOUR_DEEPSEEK_API_KEY>
+  agents:
+    claude-code:
+      protocol: responses
+```
+
+A protocol-only agent entry inherits the outer `upstream.url` and
+`upstream.apiKey`. If an agent-specific `url` is also present, the existing
+rule remains in force: omitting the agent `apiKey` means client-key passthrough.
+
+The Claude Code launch command stays unchanged. The selected upstream must
+actually implement `/responses`. Responses-only Provider Tool output cannot be
+represented losslessly in Anthropic Messages and is therefore rejected rather
+than dropped. Anthropic controls without Responses equivalents, including
+`stop_sequences` and `top_k`, are also rejected before forwarding.
+
 Default ports:
 
 | Service     | Port  | Purpose                                              |

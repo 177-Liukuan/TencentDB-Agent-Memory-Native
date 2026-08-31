@@ -495,12 +495,21 @@ export function validateToolExecutionContext(context: ToolExecutionContext): voi
     "metadata",
     "service_tier",
     "max_completion_tokens",
+    "max_output_tokens",
     "frequency_penalty",
     "presence_penalty",
     "parallel_tool_calls",
     "response_format",
     "seed",
     "stream_options",
+    "reasoning",
+    "text",
+    "include",
+    "truncation",
+    "previous_response_id",
+    "conversation",
+    "store",
+    "background",
   ]);
   if (Object.keys(context.upstreamSnapshot.requestParameters).some((name) => !requestParameterKeys.has(name))) {
     throw new ToolExecutionValidationError("Upstream request parameters contain a non-allowlisted field");

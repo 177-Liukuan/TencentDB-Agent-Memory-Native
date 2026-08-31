@@ -344,20 +344,20 @@ export interface SkillRuntimeConfig {
  * prefix like "claude-code") needs a different upstream than the global
  * default, this struct provides the replacement `url` (and optional `apiKey`).
  *
- * Fallback semantics — three cases, matching the runtime `effectiveApiKey`
+ * Fallback semantics — four cases, matching the runtime `effectiveApiKey`
  * resolution in `handler.ts` / `anthropicHandler.ts`:
  *
  *   ┌──────────────────────────────┬────────────┬──────────────────────────┐
  *   │ agent config                 │ url used   │ apiKey used              │
  *   ├──────────────────────────────┼────────────┼──────────────────────────┤
  *   │ NOT in agents map            │ upstream.url│ upstream.apiKey (global)│
+ *   │ protocol only                │ upstream.url│ upstream.apiKey (global)│
  *   │ in map, url only, no apiKey  │ agent.url  │ passthrough client key  │
  *   │ in map, url + apiKey         │ agent.url  │ agent.apiKey            │
  *   └──────────────────────────────┴────────────┴──────────────────────────┘
  *
- * The presence of an entry cuts the global `upstream.apiKey` fallback —
- * this is intentional so an operator can run some agents on a server-side
- * key and others on the client's own key from a single proxy config.
+ * An entry with a routing/auth override cuts the global `upstream.apiKey`
+ * fallback. A protocol-only entry deliberately retains the global URL/key.
  *
  * Priority order (high → low):
  *   1. `costGuard`-provided `target.authHeaders`（cheap-model 兜底路由自带凭据）
@@ -370,15 +370,16 @@ export interface SkillRuntimeConfig {
  * itself is protocol-agnostic.
  */
 export interface AgentUpstreamEntry {
-  /** Target upstream base URL. Required. */
-  url: string;
+  /** Optional target base URL. Protocol-only entries inherit global URL/key. */
+  url?: string;
+  /** Override the handler-native upstream wire format. */
+  protocol?: "native" | "responses";
   /**
    * Per-agent apiKey. When set (non-empty):
    *   - OpenAI: `Authorization: Bearer <apiKey>` is injected
    *   - Anthropic: `x-api-key: <apiKey>` is injected
-   * When absent / empty: the client's own auth header is passed through
-   * upstream untouched. This does NOT fall back to `upstream.apiKey` —
-   * that fallback only applies when this agent has no entry at all.
+   * When absent on an entry with its own URL, the client's auth is passed
+   * through. A protocol-only entry inherits the global upstream API key.
    */
   apiKey?: string;
 }
@@ -667,7 +668,11 @@ export interface RawYamlConfig {
     url?: string;
     apiKey?: string;
     /** Per-agent override map. See `AgentUpstreamEntry`. */
-    agents?: Record<string, { url?: string; apiKey?: string } | null | undefined>;
+    agents?: Record<string, {
+      url?: string;
+      apiKey?: string;
+      protocol?: "native" | "responses";
+    } | null | undefined>;
   };
   log?: {
     file?: string;

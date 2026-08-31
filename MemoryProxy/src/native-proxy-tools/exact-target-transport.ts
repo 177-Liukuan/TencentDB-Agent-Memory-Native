@@ -311,13 +311,18 @@ function restartCandidates(options: RestartExactTargetTransportOptions): Restart
     options.config.costGuard.anthropicUpstream?.url,
     options.config.upstream.url,
   ].filter((value): value is string => typeof value === "string" && value.length > 0);
-  if (agent) {
+  // A protocol-only agent inherits the global endpoint and credential. Only
+  // build agent-auth candidates when the entry actually overrides routing or
+  // auth; calling joinUrl(undefined, ...) would also break restart recovery.
+  if (agent && (agent.url !== undefined || agent.apiKey !== undefined)) {
     const agentAuthSource = agent.apiKey ? "agent" : "client";
-    candidates.push({
-      url: joinUrl(agent.url, options.requestPath),
-      authSource: agentAuthSource,
-      apiKey: agent.apiKey ?? "",
-    });
+    if (agent.url) {
+      candidates.push({
+        url: joinUrl(agent.url, options.requestPath),
+        authSource: agentAuthSource,
+        apiKey: agent.apiKey ?? "",
+      });
+    }
     // A routed request can retry on either configured default endpoint while
     // deliberately keeping the per-agent/client credential selected for the
     // first attempt. Persisted target identity, not endpoint class, decides.
