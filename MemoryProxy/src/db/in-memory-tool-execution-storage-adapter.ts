@@ -101,6 +101,10 @@ export class InMemoryToolExecutionStorageAdapter implements ToolExecutionStorage
       current.assistantSkeleton = structuredClone(update.assistantSkeleton);
       current.slots = slots;
       current.responseStreamStatus = update.responseStreamStatus;
+      if (update.totalCalls !== undefined) {
+        if (!Number.isInteger(update.totalCalls) || update.totalCalls < current.totalCalls) return null;
+        current.totalCalls = update.totalCalls;
+      }
       return current;
     });
   }

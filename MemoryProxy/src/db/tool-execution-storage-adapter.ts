@@ -14,6 +14,8 @@ export interface StreamSnapshotCas {
   assistantSkeleton: JsonValue[];
   slots: ToolCallSlot[];
   responseStreamStatus: ResponseStreamStatus;
+  /** Monotonic count of Native calls observed in this logical user turn. */
+  totalCalls?: number;
 }
 
 export interface ClientDispatchCas {

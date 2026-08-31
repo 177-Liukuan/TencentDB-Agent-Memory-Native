@@ -1,0 +1,438 @@
+import { describe, expect, it, vi } from "vitest";
+
+import { DEFAULT_CONFIG } from "../../config.js";
+import { InMemoryToolExecutionStorageAdapter } from "../../db/in-memory-tool-execution-storage-adapter.js";
+import type { UnifiedToolCall } from "../../injection/adapters/interface.js";
+import type { NativeToolResult, ToolExecutionScope, UpstreamRequestSnapshot } from "../types.js";
+import {
+  AnthropicToolLoopCoordinator,
+  type NativeReentryRequest,
+  type ToolLoopRoundInput,
+  type UpstreamRound,
+} from "../tool-loop-coordinator.js";
+import { createDefaultNativeProxyToolRegistry } from "../tool-registry.js";
+
+const encoder = new TextEncoder();
+const decoder = new TextDecoder();
+const fixedNow = new Date("2026-08-31T02:00:00.000Z");
+
+function frame(event: string, payload: Record<string, unknown>): Uint8Array {
+  return encoder.encode(`event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`);
+}
+
+function concat(...chunks: Uint8Array[]): Uint8Array {
+  const size = chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0);
+  const output = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) {
+    output.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return output;
+}
+
+function messageStart(): Uint8Array {
+  return frame("message_start", {
+    type: "message_start",
+    message: {
+      id: "msg-1",
+      type: "message",
+      role: "assistant",
+      model: "claude-test",
+      content: [],
+      stop_reason: null,
+      usage: { input_tokens: 5, output_tokens: 0 },
+    },
+  });
+}
+
+function toolFrames(index: number, id: string, name: string, input: Record<string, unknown>): Uint8Array {
+  return concat(
+    frame("content_block_start", {
+      type: "content_block_start",
+      index,
+      content_block: { type: "tool_use", id, name, input: {} },
+    }),
+    frame("content_block_delta", {
+      type: "content_block_delta",
+      index,
+      delta: { type: "input_json_delta", partial_json: JSON.stringify(input) },
+    }),
+    frame("content_block_stop", { type: "content_block_stop", index }),
+  );
+}
+
+function messageStop(reason = "tool_use"): Uint8Array {
+  return concat(
+    frame("message_delta", {
+      type: "message_delta",
+      delta: { stop_reason: reason },
+      usage: { output_tokens: 3 },
+    }),
+    frame("message_stop", { type: "message_stop" }),
+  );
+}
+
+function nativeFixture(callCount = 1): Uint8Array {
+  const tools = Array.from({ length: callCount }, (_, index) => toolFrames(
+    index,
+    `proxy-${index + 1}`,
+    "tdai_memory_search",
+    { query: `rules-${index + 1}` },
+  ));
+  return concat(messageStart(), ...tools, messageStop());
+}
+
+function clientFixture(): Uint8Array {
+  return concat(
+    messageStart(),
+    toolFrames(0, "client-1", "client_shell", { command: "pwd" }),
+    messageStop(),
+  );
+}
+
+function finalFixture(): Uint8Array {
+  return concat(
+    messageStart(),
+    frame("content_block_start", {
+      type: "content_block_start",
+      index: 0,
+      content_block: { type: "text", text: "" },
+    }),
+    frame("content_block_delta", {
+      type: "content_block_delta",
+      index: 0,
+      delta: { type: "text_delta", text: "final answer" },
+    }),
+    frame("content_block_stop", { type: "content_block_stop", index: 0 }),
+    messageStop("end_turn"),
+  );
+}
+
+function byteStream(bytes: Uint8Array) {
+  let readerCount = 0;
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(bytes);
+      controller.close();
+    },
+  });
+  const originalGetReader = stream.getReader.bind(stream);
+  stream.getReader = ((...args: Parameters<typeof stream.getReader>) => {
+    readerCount++;
+    if (readerCount > 1) throw new Error("stream acquired more than once");
+    return originalGetReader(...args);
+  }) as typeof stream.getReader;
+  return { stream, readerCount: () => readerCount };
+}
+
+function controlledNativeStream() {
+  let controller!: ReadableStreamDefaultController<Uint8Array>;
+  let stopReleased = false;
+  const stream = new ReadableStream<Uint8Array>({
+    start(value) {
+      controller = value;
+    },
+  });
+  return {
+    stream,
+    releaseThroughBlockStop() {
+      controller.enqueue(concat(
+        messageStart(),
+        toolFrames(0, "proxy-1", "tdai_memory_search", { query: "rules" }),
+      ));
+    },
+    releaseMessageStop() {
+      stopReleased = true;
+      controller.enqueue(messageStop());
+      controller.close();
+    },
+    closeBeforeMessageStop() {
+      controller.close();
+    },
+    failBeforeMessageStop() {
+      controller.error(new Error("socket reset with secret transport detail"));
+    },
+    messageStopReleased: () => stopReleased,
+  };
+}
+
+function scope(): ToolExecutionScope {
+  return {
+    spaceId: "space-1",
+    userId: "user-1",
+    agentSource: "claude-code",
+    sessionId: "session-1",
+    contextVersion: "v1",
+  };
+}
+
+function snapshot(): UpstreamRequestSnapshot {
+  return {
+    protocol: "anthropic",
+    baseMessages: [{ role: "user", content: "remembered rules?" }],
+    system: [{ type: "text", text: "injected system" }],
+    tools: [{ name: "tdai_memory_search", input_schema: { type: "object" } }],
+    requestParameters: { model: "claude-test", stream: true, max_tokens: 1_024 },
+    target: {
+      id: "agent:claude-code",
+      url: "https://upstream.example/v1/messages",
+      model: "claude-test",
+      authSource: "agent",
+    },
+  };
+}
+
+function roundInput(stream: ReadableStream<Uint8Array>, overrides: Partial<ToolLoopRoundInput> = {}): ToolLoopRoundInput {
+  return {
+    stream,
+    status: 200,
+    headers: new Headers({ "content-type": "text/event-stream", "x-request-id": "upstream-1" }),
+    scope: scope(),
+    turnSeq: 9,
+    upstreamSnapshot: snapshot(),
+    round: 1,
+    totalCalls: 0,
+    ...overrides,
+  };
+}
+
+function coordinatorHarness(options: {
+  execute?: (call: UnifiedToolCall, context: ToolExecutionScope) => Promise<NativeToolResult>;
+  reenter?: (request: NativeReentryRequest) => Promise<UpstreamRound>;
+  configure?: (config: typeof DEFAULT_CONFIG) => void;
+} = {}) {
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.nativeProxyTools.enabled = true;
+  options.configure?.(config);
+  const storage = new InMemoryToolExecutionStorageAdapter({ now: () => fixedNow });
+  const execute = vi.fn(options.execute ?? (async (call: UnifiedToolCall) => ({
+    isError: false,
+    value: { memories: [`result:${call.callId}`] },
+  })));
+  const reenter = vi.fn(options.reenter ?? (async () => ({
+    stream: byteStream(finalFixture()).stream,
+    status: 200,
+    headers: new Headers({ "content-type": "text/event-stream", "x-request-id": "upstream-2" }),
+  })));
+  let sequence = 0;
+  const coordinator = new AnthropicToolLoopCoordinator({
+    registry: createDefaultNativeProxyToolRegistry(),
+    storage,
+    dispatcher: { execute },
+    limits: config.nativeProxyTools,
+    reenter,
+    now: () => fixedNow,
+    createId: () => `id-${++sequence}`,
+  });
+  return { coordinator, storage, execute, reenter, config };
+}
+
+async function eventually(assertion: () => void, timeoutMs = 1_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  let lastError: unknown;
+  while (Date.now() < deadline) {
+    try {
+      assertion();
+      return;
+    } catch (error) {
+      lastError = error;
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+  }
+  throw lastError;
+}
+
+describe("AnthropicToolLoopCoordinator", () => {
+  it.each([
+    ["no-tool", concat(messageStart(), messageStop("end_turn"))],
+    ["Client-only", clientFixture()],
+  ])("consumes and replays a %s response once without persistent state", async (_name, fixture) => {
+    const source = byteStream(fixture);
+    const { coordinator, storage, execute, reenter } = coordinatorHarness();
+
+    const decision = await coordinator.handleRound(roundInput(source.stream));
+
+    expect(decision.kind).toBe("replay");
+    if (decision.kind === "replay") expect(decision.bytes).toEqual(fixture);
+    expect(source.readerCount()).toBe(1);
+    expect(await storage.findActiveBySession(scope())).toEqual([]);
+    expect(execute).not.toHaveBeenCalled();
+    expect(reenter).not.toHaveBeenCalled();
+  });
+
+  it("starts Native execution after block stop and before message_stop", async () => {
+    const gates = controlledNativeStream();
+    const { coordinator, execute } = coordinatorHarness();
+    const promise = coordinator.handleRound(roundInput(gates.stream));
+
+    gates.releaseThroughBlockStop();
+    await eventually(() => expect(execute).toHaveBeenCalledTimes(1));
+    expect(gates.messageStopReleased()).toBe(false);
+    gates.releaseMessageStop();
+
+    await expect(promise).resolves.toMatchObject({ kind: "final" });
+  });
+
+  it("persists Native results and re-enters with the first request snapshot", async () => {
+    const source = byteStream(nativeFixture());
+    const { coordinator, storage, reenter } = coordinatorHarness();
+
+    const decision = await coordinator.handleRound(roundInput(source.stream));
+
+    expect(decision.kind).toBe("final");
+    if (decision.kind === "final") {
+      expect(decoder.decode(decision.bytes)).toContain("final answer");
+      expect(decision.rounds).toHaveLength(2);
+    }
+    expect(reenter).toHaveBeenCalledTimes(1);
+    const request = reenter.mock.calls[0][0];
+    expect(request).toMatchObject({
+      round: 2,
+      totalCalls: 1,
+      upstreamSnapshot: {
+        system: snapshot().system,
+        tools: snapshot().tools,
+        target: snapshot().target,
+      },
+    });
+    expect(request.messages).toEqual([
+      ...snapshot().baseMessages,
+      {
+        role: "assistant",
+        content: [{
+          type: "tool_use",
+          id: "proxy-1",
+          name: "tdai_memory_search",
+          input: { query: "rules-1" },
+        }],
+      },
+      {
+        role: "user",
+        content: [{
+          type: "tool_result",
+          tool_use_id: "proxy-1",
+          content: "{\"memories\":[\"result:proxy-1\"]}",
+        }],
+      },
+    ]);
+    const states = await storage.findActiveBySession(scope());
+    expect(states).toHaveLength(1);
+    expect(states[0]).toMatchObject({
+      responseStreamStatus: "completed",
+      totalCalls: 1,
+      slots: [{ callId: "proxy-1", status: "succeeded" }],
+    });
+  });
+
+  it("feeds a structured Native failure back as an Anthropic error result", async () => {
+    const { coordinator, reenter } = coordinatorHarness({
+      execute: async () => ({
+        isError: true,
+        value: { code: "memory_bridge_unavailable", retryable: true },
+      }),
+    });
+
+    await coordinator.handleRound(roundInput(byteStream(nativeFixture()).stream));
+
+    expect(reenter.mock.calls[0][0].messages.at(-1)).toEqual({
+      role: "user",
+      content: [{
+        type: "tool_result",
+        tool_use_id: "proxy-1",
+        content: "{\"code\":\"memory_bridge_unavailable\",\"retryable\":true}",
+        is_error: true,
+      }],
+    });
+  });
+
+  it("persists multiple Native calls and carries the monotonic total into re-entry", async () => {
+    const { coordinator, storage, execute, reenter } = coordinatorHarness();
+
+    await coordinator.handleRound(roundInput(byteStream(nativeFixture(2)).stream));
+
+    expect(execute).toHaveBeenCalledTimes(2);
+    expect(reenter.mock.calls[0][0]).toMatchObject({ totalCalls: 2, round: 2 });
+    const states = await storage.findActiveBySession(scope());
+    expect(states[0]).toMatchObject({
+      totalCalls: 2,
+      slots: [
+        { callId: "proxy-1", status: "succeeded" },
+        { callId: "proxy-2", status: "succeeded" },
+      ],
+    });
+  });
+
+  it("enforces per-round, total-call, and round limits before offending execution", async () => {
+    const perRound = coordinatorHarness({ configure: (config) => {
+      config.nativeProxyTools.maxCallsPerRound = 1;
+      config.nativeProxyTools.maxTotalCalls = 10;
+    } });
+    const total = coordinatorHarness({ configure: (config) => {
+      config.nativeProxyTools.maxCallsPerRound = 2;
+      config.nativeProxyTools.maxTotalCalls = 2;
+    } });
+    const rounds = coordinatorHarness({ configure: (config) => {
+      config.nativeProxyTools.maxRounds = 1;
+    } });
+
+    const perRoundDecision = await perRound.coordinator.handleRound(
+      roundInput(byteStream(nativeFixture(2)).stream),
+    );
+    const totalDecision = await total.coordinator.handleRound(roundInput(
+      byteStream(nativeFixture()).stream,
+      { totalCalls: 2 },
+    ));
+    const roundDecision = await rounds.coordinator.handleRound(roundInput(
+      byteStream(nativeFixture()).stream,
+      { round: 2 },
+    ));
+
+    for (const decision of [perRoundDecision, totalDecision, roundDecision]) {
+      expect(decision.kind).toBe("error");
+      if (decision.kind === "error") {
+        expect(decision.code).toBe("native_tool_limit_exceeded");
+        expect(decoder.decode(decision.bytes)).not.toContain("tdai_memory_search");
+        expect(decoder.decode(decision.bytes)).not.toContain("proxy-1");
+      }
+    }
+    await eventually(() => expect(perRound.execute).toHaveBeenCalledTimes(1));
+    expect(total.execute).not.toHaveBeenCalled();
+    expect(rounds.execute).not.toHaveBeenCalled();
+  });
+
+  it("marks a started batch aborted when SSE ends before message_stop", async () => {
+    const gates = controlledNativeStream();
+    const { coordinator, storage, execute, reenter } = coordinatorHarness();
+    const promise = coordinator.handleRound(roundInput(gates.stream));
+    gates.releaseThroughBlockStop();
+    await eventually(() => expect(execute).toHaveBeenCalledTimes(1));
+    gates.closeBeforeMessageStop();
+
+    const decision = await promise;
+
+    expect(decision).toMatchObject({ kind: "error", code: "upstream_stream_incomplete" });
+    expect(reenter).not.toHaveBeenCalled();
+    const states = await storage.findActiveBySession(scope());
+    expect(states).toHaveLength(1);
+    expect(states[0].responseStreamStatus).toBe("aborted");
+  });
+
+  it("sanitizes a stream read failure and marks the batch aborted", async () => {
+    const gates = controlledNativeStream();
+    const { coordinator, storage, execute, reenter } = coordinatorHarness();
+    const promise = coordinator.handleRound(roundInput(gates.stream));
+    gates.releaseThroughBlockStop();
+    await eventually(() => expect(execute).toHaveBeenCalledTimes(1));
+    gates.failBeforeMessageStop();
+
+    const decision = await promise;
+
+    expect(decision).toMatchObject({ kind: "error", code: "upstream_stream_interrupted" });
+    if (decision.kind === "error") {
+      expect(decoder.decode(decision.bytes)).not.toContain("secret transport detail");
+    }
+    expect(reenter).not.toHaveBeenCalled();
+    expect((await storage.findActiveBySession(scope()))[0].responseStreamStatus).toBe("aborted");
+  });
+});
