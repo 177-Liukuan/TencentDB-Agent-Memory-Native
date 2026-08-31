@@ -1,5 +1,7 @@
 /** Shared type definitions for context-proxy. */
 
+import type { NativeProxyToolsConfig } from "./native-proxy-tools/types.js";
+
 /**
  * Optional private forwarding extension config.
  *
@@ -439,6 +441,7 @@ export interface ProxyConfig {
     /** Data retention TTL in days. 0 = no TTL. Default: 0. */
     ttlDays: number;
   };
+  nativeProxyTools: NativeProxyToolsConfig;
   redis: RedisConfig;
   rateLimit: RateLimitConfig;
   storage: StorageConfig;
@@ -761,6 +764,19 @@ export interface RawYamlConfig {
     flushIntervalMs?: number;
     flushThreshold?: number;
     ttlDays?: number;
+  };
+  nativeProxyTools?: {
+    enabled?: boolean;
+    maxRounds?: number;
+    maxCallsPerRound?: number;
+    maxTotalCalls?: number;
+    toolTimeoutMs?: number;
+    maxResultBytes?: number;
+    stateTtlSeconds?: number;
+    stateStorage?: {
+      backend?: "clickhouse";
+      table?: string;
+    };
   };
   langfuse?: {
     enabled?: boolean;

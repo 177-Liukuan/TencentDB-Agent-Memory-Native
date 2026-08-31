@@ -30,6 +30,19 @@ export const DEFAULT_CONFIG: ProxyConfig = {
     flushThreshold: 50,
     ttlDays: 0,
   },
+  nativeProxyTools: {
+    enabled: false,
+    maxRounds: 5,
+    maxCallsPerRound: 8,
+    maxTotalCalls: 20,
+    toolTimeoutMs: 5_000,
+    maxResultBytes: 65_536,
+    stateTtlSeconds: 1_800,
+    stateStorage: {
+      backend: "clickhouse",
+      table: "native_proxy_tool_execution_state",
+    },
+  },
   redis: {
     enabled: false,
     url: "",
@@ -255,6 +268,87 @@ function parseUpstreamAgents(
   return out;
 }
 
+function boundedInt(
+  path: string,
+  value: unknown,
+  fallback: number,
+  min: number,
+  max: number,
+): number {
+  const resolved = value ?? fallback;
+  if (!Number.isInteger(resolved) || (resolved as number) < min || (resolved as number) > max) {
+    throw new Error(`${path} must be an integer between ${min} and ${max}`);
+  }
+  return resolved as number;
+}
+
+function parseNativeProxyTools(yaml: RawYamlConfig): ProxyConfig["nativeProxyTools"] {
+  const raw = yaml.nativeProxyTools;
+  const defaults = DEFAULT_CONFIG.nativeProxyTools;
+  const maxCallsPerRound = boundedInt(
+    "nativeProxyTools.maxCallsPerRound",
+    raw?.maxCallsPerRound,
+    defaults.maxCallsPerRound,
+    1,
+    64,
+  );
+  const maxTotalCalls = boundedInt(
+    "nativeProxyTools.maxTotalCalls",
+    raw?.maxTotalCalls,
+    defaults.maxTotalCalls,
+    1,
+    256,
+  );
+  if (maxTotalCalls < maxCallsPerRound) {
+    throw new Error("nativeProxyTools.maxTotalCalls must be greater than or equal to maxCallsPerRound");
+  }
+
+  const backend = raw?.stateStorage?.backend ?? defaults.stateStorage.backend;
+  if (backend !== "clickhouse") {
+    throw new Error("nativeProxyTools.stateStorage.backend must be clickhouse");
+  }
+
+  const table = raw?.stateStorage?.table ?? defaults.stateStorage.table;
+  if (typeof table !== "string" || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(table)) {
+    throw new Error("nativeProxyTools.stateStorage.table must be a safe ClickHouse identifier");
+  }
+
+  return {
+    enabled: typeof raw?.enabled === "boolean" ? raw.enabled : defaults.enabled,
+    maxRounds: boundedInt(
+      "nativeProxyTools.maxRounds",
+      raw?.maxRounds,
+      defaults.maxRounds,
+      1,
+      20,
+    ),
+    maxCallsPerRound,
+    maxTotalCalls,
+    toolTimeoutMs: boundedInt(
+      "nativeProxyTools.toolTimeoutMs",
+      raw?.toolTimeoutMs,
+      defaults.toolTimeoutMs,
+      100,
+      600_000,
+    ),
+    maxResultBytes: boundedInt(
+      "nativeProxyTools.maxResultBytes",
+      raw?.maxResultBytes,
+      defaults.maxResultBytes,
+      1_024,
+      1_048_576,
+    ),
+    stateTtlSeconds: boundedInt(
+      "nativeProxyTools.stateTtlSeconds",
+      raw?.stateTtlSeconds,
+      defaults.stateTtlSeconds,
+      60,
+      86_400,
+    ),
+    stateStorage: { backend, table },
+  };
+}
+
 /**
  * Build the final ProxyConfig.
  * Priority (high → low): CLI overrides > YAML config file > defaults.
@@ -322,6 +416,7 @@ export function buildConfig(overrides: CliOverrides = {}): ProxyConfig {
       flushThreshold: yaml.clickhouse?.flushThreshold ?? DEFAULT_CONFIG.clickhouse.flushThreshold,
       ttlDays: yaml.clickhouse?.ttlDays ?? DEFAULT_CONFIG.clickhouse.ttlDays,
     },
+    nativeProxyTools: parseNativeProxyTools(yaml),
     redis: {
       enabled: yaml.redis?.enabled ?? DEFAULT_CONFIG.redis.enabled,
       url: yaml.redis?.url ?? DEFAULT_CONFIG.redis.url,
