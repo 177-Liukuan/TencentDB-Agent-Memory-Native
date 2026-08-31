@@ -343,6 +343,15 @@ export class AnthropicToolLoopCoordinator {
       return this.errorDecision(failure, input, parser.snapshot());
     };
 
+    const scheduleExecution = (call: UnifiedToolCall): void => {
+      if (executionTasks.has(call.callId)) return;
+      const persistOperation = () => this.executeAndPersist(call, input.scope, stateKey!);
+      const task = (this.options.trackBackgroundOperation
+        ? this.options.trackBackgroundOperation(persistOperation)
+        : persistOperation()).catch(() => {});
+      executionTasks.set(call.callId, task);
+    };
+
     try {
       reader = input.stream.getReader();
       while (!messageCompleted) {
@@ -400,11 +409,9 @@ export class AnthropicToolLoopCoordinator {
                   input.totalCalls + nativeCalls.length,
                 );
               }
-              const persistOperation = () => this.executeAndPersist(event.call, input.scope, stateKey!);
-              const task = (this.options.trackBackgroundOperation
-                ? this.options.trackBackgroundOperation(persistOperation)
-                : persistOperation()).catch(() => {});
-              executionTasks.set(event.call.callId, task);
+              if (this.options.registry.require(event.call.toolName).effect === "read") {
+                scheduleExecution(event.call);
+              }
             }
             if (event.type === "tool_call_completed" && event.call.owner === "client" && stateKey) {
               const currentSnapshot = parser.snapshot();
@@ -509,6 +516,7 @@ export class AnthropicToolLoopCoordinator {
       const totalCalls = input.totalCalls + nativeCalls.length;
       if (clientCalls.length > 0) await this.options.beforeClientDispatch?.();
       await this.persistSnapshot(stateKey, snapshot, "completed", totalCalls);
+      for (const call of nativeCalls) scheduleExecution(call);
 
       if (clientCalls.length > 0) {
         const bytes = buildClientVisibleAnthropicSse(

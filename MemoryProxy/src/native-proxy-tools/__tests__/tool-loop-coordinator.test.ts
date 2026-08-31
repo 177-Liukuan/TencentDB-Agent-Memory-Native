@@ -152,7 +152,10 @@ function byteStream(bytes: Uint8Array) {
   return { stream, readerCount: () => readerCount };
 }
 
-function controlledNativeStream() {
+function controlledNativeStream(
+  toolName = "tdai_memory_search",
+  input: Record<string, unknown> = { query: "rules" },
+) {
   let controller!: ReadableStreamDefaultController<Uint8Array>;
   let stopReleased = false;
   const stream = new ReadableStream<Uint8Array>({
@@ -165,7 +168,7 @@ function controlledNativeStream() {
     releaseThroughBlockStop() {
       controller.enqueue(concat(
         messageStart(),
-        toolFrames(0, "proxy-1", "tdai_memory_search", { query: "rules" }),
+        toolFrames(0, "proxy-1", toolName, input),
       ));
     },
     releaseMessageStop() {
@@ -324,6 +327,40 @@ describe("AnthropicToolLoopCoordinator", () => {
     gates.releaseMessageStop();
 
     await expect(promise).resolves.toMatchObject({ kind: "final" });
+  });
+
+  it("defers a mutating Skill tool until message_stop", async () => {
+    const gates = controlledNativeStream("skill_delete", { skill_id: "skill-1" });
+    const { coordinator, execute } = coordinatorHarness();
+    const promise = coordinator.handleRound(roundInput(gates.stream));
+
+    gates.releaseThroughBlockStop();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(execute).not.toHaveBeenCalled();
+    gates.releaseMessageStop();
+
+    await expect(promise).resolves.toMatchObject({ kind: "final" });
+    expect(execute).toHaveBeenCalledTimes(1);
+  });
+
+  it("never executes a deferred Skill mutation when SSE ends before message_stop", async () => {
+    const gates = controlledNativeStream("skill_files_write", {
+      skill_id: "skill-1",
+      path: "SKILL.md",
+      content: "changed",
+    });
+    const { coordinator, execute } = coordinatorHarness();
+    const promise = coordinator.handleRound(roundInput(gates.stream));
+
+    gates.releaseThroughBlockStop();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    gates.closeBeforeMessageStop();
+
+    await expect(promise).resolves.toMatchObject({
+      kind: "error",
+      code: "upstream_stream_incomplete",
+    });
+    expect(execute).not.toHaveBeenCalled();
   });
 
   it("coordinates a CR-only Anthropic event stream without losing the final frame", async () => {
