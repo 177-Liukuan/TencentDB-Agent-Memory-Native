@@ -5,6 +5,10 @@ export type JsonValue =
   | JsonValue[]
   | { [key: string]: JsonValue };
 
+export type NativeToolBackend = "memory" | "skill";
+
+export type NativeToolEffect = "read" | "write" | "archive";
+
 export interface NativeProxyToolsConfig {
   enabled: boolean;
   maxRounds: number;

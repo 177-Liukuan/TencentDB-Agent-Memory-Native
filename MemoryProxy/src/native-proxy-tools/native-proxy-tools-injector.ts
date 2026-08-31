@@ -51,6 +51,9 @@ export function describeNativeProxyToolInjectionFailure(
 export interface NativeProxyToolsInjectorOptions {
   enabled: boolean;
   registry: NativeProxyToolRegistry;
+  memoryEnabled?: boolean;
+  skillEnabled?: boolean;
+  allowSkillWrite?: boolean;
 }
 
 export class NativeProxyToolsInjector implements InjectionHook {
@@ -72,15 +75,26 @@ export class NativeProxyToolsInjector implements InjectionHook {
       }
     }
 
-    if (!this.hasTrustedVisibility(ctx)) return [];
+    if (!this.hasTrustedSession(ctx)) return [];
 
-    return this.options.registry.list().map((tool) => ({
+    const custom = ctx.metadata.custom as Record<string, unknown> | undefined;
+    const capabilities = custom?.assetCapabilities as Record<string, unknown> | undefined;
+    const visible = this.options.registry.visibleFor({
+      memoryEnabled: this.options.memoryEnabled ?? true,
+      chatMemory: capabilities?.chat_memory !== false,
+      skillEnabled: this.options.skillEnabled ?? false,
+      skillCapability: capabilities?.skill !== false,
+      allowSkillWrite: this.options.allowSkillWrite ?? false,
+    });
+
+    return visible.map((tool) => ({
       type: "custom" as const,
       content: tool.description,
       metadata: {
         tool_name: tool.name,
         parameters: tool.inputSchema,
         native_proxy_owner: tool.owner,
+        native_proxy_backend: tool.backend,
         native_proxy_effect: tool.effect,
         native_proxy_route: tool.route,
       },
@@ -96,11 +110,8 @@ export class NativeProxyToolsInjector implements InjectionHook {
     return true;
   }
 
-  private hasTrustedVisibility(ctx: AgentContext): boolean {
+  private hasTrustedSession(ctx: AgentContext): boolean {
     const custom = ctx.metadata.custom as Record<string, unknown> | undefined;
-    const capabilities = custom?.assetCapabilities as Record<string, unknown> | undefined;
-    if (capabilities?.chat_memory === false) return false;
-
     const session = custom?.session as Record<string, unknown> | undefined;
     if (!session) return false;
     const required = ["session_id", "team_id", "agent_id", "user_id"] as const;

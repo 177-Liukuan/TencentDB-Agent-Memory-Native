@@ -213,14 +213,13 @@ function buildPipelineBundle(config: ProxyConfig): PipelineBundle {
   // (`coreSkill`, `tdai`, ...); there is no shared external endpoint anymore.
   const injectors = config.injection?.injectors ?? [];
 
-  if (
-    config.nativeProxyTools.enabled
-    && config.tdai.enabled
-    && config.tdai.memory.enabled
-  ) {
+  if (config.nativeProxyTools.enabled) {
     registry.register(new NativeProxyToolsInjector({
       enabled: true,
       registry: getNativeProxyToolRuntime(config).registry,
+      memoryEnabled: config.tdai.enabled && config.tdai.memory.enabled,
+      skillEnabled: injectors.includes("skill"),
+      allowSkillWrite: config.skillRuntime?.allowLlmWrite ?? false,
     }));
   }
 

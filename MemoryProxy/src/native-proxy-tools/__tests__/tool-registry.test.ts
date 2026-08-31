@@ -70,16 +70,131 @@ function initializedAnthropicContext(
 }
 
 describe("Native Proxy Tool Registry", () => {
-  it("registers exactly one read-only Memory search tool", () => {
+  it("registers all six Memory and ten Skill tools in stable order", () => {
     const registry = createDefaultNativeProxyToolRegistry();
 
-    expect(registry.list().map((tool) => tool.name)).toEqual(["tdai_memory_search"]);
+    expect(registry.list().map((tool) => tool.name)).toEqual([
+      "tdai_memory_search",
+      "tdai_atomic_query",
+      "tdai_conversation_search",
+      "tdai_conversation_query",
+      "tdai_scenario_ls",
+      "tdai_read_scene",
+      "skill_search",
+      "skill_view",
+      "skill_files_read",
+      "skill_extract",
+      "skill_create",
+      "skill_update",
+      "skill_patch",
+      "skill_delete",
+      "skill_files_write",
+      "skill_files_remove",
+    ]);
     expect(registry.require("tdai_memory_search")).toMatchObject({
       owner: "proxy",
+      backend: "memory",
       effect: "read",
       route: "atomic/search",
     });
+    expect(registry.require("skill_extract")).toMatchObject({
+      backend: "skill",
+      effect: "archive",
+      route: "extract",
+    });
+    expect(registry.require("skill_delete")).toMatchObject({
+      backend: "skill",
+      effect: "write",
+      route: "delete",
+    });
     expect(registry.owns("client_tool")).toBe(false);
+  });
+
+  it("resolves Memory and Skill exposure independently", () => {
+    const registry = createDefaultNativeProxyToolRegistry();
+    const names = (value: Parameters<typeof registry.visibleFor>[0]) =>
+      registry.visibleFor(value).map((tool) => tool.name);
+
+    expect(names({
+      memoryEnabled: false,
+      chatMemory: false,
+      skillEnabled: false,
+      skillCapability: false,
+      allowSkillWrite: false,
+    })).toEqual([]);
+    expect(names({
+      memoryEnabled: true,
+      chatMemory: true,
+      skillEnabled: false,
+      skillCapability: false,
+      allowSkillWrite: false,
+    })).toEqual(registry.list().slice(0, 6).map((tool) => tool.name));
+    expect(names({
+      memoryEnabled: false,
+      chatMemory: false,
+      skillEnabled: true,
+      skillCapability: true,
+      allowSkillWrite: false,
+    })).toEqual(["skill_search", "skill_view", "skill_files_read", "skill_extract"]);
+    expect(names({
+      memoryEnabled: false,
+      chatMemory: false,
+      skillEnabled: true,
+      skillCapability: true,
+      allowSkillWrite: true,
+    })).toEqual(registry.list().slice(6).map((tool) => tool.name));
+  });
+
+  it("publishes strict object schemas for every registered tool", () => {
+    for (const tool of createDefaultNativeProxyToolRegistry().list()) {
+      expect(tool.inputSchema).toMatchObject({
+        type: "object",
+        additionalProperties: false,
+        properties: expect.any(Object),
+      });
+    }
+  });
+
+  it.each([
+    ["tdai_atomic_query", { type: "episodic", limit: 20, offset: 0 }],
+    ["tdai_conversation_search", { query: "exact quote", limit: 5 }],
+    ["tdai_conversation_query", { session_id: "session-old", limit: 50, offset: 0 }],
+    ["tdai_scenario_ls", { path_prefix: "project/" }],
+    ["tdai_read_scene", { path: "project/rules" }],
+    ["skill_search", { query: "deployment" }],
+    ["skill_view", { skill_id: "skl-1" }],
+    ["skill_files_read", { skill_id: "skl-1", path: "SKILL.md", encoding: "utf-8" }],
+    ["skill_extract", { reason: "reusable workflow" }],
+    ["skill_create", { name: "deploy", content: "---\nname: deploy\n---" }],
+    ["skill_update", { skill_id: "skl-1", content: "updated" }],
+    ["skill_patch", { skill_id: "skl-1", old_string: "a", new_string: "b", replace_all: false }],
+    ["skill_delete", { skill_id: "skl-1" }],
+    ["skill_files_write", { skill_id: "skl-1", files: [{ path: "a.txt", content: "a", encoding: "utf-8" }] }],
+    ["skill_files_remove", { skill_id: "skl-1", paths: ["a.txt"] }],
+  ])("validates and normalizes %s arguments", (name, input) => {
+    expect(createDefaultNativeProxyToolRegistry().require(name).validate(input))
+      .toMatchObject({ ok: true });
+  });
+
+  it.each([
+    ["tdai_atomic_query", { type: "unknown" }],
+    ["tdai_conversation_search", { query: "" }],
+    ["tdai_conversation_query", { session_id: "s", limit: 0 }],
+    ["tdai_scenario_ls", { path_prefix: 1 }],
+    ["tdai_read_scene", { path: "" }],
+    ["skill_search", { query: "x", user_id: "attacker" }],
+    ["skill_view", { skill_name: "ambiguous" }],
+    ["skill_files_read", { skill_id: "skl-1", path: "a", encoding: "binary" }],
+    ["skill_extract", { reason: "x".repeat(2_001) }],
+    ["skill_create", { name: "", content: "x" }],
+    ["skill_update", { skill_id: "skl-1", content: "x".repeat(262_145) }],
+    ["skill_patch", { skill_id: "skl-1", old_string: "", new_string: "b" }],
+    ["skill_delete", { skill_id: "" }],
+    ["skill_files_write", { skill_id: "skl-1", files: [] }],
+    ["skill_files_remove", { skill_id: "skl-1", paths: [] }],
+  ])("rejects invalid %s arguments", (name, input) => {
+    expect(createDefaultNativeProxyToolRegistry().require(name).validate(input))
+      .toMatchObject({ ok: false });
   });
 
   it("normalizes valid input and applies the default result limit", () => {
@@ -124,7 +239,7 @@ describe("Native Proxy Tool injection", () => {
   it.each([
     { stream: false, enabled: true, expected: 0 },
     { stream: true, enabled: false, expected: 0 },
-    { stream: true, enabled: true, expected: 1 },
+    { stream: true, enabled: true, expected: 6 },
   ])("applies streaming and feature visibility", async ({ stream, enabled, expected }) => {
     const injector = new NativeProxyToolsInjector({
       enabled,
@@ -155,6 +270,45 @@ describe("Native Proxy Tool injection", () => {
 
     expect(injector.execute(initializedAnthropicContext({ custom })))
       .toEqual([]);
+  });
+
+  it("exposes the four safe Skill tools or all ten when writes are enabled", () => {
+    const readonlyInjector = new NativeProxyToolsInjector({
+      enabled: true,
+      memoryEnabled: false,
+      skillEnabled: true,
+      allowSkillWrite: false,
+      registry: createDefaultNativeProxyToolRegistry(),
+    });
+    const writableInjector = new NativeProxyToolsInjector({
+      enabled: true,
+      memoryEnabled: false,
+      skillEnabled: true,
+      allowSkillWrite: true,
+      registry: createDefaultNativeProxyToolRegistry(),
+    });
+
+    expect(readonlyInjector.execute(initializedAnthropicContext()).map((block) => block.metadata?.tool_name))
+      .toEqual(["skill_search", "skill_view", "skill_files_read", "skill_extract"]);
+    expect(writableInjector.execute(initializedAnthropicContext())).toHaveLength(10);
+  });
+
+  it("reserves a hidden Skill write name when writes are disabled", () => {
+    const injector = new NativeProxyToolsInjector({
+      enabled: true,
+      memoryEnabled: false,
+      skillEnabled: true,
+      allowSkillWrite: false,
+      registry: createDefaultNativeProxyToolRegistry(),
+    });
+    const context = initializedAnthropicContext();
+    context.tools = [{
+      name: "skill_delete",
+      description: "client collision",
+      parameters: { type: "object" },
+    }];
+
+    expect(() => injector.execute(context)).toThrow(NativeProxyToolNameCollisionError);
   });
 
   it("does not expose the tool on a request explicitly marked ineligible", () => {
@@ -247,14 +401,15 @@ describe("Native Proxy Tool injection", () => {
       messages: [{ role: "user", content: "remembered rules?" }],
     }, metadata);
 
-    expect(output.tools).toEqual([expect.objectContaining({
+    expect(output.tools).toHaveLength(6);
+    expect(output.tools).toEqual(expect.arrayContaining([expect.objectContaining({
       name: "tdai_memory_search",
       input_schema: expect.objectContaining({
         type: "object",
         additionalProperties: false,
         required: ["query"],
       }),
-    })]);
+    })]));
   });
 
   it("runs the Native hook when legacy prompt injection is disabled", async () => {
@@ -271,9 +426,10 @@ describe("Native Proxy Tool injection", () => {
       messages: [{ role: "user", content: "remembered rules?" }],
     }, metadata);
 
-    expect(output.tools).toEqual([expect.objectContaining({
+    expect(output.tools).toHaveLength(6);
+    expect(output.tools).toEqual(expect.arrayContaining([expect.objectContaining({
       name: "tdai_memory_search",
-    })]);
+    })]));
   });
 
   it("never emits Fake Tool tags or curl recipes beside the Native tool", async () => {
