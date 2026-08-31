@@ -2,10 +2,8 @@
  * Skill Injector — emits the `<available_skills>` block containing skills
  * owned by the current agent (team_id + agent_id filtered via /v3/skill/listing).
  *
- * The sister hook `skill-tools-injector.ts` emits the static `<skill_tools>`
- * block describing the curl recipes. Together:
- *   <skill_tools>        = how to use skills (via /skill-bridge curl)
- *   <available_skills>   = which skills belong to this agent (owner-filtered)
+ * This phase exposes the listing only as neutral asset metadata. It does not
+ * advertise a model-facing Skill tool family or a shell/curl fallback.
  *
  * The listing endpoint uses routing internally:
  *   - No query → list head (full listing when ≤ searchTopK, search when >)
@@ -17,7 +15,7 @@
  *   - Calls core directly via `CoreSkillClient.listListing`.
  *   - Failure / empty listing → 0 blocks (graceful degradation).
  *
- * The LLM can discover team-wide skills via the skill_search tool (separate).
+ * The listing must not imply that the model can load or mutate a skill.
  */
 
 import type {
@@ -47,57 +45,34 @@ export interface SkillInjectorConfig {
 /**
  * Prompt boilerplate wrapping the `<available_skills>` listing.
  *
- * Mirrored from `MemoryCore/src/core/skill/prompts/skill-listing-prompt.ts`
- * (SKILL_ENGINEERING_DESIGN appendix C.1). Kept as a physical copy — the
- * plugin boundary rules forbid cross-plugin deep imports. Wording is adapted
- * to reference the proxy's skill-bridge tool names (`skill_view`,
- * `skill_patch`) instead of the design-doc's hypothetical `skill_view(name)` /
- * `skill_manage(action='patch')` function calls. Read the `<skill_tools>`
- * block above `<available_skills>` for the exact curl recipes.
- *
- * When updating either copy, update the other so the LLM sees consistent
- * guidance regardless of which host renders the block.
+ * Unlike the full Skill runtime prompt, this wording is deliberately
+ * reference-only because no structured Skill Native Tool exists in this
+ * project phase.
  */
 const SKILL_LISTING_HEADER =
-  "## Skills (mandatory)\n"
-  + "Before replying, scan the skills below. If a skill matches or is even partially relevant "
-  + "to your task, you MUST load it by calling the `skill_view` skill-bridge tool "
-  + "(see the `<skill_tools>` block above for the exact curl recipe) and follow its instructions. "
-  + "Err on the side of loading — it is always better to have context you don't need "
-  + "than to miss critical steps, pitfalls, or established workflows. "
-  + "Skills contain specialized knowledge — API endpoints, tool-specific commands, "
-  + "and proven workflows that outperform general-purpose approaches. Load the skill "
-  + "even if you think you could handle the task with basic tools like web_search or terminal. "
-  + "Skills also encode the user's preferred approach, conventions, and quality standards "
-  + "for tasks like code review, planning, and testing — load them even for tasks you "
-  + "already know how to do, because the skill defines how it should be done here.\n"
-  + "If a skill has issues, fix it with the `skill_patch` skill-bridge tool.\n"
-  + "After difficult/iterative tasks, offer to save the approach as a new skill "
-  + "(`skill_create`). If a skill you loaded was missing steps, had wrong commands, "
-  + "or needed pitfalls you discovered, update it before finishing.\n";
+  "## Available Skill Assets (reference only)\n"
+  + "The entries below are metadata for assets associated with the current agent. "
+  + "This deployment does not expose a model-facing Skill execution, loading, or editing tool. "
+  + "Use names and descriptions only as background context, and do not claim that you loaded, "
+  + "executed, created, or modified any listed asset.\n";
 
 const SKILL_LISTING_FOOTER =
-  "\nOnly proceed without loading a skill if genuinely none are relevant to the task.";
+  "\nTreat this catalog as reference metadata only.";
 
 /**
  * Wrap the pre-rendered `<available_skills>` listing from plugin into a
- * context block, with additional instructions about skill-bridge access.
+ * context block with explicit reference-only semantics.
  *
  * Layout (top → bottom, single joined string):
- *   1. SKILL_LISTING_HEADER — English mandatory-load directive (mirrored
- *      from MemoryCore).
- *   2. Chinese fallback + skill-bridge/curl usage reminder.
- *   3. `<available_skills>` listing (verbatim from core).
- *   4. SKILL_LISTING_FOOTER — "only skip if genuinely nothing matches".
+ *   1. SKILL_LISTING_HEADER — neutral capability boundary.
+ *   2. `<available_skills>` listing (verbatim from core).
+ *   3. SKILL_LISTING_FOOTER — reinforces reference-only use.
  */
 export function wrapAvailableSkillsBlock(listing: string): string {
   return [
     SKILL_LISTING_HEADER,
-    "以下是你（当前 agent）自带的云端 skill 列表。这些 skill 存储在你的 agent 名下，",
-    "优先使用它们完成任务。如果你觉得自带的 skill 不够，可以用 skill_search 工具",
-    "在团队的 skill 库中检索更多（跨 agent 共享）。",
-    "",
-    "**重要：这些 skill 存储在云端，不能使用 read_file / tool_use 直接访问，\n必须用 Bash 执行 curl 调用上方 <skill_tools> 块中的 skill-bridge 工具。**",
+    "以下仅是当前 agent 关联的云端 skill 元数据。本阶段没有提供给模型的 Skill 调用、读取或修改工具；",
+    "只能把名称和描述作为背景信息，不能声称已经加载或执行其内容。",
     "",
     listing,
     SKILL_LISTING_FOOTER,

@@ -10,6 +10,7 @@ import {
   resumeClientToolResults,
   type ClientToolResumeInput,
 } from "../client-tool-resume.js";
+import { NativeToolTargetUnavailableError } from "../exact-target-transport.js";
 import type {
   JsonValue,
   NativeToolResult,
@@ -329,6 +330,26 @@ describe("resumeClientToolResults", () => {
         },
       ]),
     }));
+  });
+
+  it("reports an unavailable persisted target without selecting a substitute", async () => {
+    const harness = resumeHarness({
+      reenter: async () => {
+        throw new NativeToolTargetUnavailableError();
+      },
+    });
+    await harness.storage.create(mixedState({
+      p1: { status: "succeeded", result: "p1", isError: false },
+    }));
+
+    const decision = await resumeClientToolResults(harness.input());
+
+    expect(decision).toMatchObject({
+      kind: "error",
+      code: "native_tool_target_unavailable",
+      status: 503,
+    });
+    expect(harness.reenter).toHaveBeenCalledTimes(1);
   });
 
   it.each([

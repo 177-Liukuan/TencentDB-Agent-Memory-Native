@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { DEFAULT_CONFIG } from "../../config.js";
 import { AnthropicAdapter } from "../../injection/adapters/anthropic.js";
@@ -47,6 +47,7 @@ const metadata: AgentContextMetadata = {
 };
 
 afterEach(() => {
+  vi.unstubAllGlobals();
   __resetInjectionPipelineForTests();
 });
 
@@ -172,6 +173,22 @@ describe("Native Proxy Tool injection", () => {
       .toThrow(NativeProxyToolNameCollisionError);
   });
 
+  it("reserves the proxy-owned name even when the trusted Session is unavailable", () => {
+    const injector = new NativeProxyToolsInjector({
+      enabled: true,
+      registry: createDefaultNativeProxyToolRegistry(),
+    });
+    const context = initializedAnthropicContext({ custom: {} });
+    context.tools = [{
+      name: "tdai_memory_search",
+      description: "untrusted client collision",
+      parameters: { type: "object" },
+    }];
+
+    expect(() => injector.execute(context))
+      .toThrow(NativeProxyToolNameCollisionError);
+  });
+
   it("maps only Native critical failures to sanitized Anthropic errors", () => {
     const collision = new NativeProxyToolNameCollisionError("tdai_memory_search");
     expect(describeNativeProxyToolInjectionFailure(collision)).toEqual({
@@ -244,6 +261,76 @@ describe("Native Proxy Tool injection", () => {
     expect(output.tools).toEqual([expect.objectContaining({
       name: "tdai_memory_search",
     })]);
+  });
+
+  it("never emits Fake Tool tags or curl recipes beside the Native tool", async () => {
+    const config = structuredClone(DEFAULT_CONFIG);
+    config.injection.enabled = true;
+    config.injection.injectors = ["skill", "knowledge", "tdai-memory"];
+    config.nativeProxyTools.enabled = true;
+    config.tdai.enabled = true;
+    config.tdai.endpoint = "https://memory.example";
+    config.tdai.memory.enabled = true;
+    config.tdai.memory.inject = true;
+    config.tdai.memory.injectL2L3 = true;
+    config.knowledge.enabled = true;
+    config.coreSkill.serviceToken = "service-token";
+    config.knowledge.serviceToken = "knowledge-token";
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({
+      code: 0,
+      data: { items: [], skills: [] },
+    }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    })));
+
+    const output = await getInjectionPipeline(config).process({
+      model: "claude-test",
+      stream: true,
+      system: "system",
+      messages: [{ role: "user", content: "remembered rules?" }],
+    }, metadata);
+    const serializedSystem = JSON.stringify(output.system ?? "");
+
+    expect(output.tools).toEqual(expect.arrayContaining([
+      expect.objectContaining({ name: "tdai_memory_search" }),
+    ]));
+    const forbiddenTags = new RegExp([
+      "<tdai_" + "memory_tools>",
+      "<memory-" + "tools-guide>",
+      "<skill_" + "tools>",
+      "<knowledge_" + "tools>",
+    ].join("|"));
+    expect(serializedSystem).not.toMatch(forbiddenTags);
+    expect(serializedSystem).not.toMatch(
+      /Bash\s*\+\s*curl|skill-bridge.*curl|memory-bridge.*curl/i,
+    );
+  });
+
+  it("provides no Native or Fake Tool fallback when Native Proxy Tools are disabled", async () => {
+    const config = structuredClone(DEFAULT_CONFIG);
+    config.injection.enabled = false;
+    config.injection.injectors = [];
+    config.nativeProxyTools.enabled = false;
+
+    const output = await getInjectionPipeline(config).process({
+      model: "claude-test",
+      stream: true,
+      system: "system",
+      messages: [{ role: "user", content: "remembered rules?" }],
+    }, metadata);
+    const serialized = JSON.stringify(output);
+
+    expect(output).not.toHaveProperty("tools");
+    const forbiddenFallbacks = new RegExp([
+      "tdai_memory_search",
+      "<tdai_" + "memory_tools>",
+      "<memory-" + "tools-guide>",
+      "<skill_" + "tools>",
+      "<knowledge_" + "tools>",
+    ].join("|"));
+    expect(serialized).not.toMatch(forbiddenFallbacks);
+    expect(serialized).not.toMatch(/Bash\s*\+\s*curl|skill-bridge.*curl|memory-bridge.*curl/i);
   });
 
   it("propagates critical hook failures while retaining non-critical degradation", async () => {

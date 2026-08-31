@@ -58,6 +58,18 @@ import {
   recordInputTokenUsage,
 } from "./rate-limit/guard.js";
 import { describeNativeProxyToolInjectionFailure } from "./native-proxy-tools/native-proxy-tools-injector.js";
+import { getNativeProxyToolRuntime } from "./native-proxy-tools/runtime.js";
+import { AnthropicToolLoopCoordinator, type ToolLoopDecision } from "./native-proxy-tools/tool-loop-coordinator.js";
+import { resumeClientToolResults } from "./native-proxy-tools/client-tool-resume.js";
+import {
+  buildUpstreamRequestSnapshot,
+  createRestartExactTargetTransport,
+  createRetainedExactTargetTransport,
+} from "./native-proxy-tools/exact-target-transport.js";
+import type {
+  PersistedForwardTarget,
+  ToolExecutionScope,
+} from "./native-proxy-tools/types.js";
 
 const SKIP_REQUEST_HEADERS = new Set([
   "host",
@@ -74,6 +86,67 @@ const SKIP_RESPONSE_HEADERS = new Set([
   "content-length",
   "connection",
 ]);
+
+function streamFromBytes(bytes: Uint8Array): ReadableStream<Uint8Array> {
+  return new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(bytes.slice());
+      controller.close();
+    },
+  });
+}
+
+function nativeToolErrorResponse(
+  status: number,
+  code: string,
+  message: string,
+): Response {
+  return new Response(JSON.stringify({
+    type: "error",
+    error: {
+      type: status >= 500 ? "api_error" : "invalid_request_error",
+      code,
+      message,
+    },
+  }), {
+    status,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+function nativeToolScope(input: {
+  spaceId: string;
+  userId: string;
+  agentSource: string;
+  sessionKey: string;
+  sessionInfo?: Record<string, unknown> | null;
+  config: ProxyConfig;
+}): ToolExecutionScope {
+  const sessionSpaceId = typeof input.sessionInfo?.space_id === "string"
+    ? input.sessionInfo.space_id
+    : "";
+  const sessionUserId = typeof input.sessionInfo?.user_id === "string"
+    ? input.sessionInfo.user_id
+    : "";
+  return {
+    spaceId: sessionSpaceId || input.spaceId || input.config.tdai.serviceId || input.config.coreSkill.serviceId,
+    userId: sessionUserId || input.userId || "anonymous",
+    agentSource: input.agentSource,
+    sessionId: input.sessionKey,
+    contextVersion: "v1",
+  };
+}
+
+function successfulAuthSource(input: {
+  retried: boolean;
+  target: ForwardTarget;
+  effectiveApiKey: string;
+  hasAgentEntry: boolean;
+}): PersistedForwardTarget["authSource"] {
+  if (!input.retried && input.target.authHeaders) return "extension";
+  if (!input.effectiveApiKey) return "client";
+  return input.hasAgentEntry ? "agent" : "global";
+}
 
 /**
  * Build a per-request TdaiClient. `spaceId` (extracted from the request path
@@ -542,7 +615,10 @@ export async function handleAnthropicMessages(
     ? _pathPartsEarly[0] : undefined;
   const agentAdapter = resolveAgentAdapter(_agentFromPathEarly ?? "claude-code");
   const ccRoutingEnabled = config.ccRequestRouting?.enabled === true;
-  const requestKind: CcRequestKind = ccRoutingEnabled ? agentAdapter.classifyRequest(body) : "main";
+  const classifiedRequestKind = ccRoutingEnabled ? agentAdapter.classifyRequest(body) : "main";
+  const requestKind: CcRequestKind = classifiedRequestKind === "auxiliary"
+    ? "sidequery"
+    : classifiedRequestKind;
 
   // ── Model gate: reject requests whose `model` is not a registered display name ──
   // 价目表已配置时，客户端 `model` 必须匹配某条 entry 的 `modelName`（展示名，
@@ -595,6 +671,20 @@ export async function handleAnthropicMessages(
   let messages = Array.isArray(body.messages) ? body.messages : [];
   const isStream = body.stream === true;
   let hasTools = Array.isArray(body.tools) && body.tools.length > 0;
+  const nativeToolRuntime = config.nativeProxyTools.enabled && isStream
+    ? getNativeProxyToolRuntime(config)
+    : null;
+  if (nativeToolRuntime) {
+    try {
+      await nativeToolRuntime.ready();
+    } catch {
+      return nativeToolErrorResponse(
+        503,
+        "native_tool_state_unavailable",
+        "Native Proxy Tool state storage is unavailable",
+      );
+    }
+  }
 
   // ── Resolve agent source from URL path (e.g. /claude-code/v1/messages) ──
   const pathParts = c.req.path.split("/").filter(Boolean);
@@ -841,6 +931,186 @@ export async function handleAnthropicMessages(
       console.error("[session-init] Error in handleSessionInit (anthropic):", err instanceof Error ? err.message : String(err));
       sessionInfo = undefined;
       injectedSkipped = true;
+    }
+  }
+
+  const toolExecutionScope = nativeToolRuntime
+    ? nativeToolScope({
+        spaceId,
+        userId,
+        agentSource,
+        sessionKey,
+        sessionInfo,
+        config,
+      })
+    : null;
+
+  // Client Tool Results for a persisted mixed batch resume before mem-command,
+  // injection, request preparation, or routing. A known batch must re-enter
+  // only its persisted successful target; an unrelated Client Tool loop falls
+  // through to the ordinary request path.
+  if (
+    nativeToolRuntime?.storage
+    && nativeToolRuntime.dispatcher
+    && toolExecutionScope
+  ) {
+    const restartReentry = createRestartExactTargetTransport({
+      config,
+      agentSource,
+      requestPath: "/messages",
+      sessionId: sessionKey,
+      currentRequestHeaders: reqHeaders,
+      timeoutMs: config.server.forwardTimeoutMs ?? 600_000,
+      beforeFetch: async (reentryModel) => {
+        await enforceRateLimit({
+          config,
+          instanceId: spaceId || undefined,
+          modelId: reentryModel,
+          protocol: "anthropic",
+        });
+      },
+    });
+    const resume = await resumeClientToolResults({
+      body,
+      scope: toolExecutionScope,
+      storage: nativeToolRuntime.storage,
+      dispatcher: nativeToolRuntime.dispatcher,
+      limits: config.nativeProxyTools,
+      reenter: restartReentry,
+    });
+    if (resume.kind === "error") {
+      return nativeToolErrorResponse(resume.status, resume.code, resume.message);
+    }
+    if (resume.kind === "reentered") {
+      const resumePipe = createPipeline(config, traceId, resume.upstreamSnapshot.target.model);
+      resumePipe.requestReceived(resume.messages.length, true);
+      resumePipe.forwardStart();
+      resumePipe.forwardDone(resume.upstreamRound.status);
+      const coordinator = new AnthropicToolLoopCoordinator({
+        registry: nativeToolRuntime.registry,
+        storage: nativeToolRuntime.storage,
+        dispatcher: nativeToolRuntime.dispatcher,
+        limits: config.nativeProxyTools,
+        reenter: restartReentry,
+      });
+      const decision = await coordinator.handleRound({
+        ...resume.upstreamRound,
+        scope: toolExecutionScope,
+        turnSeq: resume.turnSeq,
+        upstreamSnapshot: resume.upstreamSnapshot,
+        round: resume.round,
+        totalCalls: resume.totalCalls,
+      });
+
+      const resumeTags = [
+        `agent_source:${agentSource}`,
+        "protocol:anthropic",
+        "stream",
+        `session:${sessionKey}`,
+        "native-tool-resume",
+      ];
+      const resumeLf: LangfuseTurnContext = {
+        traceId: langfuseTurnTraceId(sessionKey, resume.turnSeq),
+        turnSeq: resume.turnSeq,
+        traceName: `${resume.upstreamSnapshot.target.model} / ${keyId}`,
+        userId: keyId,
+        sessionId: sessionKey,
+        tags: resumeTags,
+        routeTags: [],
+        userQuery: resolveLatestUserQuery(
+          config,
+          lcHeaders,
+          c.req.path,
+          {
+            ...resume.upstreamSnapshot.requestParameters,
+            messages: resume.upstreamSnapshot.baseMessages,
+            ...(resume.upstreamSnapshot.system !== undefined
+              ? { system: resume.upstreamSnapshot.system }
+              : {}),
+          },
+          resume.upstreamSnapshot.baseMessages,
+        ),
+      };
+      const resumeForkTraceId = opikCreateTrace(config, {
+        traceId,
+        projectName: keyId,
+        name: resumeLf.traceName,
+        startTime,
+        input: {
+          messages: flattenAnthropicMessagesForOpik(
+            resume.upstreamSnapshot.baseMessages,
+            resume.upstreamSnapshot.system,
+          ),
+        },
+        tags: resumeTags,
+        forkProjectName: "request_log",
+        forkMetadata: {
+          keyId,
+          modelId: resume.upstreamSnapshot.target.model,
+          stream: true,
+          upstreamUrl: resume.upstreamSnapshot.target.url,
+          nativeToolResume: true,
+        },
+      });
+      const resumeTdaiClient = assetCapabilities?.chat_memory === false
+        ? null
+        : createTdaiClient(config, spaceId);
+      const resumeTdaiIdentity = deriveTdaiIdentity({
+        sessionInfo,
+        userId: userId || null,
+        sessionKey,
+        userKey: callerUserKey,
+      });
+      const resumeInputMessages = resume.upstreamSnapshot.baseMessages;
+      const resumeDebug = config.langfuse.debug === true;
+      const resumeDebugMetadata = buildRequestDebugMetadata({
+        debug: resumeDebug,
+        body,
+        headers: reqHeaders,
+        agentSource,
+        requestKind,
+        spaceId,
+        turnSeq: resume.turnSeq,
+        requestPath: c.req.path,
+        protocol: "anthropic",
+      });
+      observeNativeToolDecision(decision, {
+        config,
+        modelId: resume.upstreamSnapshot.target.model,
+        keyId,
+        sessionKey,
+        upstreamUrl: resume.upstreamSnapshot.target.url,
+        requestPath: c.req.path,
+        traceId,
+        forkTraceId: resumeForkTraceId,
+        startTime,
+        inputMessages: resumeInputMessages,
+        system: resume.upstreamSnapshot.system,
+        retried: false,
+        logMeta: { nativeToolResume: true },
+        routedFrom: "",
+        pipe: resumePipe,
+        sessionKeyForSkill: sessionKey,
+        agentSource,
+        sessionInfo,
+        tdaiClient: resumeTdaiClient,
+        tdaiIdentity: resumeTdaiIdentity,
+        tdaiUserMessage: extractLatestUserMessage(resumeInputMessages),
+        assetCapabilities,
+        lf: resumeLf,
+        spaceId,
+        upstreamRequestId: decision.headers.get("x-request-id") ?? "",
+        requestKind,
+        langfuseDebug: resumeDebug,
+        debugMetadata: resumeDebugMetadata,
+        preparedStats: null,
+      });
+      const decisionHeaders = new Headers(decision.headers);
+      const isSse = decisionHeaders.get("content-type")?.toLowerCase().includes("text/event-stream");
+      const output = isSse
+        ? streamFromBytes(decision.bytes).pipeThrough(createSseThinkingFixStream(resumePipe))
+        : streamFromBytes(decision.bytes);
+      return new Response(output, { status: decision.status, headers: decisionHeaders });
     }
   }
 
@@ -1278,8 +1548,8 @@ export async function handleAnthropicMessages(
 
     // Log error body for 4xx
     if (!retried && upstreamResp.status >= 400 && upstreamResp.status < 500) {
-      const [errStream, clientStream] = upstreamResp.body.tee();
-      const errText = await new Response(errStream).text();
+      const errBytes = new Uint8Array(await upstreamResp.arrayBuffer());
+      const errText = new TextDecoder().decode(errBytes);
       pipe.error("UPSTREAM_4xx", `status=${upstreamResp.status} body=${errText.slice(0, 1000)}`);
       writeLog(config, {
         timestamp: new Date().toISOString(),
@@ -1306,7 +1576,122 @@ export async function handleAnthropicMessages(
         observationMetadata: { stage: "upstream", stream: true, ...debugMetadata },
       });
       pipe.streamDone(null);
-      return new Response(clientStream, { status: upstreamResp.status, headers: respHeaders });
+      return new Response(errBytes, { status: upstreamResp.status, headers: respHeaders });
+    }
+
+    if (
+      nativeToolRuntime
+      && nativeToolRuntime.storage
+      && nativeToolRuntime.dispatcher
+      && toolExecutionScope
+    ) {
+      const successfulBody = retried ? retryBody : upstreamBody;
+      const successfulUrl = retried && target.retryTarget
+        ? target.retryTarget.url
+        : target.url;
+      const successfulHeaders = retried
+        ? {
+            ...originalHeaders,
+            "content-type": "application/json",
+            ...(sessionKey ? { "x-vertex-ai-session-id": sessionKey } : {}),
+          }
+        : upstreamHeaders;
+      const successfulModel = typeof successfulBody.model === "string"
+        ? successfulBody.model
+        : effectiveModel;
+      let upstreamSnapshot;
+      try {
+        upstreamSnapshot = buildUpstreamRequestSnapshot({
+          body: successfulBody,
+          url: successfulUrl,
+          model: successfulModel,
+          authSource: successfulAuthSource({
+            retried,
+            target,
+            effectiveApiKey,
+            hasAgentEntry: agentUpstreamEntry !== undefined,
+          }),
+        });
+      } catch {
+        pipe.streamDone(null);
+        return nativeToolErrorResponse(
+          500,
+          "native_tool_snapshot_failed",
+          "Native Proxy Tool request snapshot could not be created",
+        );
+      }
+      const reenter = createRetainedExactTargetTransport({
+        capturedSnapshot: upstreamSnapshot,
+        headers: successfulHeaders,
+        timeoutMs: forwardTimeoutMs,
+        beforeFetch: async (model) => {
+          await enforceRateLimit({
+            config,
+            instanceId: spaceId || undefined,
+            modelId: model,
+            protocol: "anthropic",
+          });
+        },
+      });
+      const coordinator = new AnthropicToolLoopCoordinator({
+        registry: nativeToolRuntime.registry,
+        storage: nativeToolRuntime.storage,
+        dispatcher: nativeToolRuntime.dispatcher,
+        limits: config.nativeProxyTools,
+        reenter,
+      });
+      const decision = await coordinator.handleRound({
+        stream: upstreamResp.body,
+        status: upstreamResp.status,
+        headers: respHeaders,
+        scope: toolExecutionScope,
+        turnSeq,
+        upstreamSnapshot,
+        round: 1,
+        totalCalls: 0,
+      });
+
+      observeNativeToolDecision(decision, {
+        config,
+        modelId: successfulModel,
+        keyId,
+        sessionKey,
+        upstreamUrl: successfulUrl,
+        requestPath: c.req.path,
+        traceId,
+        forkTraceId,
+        startTime,
+        inputMessages: upstreamSnapshot.baseMessages,
+        system: upstreamSnapshot.system,
+        retried,
+        logMeta: retried ? { retrySuccess: true } : {},
+        routedFrom,
+        pipe,
+        sessionKeyForSkill: sessionKey,
+        agentSource,
+        sessionInfo,
+        tdaiClient,
+        tdaiIdentity,
+        tdaiUserMessage,
+        assetCapabilities,
+        lf,
+        spaceId,
+        upstreamRequestId: decision.headers.get("x-request-id") ?? upstreamRequestId,
+        requestKind,
+        langfuseDebug,
+        debugMetadata,
+        preparedStats,
+      });
+
+      const decisionHeaders = new Headers(decision.headers);
+      const isSse = decisionHeaders.get("content-type")?.toLowerCase().includes("text/event-stream");
+      const clientStream = isSse
+        ? streamFromBytes(decision.bytes).pipeThrough(createSseThinkingFixStream(pipe))
+        : streamFromBytes(decision.bytes);
+      return new Response(clientStream, {
+        status: decision.status,
+        headers: decisionHeaders,
+      });
     }
 
     const [rawClientStream, tapStream] = upstreamResp.body.tee();
@@ -1757,6 +2142,43 @@ interface AnthropicTapContext {
   debugMetadata: Record<string, unknown>;
   /** Opaque counters from the request-preparation stage; null when it didn't run. */
   preparedStats: Record<string, unknown> | null;
+}
+
+/** Observe buffered protocol snapshots without acquiring the network stream again. */
+function observeNativeToolDecision(
+  decision: ToolLoopDecision,
+  ctx: AnthropicTapContext,
+): void {
+  if (decision.rounds.length === 0) {
+    ctx.pipe.streamDone(null);
+    return;
+  }
+
+  const lastIndex = decision.rounds.length - 1;
+  decision.rounds.forEach((snapshot, index) => {
+    const roundPipe = index === lastIndex
+      ? ctx.pipe
+      : createPipeline(ctx.config, ctx.traceId, ctx.modelId);
+    if (index !== lastIndex) {
+      roundPipe.requestReceived(ctx.inputMessages.length, true);
+    }
+    roundPipe.streamStart();
+    consumeAnthropicStream(streamFromBytes(snapshot.rawBytes), {
+      ...ctx,
+      pipe: roundPipe,
+      // Hidden Native rounds have accounting/Generation telemetry but never
+      // run per-turn L0 or Skill writeback. Only the final visible response is
+      // treated as the logical main-dialog response.
+      requestKind: index === lastIndex && decision.kind !== "error"
+        ? ctx.requestKind
+        : "fork",
+      logMeta: {
+        ...ctx.logMeta,
+        nativeToolRound: index + 1,
+        nativeToolDecision: decision.kind,
+      },
+    });
+  });
 }
 
 /**

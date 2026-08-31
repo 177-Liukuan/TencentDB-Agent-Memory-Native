@@ -64,13 +64,15 @@ export class NativeProxyToolsInjector implements InjectionHook {
   constructor(private readonly options: NativeProxyToolsInjectorOptions) {}
 
   execute(ctx: AgentContext): ContextBlock[] {
-    if (!this.isVisible(ctx)) return [];
+    if (!this.isEligibleRequest(ctx)) return [];
 
     for (const tool of ctx.tools ?? []) {
       if (this.options.registry.owns(tool.name)) {
         throw new NativeProxyToolNameCollisionError(tool.name);
       }
     }
+
+    if (!this.hasTrustedVisibility(ctx)) return [];
 
     return this.options.registry.list().map((tool) => ({
       type: "custom" as const,
@@ -85,11 +87,14 @@ export class NativeProxyToolsInjector implements InjectionHook {
     }));
   }
 
-  private isVisible(ctx: AgentContext): boolean {
+  private isEligibleRequest(ctx: AgentContext): boolean {
     if (!this.options.enabled || ctx.metadata.protocol !== "anthropic" || !ctx.metadata.stream) {
       return false;
     }
+    return true;
+  }
 
+  private hasTrustedVisibility(ctx: AgentContext): boolean {
     const custom = ctx.metadata.custom as Record<string, unknown> | undefined;
     const capabilities = custom?.assetCapabilities as Record<string, unknown> | undefined;
     if (capabilities?.chat_memory === false) return false;

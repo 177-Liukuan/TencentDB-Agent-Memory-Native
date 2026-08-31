@@ -1,10 +1,9 @@
 /**
  * memory-bridge — reverse proxy for `<proxy>/memory-bridge/v3/*` → tdai gateway.
  *
- * 设计思路与 src/skill/skill-bridge.ts 同形：
- *   - 不在 body.tools 里塞 native tool 定义（agent host 不识别）
- *   - 注入文本 `<tdai_memory_tools>` 引导 LLM 用 Bash curl 这个 bridge
- *   - bridge 强制注入 session IdFields + serviceToken 鉴权后转发到 tdai
+ * 作为独立可信调用边界以及 Native Dispatcher 的协议无关执行边界：
+ * bridge 强制注入 session IdFields + serviceToken 鉴权后转发到 tdai，
+ * 但不通过模型提示暴露 HTTP 调用指南。
  *
  * 行为：
  *   1. 路径必须是 /memory-bridge/v3/{sub} ；sub 在 ALLOWED_SUBPATHS 内
@@ -33,7 +32,7 @@ import { emitBridgeToolCallTelemetry, agentSourceFromSessionKey } from "./bridge
 const TAG = "[memory-bridge]";
 
 /**
- * 允许通过 bridge 转发的 tdai 子路径（**只读**，LLM 通过 Bash 工具按需调用）。
+ * 允许通过 bridge 转发的 tdai 子路径（只读）。
  *
  * 设计取舍：
  *   - L0/L1 不再每轮自动召回，改为静态工具按需检索（cache 友好），因此放行
@@ -77,7 +76,7 @@ export interface MemoryBridgeSessionIdentity {
 type SessionIdFields = MemoryBridgeSessionIdentity;
 
 /**
- * curl 模板固定 2 header:
+ * HTTP bridge caller supplies two routing headers:
  *   - x-conversation-id → sessionId
  *   - x-tdai-service-id → spaceId
  *
@@ -141,7 +140,7 @@ function loadSessionIdsL1(
   sessionId: string,
   store = getSessionStore(),
 ): SessionIdFields | null {
-  // handler 层存的 L1 key 形如 `${agentSource}:${sessionId}`; curl 拿到的
+  // handler 层存的 L1 key 形如 `${agentSource}:${sessionId}`; bridge caller 拿到的
   // 通常是 bare sessionId。按候选前缀顺序探,命中即返回。
   const candidates = sessionId.includes(":")
     ? [sessionId]
@@ -161,7 +160,7 @@ function loadSessionIdsL1(
  * docs/design/2026-08-03-binding-flatten.md。
  *
  * 不再走 verifyUserKey + getOrRecover 4 段路径:
- *   1) bridge curl 模板没塞 bearer,verify 拿不到 userId
+ *   1) bridge request 不依赖 bearer，verify 路径拿不到 userId
  *   2) 拍平后 binding.json 里已经存了 user_id/team_id/agent_id/agent_source/user_key,
  *      单次 GET 直接凑齐 IdFields
  */

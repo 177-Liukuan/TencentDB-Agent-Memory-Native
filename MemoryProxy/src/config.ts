@@ -473,9 +473,6 @@ export function buildConfig(overrides: CliOverrides = {}): ProxyConfig {
     injection: {
       enabled: yaml.injection?.enabled ?? DEFAULT_CONFIG.injection.enabled,
       injectors: yaml.injection?.injectors ?? DEFAULT_CONFIG.injection.injectors,
-      externalGatewayUrl: typeof yaml.injection?.externalGatewayUrl === "string" && yaml.injection.externalGatewayUrl.trim() !== ""
-        ? yaml.injection.externalGatewayUrl.trim().replace(/\/$/, "")
-        : undefined,
       // 只接受 boolean；yaml 缺省或类型错走 default（关）。跟 costGuard.markerOptIn
       // 同姿势，保证线上未配 assetReflection: 段的 yaml 完全无感。
       assetReflection: {

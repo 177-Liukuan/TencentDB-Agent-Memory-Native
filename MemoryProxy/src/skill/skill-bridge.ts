@@ -1,10 +1,9 @@
 /**
  * skill-bridge — reverse proxy for `<proxy>/skill-bridge/v3/skill/*` → core gateway.
  *
- * Why: the LLM uses Bash to curl skill operations (see <skill_tools> block in
- * system prompt). We do NOT want the bearer token to land in the prompt, and we
- * want to stamp `(user_id, team_id, agent_id, task_id?)` from the session into
- * outbound bodies so the LLM cannot fake identity.
+ * This is an independent trusted-caller API. The bearer token stays server-side,
+ * and `(user_id, team_id, agent_id, task_id?)` is stamped from the Session so a
+ * caller cannot forge identity. No model-facing prompt advertises this bridge.
  *
  * Behaviour:
  *   1. Match path `/skill-bridge/v3/skill/<sub>`. Anything else → 404.
@@ -284,7 +283,7 @@ function bindingToIdFields(
 
 /**
  * L1: 先按 bare sessionId 试(handler.ts 存的 keyId 是 `${agentSource}:${sessionId}`,
- * bridge curl 拿不到 agentSource,所以按候选前缀顺序探)。
+ * bridge request 不带 agentSource，所以按候选前缀顺序探)。
  *
  * ⚠️ 候选轮询是过渡期兼容:同 pod 内主对话链路建过 session, L1 Map 里的 key 带
  * agentSource 前缀,bare sessionId 命中不到。方案 B 拍平后 L2b binding 直接命中
@@ -310,7 +309,7 @@ function loadSessionIdsL1(sessionId: string): SessionIdFields | null {
  * docs/design/2026-08-03-binding-flatten.md。
  *
  * 不再走 verifyUserKey + getOrRecover 那条 4 段路径。原因:
- *   1) bridge curl 模板没塞 Authorization: Bearer,verify 拿不到 userId
+ *   1) bridge request 不依赖 Authorization: Bearer，verify 拿不到 userId
  *   2) 拍平后 binding.json 里已经存了 user_id/team_id/agent_id/agent_source/user_key,
  *      一次 GET 就够,不需要再补 kernel getAgent/getTask
  */
@@ -468,7 +467,7 @@ export function createSkillBridgeHandler(
     }
 
     // Session must be initialized — IdFields come from there.
-    // curl 模板只带 (x-conversation-id, x-tdai-service-id) 两个 header;
+    // Bridge caller只带 (x-conversation-id, x-tdai-service-id) 两个 routing header;
     // L1 miss 时用它俩去 nottl/<spaceId>/<sessionId>/binding.json 反查。
     const sessionKey = deriveSessionId(c);
     if (!sessionKey) {
@@ -501,7 +500,7 @@ export function createSkillBridgeHandler(
     // 消融实验：allowLlmWrite=false 时拒绝写操作
     const allowLlmWrite = config.skillRuntime?.allowLlmWrite ?? false;
     if (!allowLlmWrite && WRITE_SUBPATHS.has(sub)) {
-      return envelope(40302, `${TAG} LLM write access to skill is disabled (skillRuntime.allowLlmWrite=false)`, 403);
+      return envelope(40302, `${TAG} skill write access is disabled (skillRuntime.allowLlmWrite=false)`, 403);
     }
 
     // Parse body. Empty body → {}. Malformed → 400.
@@ -521,7 +520,7 @@ export function createSkillBridgeHandler(
     }
 
     // ── files/download: read from core, decode, return raw bytes ──────
-    // LLM uses `curl -o <local_path>` to save directly; no JSON parsing needed.
+    // Download callers receive raw bytes directly; no JSON envelope is needed.
     if (sub === "files/download") {
       const outbound = {
         ...inboundBody,
@@ -756,11 +755,10 @@ export function createSkillBridgeHandler(
         // Stash the whitelist Set + fixed slice size so the response handler
         // can filter/slice without re-consulting meta.
         //
-        // 2026-08-10: Hard-whitelist inbound. LLM only supplies `query` —
+        // 2026-08-10: Hard-whitelist inbound. The caller only supplies `query` —
         // top_k / mode / scope / any other field is dropped. Rationale:
         // less LLM-side decision surface, more consistent behavior across
-        // sessions. If results feel thin, the fix is to refine the query,
-        // not to raise top_k. See skill-tools-injector.ts (body: {"query": ...}).
+        // calls. If results feel thin, refine the query rather than raising top_k.
         searchVisibleIds = new Set(whitelist);
         searchOriginalTopK = DEFAULT_SEARCH_TOPK;
 

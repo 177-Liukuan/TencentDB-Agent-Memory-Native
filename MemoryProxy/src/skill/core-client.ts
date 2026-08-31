@@ -5,12 +5,11 @@
  *   - POST /v3/skill/search              → SkillInjector RAG 检索.
  *   - POST /v3/skill/listing             → SkillInjector owner-agent listing.
  *   - POST /v3/skill/conversation/add    → handler-glue 新链路, 每轮真人对话结束推送.
- *   - POST /v3/skill/extract 等其他方法保留在类里, 供 agent 通过 skill-bridge
- *     反代时透传使用 (agent 通过 curl 直接命中, 不由 proxy 主动触发)。
+ *   - POST /v3/skill/extract 等其他方法保留在类里，供独立的
+ *     skill-bridge 业务 API 透传使用，不由 proxy 主请求链路触发。
  *
- * The other /v3/skill/* endpoints are NOT wrapped here on purpose — the LLM
- * curls them directly via the /skill-bridge reverse proxy, so wrapping them
- * would just be dead code. See `docs/design/2026-06-17-team-skill-proxy-runtime.md`.
+ * Other /v3/skill/* endpoints are intentionally not wrapped here because the
+ * independent bridge forwards them without exposing that bridge to the model.
  *
  * Auth: `Authorization: Bearer <serviceToken>` + `x-tdai-service-id`.
  * Error model: throws plain `Error` on !ok or non-zero envelope code; callers

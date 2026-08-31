@@ -292,9 +292,8 @@ export interface TdaiConfig {
  *   1. RAG-driven `<cloud_skills>` injection (calls /v3/skill/search).
  *   2. Fire-and-forget skill extraction trigger (calls /v3/skill/extract?mode=async).
  *
- * The same `serviceToken` is also injected by the /skill-bridge reverse proxy
- * when the LLM curls skill operations, so that the token never appears in any
- * prompt the LLM sees.
+ * The same `serviceToken` is injected by the independent /skill-bridge API;
+ * the bridge is not advertised in model-visible prompt content.
  */
 export interface CoreSkillConfig {
   /** Default `http://127.0.0.1:8420`. */
@@ -308,7 +307,7 @@ export interface CoreSkillConfig {
 }
 
 /**
- * Knowledge tools injector configuration.
+ * Standalone knowledge gateway configuration.
  *
  * Independent from `coreSkill` so knowledge gateway routing can diverge from
  * skill (e.g. skill via kernel direct-IP, knowledge via API Gateway).
@@ -316,7 +315,7 @@ export interface CoreSkillConfig {
  * Pick<endpoint | serviceToken | serviceId | timeoutMs>.
  */
 export interface KnowledgeConfig {
-  /** Master switch. `false` (default) → injector not registered, no injection. */
+  /** Master switch for non-model host integrations. */
   enabled: boolean;
   endpoint: string;
   serviceToken: string;
@@ -324,17 +323,11 @@ export interface KnowledgeConfig {
   timeoutMs: number;
 }
 
-/** Skill runtime-side configuration. */
+/** Independent Skill Bridge API policy. */
 export interface SkillRuntimeConfig {
   /**
-   * 是否允许主模型创建/修改 skill。默认 false。
-   * 主模型的质量不可控，默认关闭写入能力以避免低质量 skill 被创建。
-   * 显式设为 true 后：
-   *   - <skill_tools> 注入全部 10 个工具（含写操作）
-   *   - /skill-bridge 放行写操作（create/update/patch/delete/files_write/files_remove）
-   * false 时：
-   *   - <skill_tools> 只注入只读工具（search/list/view/files_read）
-   *   - /skill-bridge 拒绝写操作返回 403
+   * 是否允许 /skill-bridge 调用方创建/修改 skill。默认 false。
+   * 该开关只控制独立 HTTP API，不产生任何模型侧工具或提示注入。
    */
   allowLlmWrite: boolean;
 
@@ -542,26 +535,6 @@ export interface MemCommandConfig {
 export interface InjectionConfig {
   enabled: boolean;
   injectors: string[];  // List of injector names to enable (e.g. ["skill", "knowledge", "tdai-memory"])
-  /**
-   * 对外统一 gateway 地址。LLM 生成的 curl 示例（<skill_tools> /
-   * <tdai_memory_tools> 段里嵌的路径）都以这个 URL 为 base。
-   *
-   * ⚠️ 多节点部署必配：未配时每个 pod 会用自身 `http://<hostIp>:<port>`
-   * 兜底，pods 互相覆盖 COS 里同一份 hook cache → md5 震荡 → 上游 Anthropic
-   * KV cache 每次 miss（费钱 + 首 token 慢）。
-   *
-   * 只需填 gateway 对外域名，**不带端口**（gateway 内部路由到 proxy 的端口
-   * 是 gateway ops 侧的事，跟这里无关）。示例：
-   *   externalGatewayUrl: "https://gateway.example.com"
-   *
-   * gateway 侧必须把下面两个前缀原样透传到 proxy pod：
-   *   `/skill-bridge/**`   → proxy /skill-bridge/**
-   *   `/memory-bridge/**`  → proxy /memory-bridge/**
-   *
-   * 未配置时 fallback 到 `http://<local hostIp>:<config.server.port>`（仅
-   * 单节点 / 本地开发场景可用），启动时 warn 一次。
-   */
-  externalGatewayUrl?: string;
   /**
    * 资产反思模式（内部效果评估用）。**默认关闭**，跟外部用户无关。
    *
@@ -793,7 +766,6 @@ export interface RawYamlConfig {
     enabled?: boolean;
     endpoint?: string;
     injectors?: string[];
-    externalGatewayUrl?: string;
     assetReflection?: {
       markerOptIn?: boolean;
     };
@@ -851,12 +823,18 @@ export interface RawYamlConfig {
   admin?: {
     apiKey?: string;
   };
+  memCommand?: {
+    enabled?: boolean;
+    allowedCommands?: string[];
+  };
 }
 
 /** request event — written when a request is intercepted (metadata only, no messages). */
 export interface RequestLogEntry {
   timestamp: string;
   event: "request";
+  /** Per-request trace identifier shared with structured observability spans. */
+  traceId?: string;
   modelId: string;
   keyId: string; // SHA-256(apiKey).slice(0, 8)
   sessionKey?: string; // conversationId || keyId — per-conversation isolation key

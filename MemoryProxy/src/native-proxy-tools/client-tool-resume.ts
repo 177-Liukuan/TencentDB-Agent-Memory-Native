@@ -7,6 +7,7 @@ import {
 } from "../db/tool-execution-storage-adapter.js";
 import type { UnifiedToolCall } from "../injection/adapters/interface.js";
 import { buildToolResultMessage } from "./anthropic-response-rebuilder.js";
+import { NativeToolTargetUnavailableError } from "./exact-target-transport.js";
 import type { NativeProxyToolDispatcher } from "./native-proxy-tool-dispatcher.js";
 import type {
   NativeReentryRequest,
@@ -345,7 +346,14 @@ export async function resumeClientToolResults(
         round,
         totalCalls: context.totalCalls,
       });
-    } catch {
+    } catch (error) {
+      if (error instanceof NativeToolTargetUnavailableError) {
+        throw new ClientToolResumeFailure(
+          "native_tool_target_unavailable",
+          "The persisted Native Proxy Tool upstream target is unavailable",
+          503,
+        );
+      }
       throw new ClientToolResumeFailure(
         "native_tool_reentry_failed",
         "Native Proxy Tool re-entry failed",
