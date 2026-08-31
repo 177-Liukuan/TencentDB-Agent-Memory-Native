@@ -774,8 +774,8 @@ export async function handleCodexEndpoint(
 
       if (injectedText.length > 0) {
         // Pipeline 产出的 injectedText 已经是**成品 XML 文本**（含
-        // <skill_tools> / <available_skills> / <user_memory> /
-        // <tdai_profile_memory> / <memory-tools-guide> 等多组内部 tag)，
+        // <available_skills> / <user_memory> / <tdai_profile_memory>
+        // 等参考资产 tag)，
         // 与 CC / CB 客户端在 system message 里看到的内容字节一致。
         // 走 raw 模式原样嵌入 <tdai_injections> wrapper 内层——不再套
         // 内层 <available_skills> tag，也不 escape 内容里的 XML tag，

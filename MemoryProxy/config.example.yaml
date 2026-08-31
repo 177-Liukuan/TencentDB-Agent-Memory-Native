@@ -313,6 +313,27 @@ clickhouse:
   ttlDays: 30                        # 数据保留天数（0 = 不自动过期；启动时通过 CREATE TABLE TTL 生效）
 
 
+# ── Anthropic Native Proxy Tool（仅流式 Messages API） ───────────────────────
+# 开启后，Proxy 在已初始化 Session 的 Anthropic stream 请求中注入唯一的结构化
+# 只读工具 `tdai_memory_search`。工具参数完整（content_block_stop）后立即执行；
+# Proxy 内部回填 Tool Result 并 Re-entry，Native Tool 帧不会下发给客户端。
+#
+# 状态可靠性依赖 ClickHouse（复用上面的 clickhouse 连接配置）：启动会探测
+# Lightweight UPDATE / 严格同步能力；不可用时 health=503、请求 fail-closed，绝不
+# 降级到内存/Redis。关闭时不注入 Native Tool，也不会回退到文本/curl Fake Tool。
+nativeProxyTools:
+  enabled: false
+  maxRounds: 5
+  maxCallsPerRound: 8
+  maxTotalCalls: 20
+  toolTimeoutMs: 5000
+  maxResultBytes: 65536
+  stateTtlSeconds: 1800
+  stateStorage:
+    backend: clickhouse
+    table: native_proxy_tool_execution_state
+
+
 # ── Auth 鉴权（user_key 校验 → user_id 解析） ─────────────────────────────────
 # 启用后 proxy 调用内核 POST /v3/meta/auth/verify 验证客户端 API Key。
 # 任何非 valid=true 的结果都返回 401 拒绝请求（包括超时/网络错误）。
@@ -425,26 +446,12 @@ creditPricing:
 # 每个 injector 是一个独立的 Hook，按注册顺序依次执行。
 #
 # 可选 injector：
-#   skill       — <cloud_skills> 块：从内核 RAG 检索相关 skill 注入 system prompt；
-#                 同时注入 <skill_tools> 块告诉 LLM 如何通过 curl 调用 skill。
-#                 数据源 = skill 段的 endpoint（内核 gateway）。
-#   knowledge   — <knowledge_tools> 块：从内核拉取 team 知识资源列表，
-#                 注入两步自发现流程工具（依赖 skill.serviceToken）。
-#   tdai-memory — TDAI L2/L3 记忆注入（由 tdai.memory.* 控制，详见 tdai 段）。
+#   skill       — <available_skills> 参考目录（仅元数据，不声明调用/读取工具）。
+#   tdai-memory — TDAI L2/L3 参考记忆注入（由 tdai.memory.* 控制）。
+# knowledge 在本 Native 阶段不注册模型侧工具或提示块。
 injection:
   enabled: true             # 是否启用上下文注入（关闭后下方 injectors 列表全部失效）
-  injectors: ["skill", "knowledge", "tdai-memory"]   # 要启用的注入器列表
-  # 对外统一 gateway 地址 —— LLM 生成的 <skill_tools> / <tdai_memory_tools>
-  # 段里嵌的 curl URL 都以这个为 base。只填 gateway 域名，**不带端口**
-  # （gateway 内部路由到 proxy pod 的端口由 ops 在 gateway 侧配，跟这里无关）。
-  #
-  # ⚠️ 多节点部署必配。未配时每个 pod 用自己的 host:port 兜底 → COS 里同一份
-  # hook cache 被 pods 互相覆盖 → 上游 Anthropic KV cache 每次 miss（费钱+慢）。
-  #
-  # gateway 侧需把下面两个前缀原样透传到 proxy pod：
-  #   /skill-bridge/**   → proxy /skill-bridge/**
-  #   /memory-bridge/**  → proxy /memory-bridge/**
-  externalGatewayUrl: "https://gateway.example.com"
+  injectors: ["skill", "tdai-memory"]   # 要启用的注入器列表
 
   # ── 资产反思模式（内部效果评估用；默认关闭） ─────────────────────────────
   # 结构完全对齐 costGuard.markerOptIn：
@@ -563,9 +570,8 @@ tdai:
 #   1. <cloud_skills> RAG 注入：GET /v3/skill/search 检索相关 skill
 #   2. Skill 归档触发：每轮真人对话结束调 /v3/skill/conversation/add,
 #      core 侧按 tool_call ≥ 10 或 bytes ≥ 40KB 阈值归档并异步抽取。
-#   3. knowledge injector 拉取 team 知识资源列表
-# 同一个 serviceToken 也会被 /skill-bridge 反代在转发 LLM curl 时注入，
-# 避免 token 出现在 LLM 可见的 prompt 中。
+#   3. Session/元数据恢复所需的控制面访问
+# `/skill-bridge` 仍是独立业务 API，但不会再以文本工具或 curl 指南暴露给模型。
 # sessionInit 的 team/agent/task 列表也通过此内核获取（MetadataClient）。
 #
 # 段名兼容：也可写作 `coreSkill:`（旧名，仍被读取）；两者同时存在时 `skill:` 优先。
@@ -578,9 +584,8 @@ skill:
   timeoutMs: 1500                     # 单次调用超时（毫秒）。RAG 在 session_init 热路径上，不宜太大
 
 
-# ── Knowledge tools 注入（独立 gateway 配置） ───────────────────────────────
-# proxy 通过此配置访问内核 gateway 拉取 team 知识资源（code-graph / wiki），
-# 渲染 <knowledge_tools> 块注入 system prompt，LLM 据此调 KS 的 tools/list|call。
+# ── Knowledge gateway 配置（本 Native 阶段不做模型侧工具注入） ─────────────
+# 该配置保留给其它宿主能力；MemoryProxy 不再渲染 Knowledge Fake Tool 提示块。
 #
 # 与 skill 段独立：endpoint 可以不同（例如 skill 走内核直连 IP，
 # knowledge 走 API Gateway 域名）。
@@ -604,11 +609,8 @@ knowledge:
 # 历史配置项 (已删除): extractToolCallThreshold / maxBucketCount /
 # conversationAddEnabled — 属于 proxy 侧老链路 SkillExtractTrigger, 已下线。
 skillRuntime:
-  allowLlmWrite: false           # 是否允许主模型创建/修改 skill（默认 false）
-                                 #   false: <skill_tools> 只注入只读工具（search/list/view/files_read）
-                                 #          /skill-bridge 拒绝写操作返回 403
-                                 #   true:  <skill_tools> 注入全部工具（含写操作 create/update/delete 等）
-                                 #          /skill-bridge 放行写操作
+  allowLlmWrite: false           # `/skill-bridge` 独立 API 的写权限策略；不产生模型提示
+                                 # false=拒绝写操作，true=放行写操作
 
 
 # ── mem: 特殊命令 ──────────────────────────────────────────────────────────

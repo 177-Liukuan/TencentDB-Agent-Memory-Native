@@ -25,11 +25,12 @@ MemoryProxy 是一个**透明的 LLM 请求代理**：把编码 Agent（Claude C
 ## 核心能力
 
 - **会话初始化**：首次对话时拦截请求，通过交互式表单引导用户选择 team → agent → task，完成后把 agent/task 上下文注入 system prompt。支持从请求头（`x-team-id` / `x-agent-id` / `x-task-id`）自动预选。
-- **上下文注入**：把 Skill、Knowledge、Memory L2/L3 等按需注入 system prompt；L0/L1 通过只读工具接口暴露给模型主动查询，避免破坏上游 KV cache。
+- **上下文注入**：按需注入只读参考性质的 Skill 元数据与 Memory L2/L3 上下文，不伪造文本/curl 工具。
+- **Anthropic Native Proxy Tool**：仅对流式 Messages 请求注入唯一结构化只读工具 `tdai_memory_search`；在 `content_block_stop` 执行，通过 ClickHouse 持久化混合工具状态，并复用原目标 Internal Re-entry，Native 帧不会泄漏给客户端。
 - **对话回流（提取）**：每轮真人对话结束时，把对话切片同步发到 MemoryCore `/v3/skill/conversation/add`（Skill 归档）并写入 L0 短期记忆，供 core 侧后台抽取。
 - **鉴权与身份**：调用 MemoryCore `POST /v3/meta/auth/verify` 校验 `x-tdai-user-key`，解析出 `user_id` 作为全链路用户标识；`spaceId`（memory 实例 id）从 `/proxy/<spaceId>/...` 路径自动提取。
 - **系统用户短路透传**：内部服务账号（如 memory / wiki 内部调用）命中后跳过 session init 和注入，只做透明转发 + 计费。
-- **Skill Bridge / Memory Bridge**：反向代理 MemoryCore 的 skill / memory HTTP 工具，转发时注入 `serviceToken`，避免凭据出现在 LLM 可见的 prompt 中。
+- **Skill Bridge / Memory Bridge**：保留为可信调用方使用的独立业务 API，不再作为 curl/Fake Tool 暴露给模型。
 - **统一存储抽象（ProxyStorage）**：会话初始化状态、注入缓存与 Skill 状态（`inj:*` / `sk:*` / `vpin:*`）支持 Redis、COS（kernel-sts）、SQLite、FS、Memory 五种后端，多节点部署首选 COS。
 - **Input TPM / QPM 限流**：按 `spaceId × 最终模型` 在 Redis 上做 60 秒滑动窗口限流，可通过 `/v3/admin/rate-limits` 动态调整。
 - **可观测与用量上报**：Opik trace、Langfuse（一个 trace = 一个 turn）、ClickHouse（按 turn 记录 token 明细）三路互相独立，任一失败不影响业务。
@@ -46,9 +47,9 @@ POST /proxy/<spaceId>/v1/chat/completions | /v1/messages
    ├─ 1. auth ─────── 校验 x-tdai-user-key，解析出 user_id
    ├─ 2. systemUser ─ 命中内部账号则短路透传
    ├─ 3. sessionInit ─ 首次对话弹表单：team → agent → task
-   ├─ 4. injection ── system prompt 注入 skill / knowledge / memory
+   ├─ 4. injection ── 注入参考上下文 + 结构化 Native memory tool
    ├─ 5. rateLimit ── spaceId × 最终模型 TPM/QPM 限流
-   ├─ 6. forward ──── 转发到上游 LLM
+   ├─ 6. forward ──── 转发；Native 调用在内部执行并精确 Re-entry
    ├─ 7. extract ──── 一轮结束后异步回流 conversation + L0
    └─ 8. report ───── ClickHouse / Langfuse / Opik / Credit 上报
 ```
@@ -60,16 +61,17 @@ MemoryProxy 对齐 MemoryCore 的四层记忆结构，按“注入 + 工具化�
 | 层级 | 作用 | 接入方式 |
 | --- | --- | --- |
 | L0 | 短期对话记忆 | 每轮对话由 proxy 主动写回 MemoryCore |
-| L1 | 会话级关键记忆 | 通过 `<tdai_memory_tools>` 工具让模型按需召回 |
+| L1 | 会话级关键记忆 | 通过结构化 `tdai_memory_search` Native Tool 按需检索 |
 | L2 | Agent Profile | 直接注入 system prompt |
 | L3 | Team / Global 记忆 | 直接注入 system prompt |
 
-Skill 与 Knowledge 沿用同样的思路：
+其它 prompt 上下文严格保持为参考信息：
 
-- `<cloud_skills>` —— 从 MemoryCore RAG 检索到的相关 Skill 摘要
-- `<skill_tools>` —— 告诉模型如何通过 curl 调用 Skill 的说明块（读写权限由 `skillRuntime.allowLlmWrite` 控制）
-- `<knowledge_tools>` —— 团队知识资源（Wiki / CodeGraph）两步自发现工具
+- `<available_skills>` —— 相关 Skill 的元数据摘要，不声称存在模型侧 Skill 调用/加载工具
+- 本 Native 阶段关闭 Knowledge 模型工具提示注入
 - `<session_context>` —— session init 完成后每轮追加的 agent/task 信息
+
+`nativeProxyTools.enabled=false` 时不注入 Native 定义，也不会回退到 Fake Tool、shell 或 curl 文本。开启后，状态能力对 ClickHouse fail-closed，绝不替换成内存或 Redis；执行租约采用 at-least-once，结果接纳和 Client Tool 下发通过 CAS 防止重复应用。
 
 ## 环境要求
 
@@ -77,6 +79,7 @@ Skill 与 Knowledge 沿用同样的思路：
 - npm 或 pnpm
 - 一个已运行的 **MemoryCore Gateway**（默认 `:8420`），提供 Auth / Skill / Meta / Memory API
 - Redis（默认承载会话/注入/Skill 状态；启用 `storage.enabled=true` 后可切换到其他后端）
+- 开启 `nativeProxyTools` 时需 ClickHouse 支持同步 Lightweight UPDATE
 - 一个 OpenAI-compatible 上游 LLM API（TokenHub 或其他）
 
 ## 快速开始
@@ -191,11 +194,11 @@ Anthropic Messages 客户端：
 | `POST` | `/proxy/<spaceId>/v1/messages` | Anthropic Messages 主模型调用 |
 | `POST` | `/v1/messages` | Anthropic Messages API（无 spaceId 兜底） |
 | `POST` | `/*` | OpenAI 兼容聊天接口（catch-all） |
-| `ALL`  | `/skill-bridge/**` | 反向代理 MemoryCore skill HTTP 工具 |
-| `ALL`  | `/memory-bridge/**` | 反向代理 MemoryCore memory HTTP 工具 |
+| `ALL`  | `/skill-bridge/**` | 独立的可信调用方 Skill Bridge API（不注入模型） |
+| `ALL`  | `/memory-bridge/**` | 独立的可信调用方 Memory Bridge API（不注入模型） |
 | `POST` | `/v3/instance/proxy-destroy` | 运维口：实例销毁时清 COS 缓存 |
 | `GET/PUT/DELETE` | `/v3/admin/rate-limits` | 查询 / 修改实例 × 模型 TPM/QPM |
-| `GET`  | `/health` | 运行时健康检查（含 `storage.effective`） |
+| `GET`  | `/health` | 运行时健康检查（含 Storage 与 Native Tool 就绪状态） |
 | `GET`  | `/whoami` | API Key → keyId（纯文本，便于 curl） |
 
 ## 配置说明
@@ -214,15 +217,16 @@ Anthropic Messages 客户端：
 | `auth` | `x-tdai-user-key` → `user_id` 校验（调用 MemoryCore `/v3/meta/auth/verify`） |
 | `admin` | 运维端点（如 `/v3/instance/proxy-destroy`）的 shared secret |
 | `systemUsers` | 内部服务账号，命中后短路透传 |
-| `injection` | 上下文注入总开关与 injector 列表（`skill` / `knowledge` / `tdai-memory`） |
+| `injection` | 参考上下文注入（`skill` / `tdai-memory`），不生成 Fake Tool 指南 |
 | `extraction` | 对话回流总开关（skill 归档 + L0 写入） |
 | `sessionInit` | 会话初始化表单流程、header 自动预选策略 |
 | `tdai` | MemoryCore 连接与 L0/L1/L2/L3 开关 |
 | `skill` | MemoryCore 数据面配置（Skill RAG、Skill 归档、Meta） |
-| `knowledge` | 独立的 knowledge gateway（可与 skill 不同） |
-| `skillRuntime` | 是否允许主模型写 Skill（默认只读） |
+| `knowledge` | 独立 knowledge gateway 配置；本阶段不做模型工具注入 |
+| `skillRuntime` | 独立 `/skill-bridge` API 的写权限策略 |
 | `rateLimit` | Memory 实例 × 实际模型的 Input TPM / QPM 限流 |
 | `clickhouse` | 按 turn 的用量上报（计费数据源） |
+| `nativeProxyTools` | Anthropic 流式 Native Tool 限制、TTL 与 ClickHouse 状态表 |
 | `creditReport` / `creditPricing` | Credit 计费上报与定价表 |
 | `upstream.agents` | 按 agent name 覆盖上游 URL + apiKey（如 `claude-code` 单独走 CCR） |
 
@@ -321,7 +325,7 @@ npm run test:watch
 
 - 非回环地址监听或多节点部署时，必须启用 `auth.enabled=true`，并通过 env 注入 `TDAI_PROXY_ADMIN_API_KEY` 保护运维口。
 - 所有 Secret 通过环境变量或 Secret Manager 注入；不要把真实 `apiKey` / `serviceToken` / STS 凭证 / 计费 URL 提交进配置仓库。
-- 部署到多节点时必须使用 `storage.backend=cos` 并显式配置 `injection.externalGatewayUrl`，否则每个实例各自缓存会导致上游 KV cache miss。
+- 多节点部署应使用共享的 `storage.backend=cos`；Native Tool 状态另行要求所有节点使用同一 ClickHouse 表。
 - 不要提交生成数据、本地数据库、日志或环境变量文件（`logs/`、`*.db`、`.env`、`dump.rdb`、`session*.json`、`*.pid` 等）。
 
 ## License

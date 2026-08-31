@@ -9,8 +9,8 @@
  *
  * 两种模式（与 codex-injection 保持相同的双模式设计）：
  *   - **raw**（当前 handler 走的路径）：pipeline 已经产出的**完整成品文本**
- *     （含 `<available_skills>` / `<user_memory>` / `<tdai_profile_memory>` /
- *     `<memory-tools-guide>` 等多组内部 XML tag）原样嵌进 wrapper 内层，不再
+ *     （含 `<available_skills>` / `<user_memory>` / `<tdai_profile_memory>` 等
+ *     参考上下文 tag）原样嵌进 wrapper 内层，不再
  *     escape 或加子 tag —— 与 CC / CB / Codex 客户端在 system message 里看到
  *     的内容**字节一致**。
  *

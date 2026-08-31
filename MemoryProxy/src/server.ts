@@ -14,10 +14,12 @@ import { createRateLimitHandlers } from "./routes/rate-limits.js";
 import { hasAnalyseMarker, hasCostGuardMarker } from "./routes/whitelist.js";
 import { tryActivateStorage, tryActivateRedis } from "./injection/index.js";
 import { getEffectiveBackend } from "./storage/factory.js";
+import { getNativeProxyToolRuntime } from "./native-proxy-tools/runtime.js";
 import type { ProxyConfig } from "./types.js";
 
 export function createApp(config: ProxyConfig): Hono {
   const app = new Hono();
+  const nativeToolRuntime = getNativeProxyToolRuntime(config);
 
   // Eagerly activate storage/bindingRepo so bridge-only requests (no main
   // /v1/messages hits yet) can still recover session state via L2 fallthrough
@@ -84,7 +86,10 @@ export function createApp(config: ProxyConfig): Hono {
   app.get("/health", (c) => {
     const eff = getEffectiveBackend();
     const wantsShared = config.storage?.enabled && eff.requested === "cos";
-    const degraded = wantsShared && eff.effective !== eff.requested;
+    const storageDegraded = wantsShared && eff.effective !== eff.requested;
+    const nativeToolReadiness = nativeToolRuntime.readiness();
+    const nativeToolDegraded = config.nativeProxyTools.enabled && !nativeToolReadiness.ready;
+    const degraded = storageDegraded || nativeToolDegraded;
     const body = {
       status: degraded ? "degraded" : "ok",
       version: "0.2.0",
@@ -92,11 +97,17 @@ export function createApp(config: ProxyConfig): Hono {
       opik: config.opik.enabled ? config.opik.url : "disabled",
       costGuard: config.costGuard.enabled ? "enabled" : "disabled",
       rateLimit: config.rateLimit.tpm > 0 || config.rateLimit.qpm > 0 ? "enabled" : "disabled",
+      nativeProxyTools: {
+        enabled: config.nativeProxyTools.enabled,
+        ready: nativeToolReadiness.ready,
+        failed: nativeToolReadiness.failed,
+        ...(nativeToolReadiness.message ? { message: nativeToolReadiness.message } : {}),
+      },
       storage: {
         enabled: !!config.storage?.enabled,
         requested: eff.requested,
         effective: eff.effective,
-        degraded,
+        degraded: storageDegraded,
         ...(eff.error ? { lastError: eff.error } : {}),
       },
     };
@@ -121,13 +132,13 @@ export function createApp(config: ProxyConfig): Hono {
     return c.text(keyId + "\n");
   });
 
-// Skill bridge: LLM curls land here, proxy injects auth + identity, forwards to core.
+  // Independent Skill bridge API: inject trusted identity/auth and forward to core.
   // MUST be registered before the agent-prefixed `/:agent/v1/*` routes below.
   const bridgeHandler = createSkillBridgeHandler(config);
   app.post("/skill-bridge/*", (c) => bridgeHandler(c));
 
-  // Memory bridge: 同样模式但反代 tdai L0/L1/L2/L3 只读接口。
-  // 让 LLM 用 Bash 调 <proxy>/memory-bridge/v3/atomic/search 等，proxy 注入身份。
+  // Independent Memory bridge API for trusted callers and the in-process
+  // Native dispatcher. It is not exposed through model-facing prompt text.
   const memoryBridgeHandler = createMemoryBridgeHandler(config);
   app.post("/memory-bridge/*", (c) => memoryBridgeHandler(c));
 

@@ -68,6 +68,10 @@ export interface TriggerInput {
   assetCapabilities?: AssetCapabilityFlags;
   /** Optional override (e.g. SSE accumulators contain the truth in streaming mode). */
   toolCallCountOverride?: number;
+  /** Stable key supplied by the Native Tool durable observation outbox. */
+  idempotencyKey?: string;
+  /** Propagate Core errors so a durable outbox remains pending for retry. */
+  throwOnError?: boolean;
 }
 
 export async function triggerSkillExtractIfReady(input: TriggerInput): Promise<void> {
@@ -137,7 +141,10 @@ export async function triggerSkillExtractIfReady(input: TriggerInput): Promise<v
           messages: turnMessages,
         },
         // core Shark 走 x-tdai-service-id = 真实内核实例 ID
-        { serviceId: spaceId },
+        {
+          serviceId: spaceId,
+          ...(input.idempotencyKey ? { idempotencyKey: input.idempotencyKey } : {}),
+        },
       );
       if (result.status === "archived" && result.archived) {
         console.log(
@@ -160,6 +167,7 @@ export async function triggerSkillExtractIfReady(input: TriggerInput): Promise<v
         "[skill-conversation-add] addConversation failed:",
         err instanceof Error ? err.message : String(err),
       );
+      if (input.throwOnError) throw err;
     }
   } catch (err) {
     // 保守：任何异常都吞掉，避免影响主响应链。
@@ -167,6 +175,7 @@ export async function triggerSkillExtractIfReady(input: TriggerInput): Promise<v
       "[skill-extract-glue] triggerSkillExtractIfReady swallowed error:",
       err instanceof Error ? err.message : String(err),
     );
+    if (input.throwOnError) throw err;
   }
 }
 

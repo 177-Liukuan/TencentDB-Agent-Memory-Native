@@ -32,6 +32,10 @@ import { initSystemUsers } from "./systemUser.js";
 import { checkConnectivity } from "./connectivity.js";
 import { initProxyStorage, getEffectiveBackend } from "./storage/factory.js";
 import { flushPendingWrites, pendingWriteCount } from "./tdai/pending-writes.js";
+import {
+  initializeNativeProxyToolRuntime,
+  shutdownNativeProxyToolRuntime,
+} from "./native-proxy-tools/runtime.js";
 
 const overrides = parseArgv(process.argv);
 const config = buildConfig(overrides);
@@ -104,6 +108,26 @@ if (isRequestPrepareActive(config)) {
   });
 }
 
+// Native Proxy Tools fail closed on their ClickHouse state capability. Keep
+// the process alive with degraded health so operators can diagnose/recover it;
+// every Native-enabled Anthropic request will return a sanitized 503 until the
+// configured runtime is ready, and no in-memory fallback is installed.
+if (config.nativeProxyTools.enabled) {
+  try {
+    await initializeNativeProxyToolRuntime(config);
+    log.info("native_proxy_tools.ready", {
+      backend: config.nativeProxyTools.stateStorage.backend,
+      table: config.nativeProxyTools.stateStorage.table,
+    });
+  } catch (err: unknown) {
+    log.error(
+      "native_proxy_tools.unavailable",
+      { backend: config.nativeProxyTools.stateStorage.backend },
+      err instanceof Error ? err : new Error(String(err)),
+    );
+  }
+}
+
 const app = createApp(config);
 
 log.info("server.starting", {
@@ -162,6 +186,7 @@ async function gracefulShutdown(signal: "SIGTERM" | "SIGINT"): Promise<void> {
   await shutdownGuard();
   await shutdownPrivateControlPlane();
   await shutdownRequestPrepare();
+  await shutdownNativeProxyToolRuntime();
   await shutdownLangfuse();
   await shutdownClickHouse();
   await shutdownLogger();

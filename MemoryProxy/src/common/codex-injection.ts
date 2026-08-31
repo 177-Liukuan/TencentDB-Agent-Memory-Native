@@ -6,8 +6,8 @@
  *
  * 两种模式：
  *   - **raw**（当前 codex handler 走的路径）：pipeline 已经产出的**完整成品文本**
- *     （含 `<available_skills>` / `<user_memory>` / `<tdai_profile_memory>` /
- *     `<memory-tools-guide>` 等多组内部 XML tag）原样嵌进 wrapper 内层，不再做
+ *     （含 `<available_skills>` / `<user_memory>` / `<tdai_profile_memory>` 等
+ *     参考上下文 tag）原样嵌进 wrapper 内层，不再做
  *     escape 或额外 tag 包裹，与 CC / CB 客户端在 system message 里看到的内容
  *     **字节一致**——模型学到的语义完全一样，不需要"codex 专属提示词"。
  *

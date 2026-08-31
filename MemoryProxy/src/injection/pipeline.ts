@@ -49,6 +49,16 @@ export interface InjectionPipelineOptions {
   hookCacheRepo?: HookCacheRepo;
 }
 
+export class CriticalInjectionHookError extends Error {
+  readonly hookId: string;
+
+  constructor(hookId: string, cause: Error) {
+    super(`Critical injection hook failed: ${hookId}`, { cause });
+    this.name = "CriticalInjectionHookError";
+    this.hookId = hookId;
+  }
+}
+
 /**
  * The injection pipeline. Orchestrates parse → inject → serialize.
  */
@@ -247,6 +257,10 @@ export class InjectionPipeline {
             error: error.message,
             cacheStrategy: hook.cacheStrategy ?? "none",
           });
+
+          if (hook.critical) {
+            throw new CriticalInjectionHookError(hook.id, error);
+          }
         }
       }
     }
@@ -419,9 +433,9 @@ export class InjectionPipeline {
         // the system message. The previous behavior for `system.before_tools`
         // was to prepend (顶到最前面)，会把 knowledge/skill/rules 等资产块甩到
         // 用户 persona 前面污染开场，尤其在子 agent / 简化 system prompt 场景
-        // (锚点永远解析不到) 直接看到 <knowledge_tools> 位于 offset 0。
+        // （锚点永远解析不到）直接看到资产块位于 offset 0。
         // 统一收敛为 "锚点找不到 → 挂到系统提示词末尾"，跟 system.suffix 行为
-        // 一致，跟 asset-reflection / tdai-tools 这些 suffix 类块的落位对齐。
+        // 一致，跟 asset-reflection 等 suffix 类块的落位对齐。
         const sysMsg = getSystemMessage(ctx);
         if (!sysMsg) break;
         for (const block of blocks) {

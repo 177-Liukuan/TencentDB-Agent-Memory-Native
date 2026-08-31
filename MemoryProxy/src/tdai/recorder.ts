@@ -29,13 +29,19 @@ export function extractLatestUserMessage(messages: unknown[]): TdaiMessage | nul
   return null;
 }
 
-export async function recordTdaiTurn(client: TdaiClient, identity: TdaiIdentity | null, userMessage: TdaiMessage | null, assistantContent: string | null | undefined): Promise<void> {
+export async function recordTdaiTurn(
+  client: TdaiClient,
+  identity: TdaiIdentity | null,
+  userMessage: TdaiMessage | null,
+  assistantContent: string | null | undefined,
+  options: { idempotencyKey?: string; requireSuccess?: boolean } = {},
+): Promise<void> {
   if (!identity || !userMessage) return;
   const messages: TdaiMessage[] = [userMessage];
   if (assistantContent?.trim()) {
     messages.push({ role: "assistant", content: assistantContent });
   }
-  await client.addConversation(identity, messages);
+  await client.addConversation(identity, messages, options);
 }
 
 function extractContentText(content: unknown): string {

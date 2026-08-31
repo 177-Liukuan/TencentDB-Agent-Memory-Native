@@ -347,6 +347,8 @@ export interface InjectionHook {
   priority: HookPriority;
   /** Human-readable description (for debugging/logging). */
   description: string;
+  /** Fail the entire request instead of degrading when this hook fails. */
+  critical?: boolean;
   /**
    * Optional caching strategy (default: "none" → existing per-request behavior).
    * See {@link CacheStrategy} for semantics.

@@ -13,9 +13,9 @@
  * ## Tag 集合
  * 由构造函数传入的 `activeAssetTags` 决定——由 factory 根据本节点上实际
  * register 了哪些资产 injector 计算好静态列表：
- *   - skill-*         → `<skill_tools>` + `<available_skills>`
- *   - tdai-*          → `<tdai_memory_tools>`
- *   - knowledge-*     → `<knowledge_tools>`
+ *   - skill catalog   → `<available_skills>` reference context
+ *   - tdai profile    → `<tdai_profile_memory>` reference context
+ *   - Native memory   → structured `tdai_memory_search`
  *
  * 一个都没注册（activeAssetTags 空） → hook 恒不 emit。
  */
@@ -31,7 +31,7 @@ import { HOOK_PRIORITY } from "../types.js";
 import { hasAnalyseMarker } from "../../routes/whitelist.js";
 
 export interface AssetReflectionInjectorConfig {
-  /** 本节点实际启用的资产 tag 名列表（无尖括号），如 `["skill_tools", "tdai_memory_tools"]`。 */
+  /** 本节点实际启用的资产 tag/能力名列表（无尖括号）。 */
   activeAssetTags: string[];
 }
 
@@ -43,10 +43,10 @@ export function renderAssetReflectionBlock(tags: string[]): string {
   const tagList = tags.map((t) => `<${t}>`).join(" / ");
   return [
     "<asset_reflection>",
-    "**内部效果评估模式** —— 本次系统提示词中包含以下云端资产工具块：",
+    "**内部效果评估模式** —— 本轮可见以下云端资产或结构化能力：",
     `  ${tagList}`,
     "",
-    "如果本轮对话你**真的调用过**其中任一工具（无论走 Bash curl 还是 MCP 调用），",
+    "如果本轮对话你真的使用过其中任一资产或结构化工具，",
     "请在最终回答的**末尾**追加一段简短复盘，格式固定如下：",
     "",
     "【资产反思】",

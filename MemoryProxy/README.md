@@ -25,11 +25,12 @@ Coding agent (Claude Code / CodeBuddy / ...)
 ## Core capabilities
 
 - **Session initialization**: intercepts the first request and guides the user through an interactive form to pick team → agent → task, then injects the agent/task context into the system prompt. Supports auto pre-selection from request headers (`x-team-id` / `x-agent-id` / `x-task-id`).
-- **Context injection**: injects Skills, Knowledge and Memory L2/L3 into the system prompt on demand; L0/L1 are exposed as read-only tools for the model to query proactively, avoiding upstream KV-cache invalidation.
+- **Context injection**: injects reference-only Skill metadata and Memory L2/L3 context on demand; it does not fabricate text/curl tools.
+- **Anthropic Native Proxy Tool**: on streaming Messages requests, injects the single structured read-only `tdai_memory_search` tool, executes it at `content_block_stop`, persists the mixed-tool state in ClickHouse, and performs exact-target internal re-entry without exposing Native frames to the client.
 - **Conversation write-back (extraction)**: at the end of each human turn, sends the conversation slice to MemoryCore `/v3/skill/conversation/add` (Skill archival) and writes L0 short-term memory for background extraction on the core side.
 - **Auth & identity**: calls MemoryCore `POST /v3/meta/auth/verify` to validate `x-tdai-user-key` and resolve `user_id` as the end-to-end user identity; `spaceId` (memory instance id) is auto-extracted from the `/proxy/<spaceId>/...` path.
 - **System-user passthrough**: internal service accounts (e.g. memory / wiki internal calls) short-circuit session init and injection on match, doing pure passthrough + billing only.
-- **Skill Bridge / Memory Bridge**: reverse-proxies MemoryCore's skill / memory HTTP tools, injecting `serviceToken` on forward so credentials never appear in an LLM-visible prompt.
+- **Skill Bridge / Memory Bridge**: retained as independent business APIs for trusted callers; they are not advertised to the model as curl/Fake Tools.
 - **Unified storage abstraction (ProxyStorage)**: session init state, injection cache and Skill state (`inj:*` / `sk:*` / `vpin:*`) support five backends — Redis, COS (kernel-sts), SQLite, FS, Memory. COS is preferred for multi-node deployments.
 - **Input TPM / QPM rate limiting**: 60-second sliding-window limiting on Redis, keyed by `spaceId × final model`, adjustable at runtime via `/v3/admin/rate-limits`.
 - **Observability & usage reporting**: three independent channels — Opik trace, Langfuse (one trace = one turn), ClickHouse (per-turn token detail). Any one failing does not affect the business path.
@@ -46,9 +47,9 @@ POST /proxy/<spaceId>/v1/chat/completions | /v1/messages
    ├─ 1. auth ─────── validate x-tdai-user-key, resolve user_id
    ├─ 2. systemUser ─ short-circuit passthrough on internal-account match
    ├─ 3. sessionInit ─ first turn shows a form: team → agent → task
-   ├─ 4. injection ── inject skill / knowledge / memory into system prompt
+   ├─ 4. injection ── inject reference context + structured Native memory tool
    ├─ 5. rateLimit ── spaceId × final-model TPM/QPM limiting
-   ├─ 6. forward ──── forward to the upstream LLM
+   ├─ 6. forward ──── forward; Native calls execute + exact-target re-enter internally
    ├─ 7. extract ──── async write-back of conversation + L0 after the turn
    └─ 8. report ───── ClickHouse / Langfuse / Opik / Credit reporting
 ```
@@ -60,16 +61,17 @@ MemoryProxy mirrors MemoryCore's four-layer memory structure, plugging into the 
 | Layer | Role | How it plugs in |
 | --- | --- | --- |
 | L0 | Short-term conversation memory | proxy writes it back to MemoryCore each turn |
-| L1 | Session-level key memory | recalled on demand by the model via the `<tdai_memory_tools>` tools |
+| L1 | Session-level key memory | queried by the structured `tdai_memory_search` Native Tool |
 | L2 | Agent Profile | injected directly into the system prompt |
 | L3 | Team / Global memory | injected directly into the system prompt |
 
-Skills and Knowledge follow the same idea:
+Other prompt context is deliberately reference-only:
 
-- `<cloud_skills>` — summaries of relevant Skills retrieved from MemoryCore RAG
-- `<skill_tools>` — a block telling the model how to call Skills via curl (read/write permission controlled by `skillRuntime.allowLlmWrite`)
-- `<knowledge_tools>` — two-step self-discovery tools for team knowledge resources (Wiki / CodeGraph)
+- `<available_skills>` — metadata summaries of relevant Skills; no model-facing Skill execution/loading tool is claimed
+- Knowledge tool prompt injection is disabled in this Native phase
 - `<session_context>` — agent/task info appended every turn after session init completes
+
+`nativeProxyTools.enabled=false` means no Native definition is injected. There is intentionally no Fake Tool, shell, or curl fallback. When enabled, Native state is fail-closed on ClickHouse capability/readiness: the proxy never substitutes in-memory or Redis state. Tool execution leases are at-least-once, while result acceptance and Client Tool dispatch are CAS-protected to prevent duplicate result application.
 
 ## Requirements
 
@@ -77,6 +79,7 @@ Skills and Knowledge follow the same idea:
 - npm or pnpm
 - A running **MemoryCore Gateway** (default `:8420`) providing Auth / Skill / Meta / Memory APIs
 - Redis (default backing store for session/injection/Skill state; switchable once `storage.enabled=true`)
+- ClickHouse with synchronous Lightweight UPDATE support when `nativeProxyTools.enabled=true`
 - An OpenAI-compatible upstream LLM API (TokenHub or others)
 
 ## Quick start
@@ -222,11 +225,11 @@ full syntax.
 | `POST` | `/proxy/<spaceId>/v1/messages` | Anthropic Messages main-model call |
 | `POST` | `/v1/messages` | Anthropic Messages API (fallback without spaceId) |
 | `POST` | `/*` | OpenAI-compatible chat endpoint (catch-all) |
-| `ALL`  | `/skill-bridge/**` | reverse-proxy for MemoryCore skill HTTP tools |
-| `ALL`  | `/memory-bridge/**` | reverse-proxy for MemoryCore memory HTTP tools |
+| `ALL`  | `/skill-bridge/**` | independent trusted-caller Skill bridge API (not model-injected) |
+| `ALL`  | `/memory-bridge/**` | independent trusted-caller Memory bridge API (not model-injected) |
 | `POST` | `/v3/instance/proxy-destroy` | ops endpoint: clear COS cache on instance destroy |
 | `GET/PUT/DELETE` | `/v3/admin/rate-limits` | query / modify per-instance × model TPM/QPM |
-| `GET`  | `/health` | runtime health check (includes `storage.effective`) |
+| `GET`  | `/health` | runtime health check (includes storage and Native Tool readiness) |
 | `GET`  | `/whoami` | API Key → keyId (plain text, handy with curl) |
 
 ## Configuration
@@ -245,15 +248,16 @@ Config sections at a glance:
 | `auth` | `x-tdai-user-key` → `user_id` validation (calls MemoryCore `/v3/meta/auth/verify`) |
 | `admin` | shared secret for ops endpoints (e.g. `/v3/instance/proxy-destroy`) |
 | `systemUsers` | internal service accounts; short-circuit passthrough on match |
-| `injection` | master switch and injector list (`skill` / `knowledge` / `tdai-memory`) |
+| `injection` | reference-context injection (`skill` / `tdai-memory`); no Fake Tool recipes |
 | `extraction` | conversation write-back master switch (skill archival + L0 write) |
 | `sessionInit` | session init form flow and header auto pre-select policy |
 | `tdai` | MemoryCore connection and L0/L1/L2/L3 switches |
 | `skill` | MemoryCore data-plane config (Skill RAG, Skill archival, Meta) |
-| `knowledge` | standalone knowledge gateway (may differ from skill) |
-| `skillRuntime` | whether the main model may write Skills (read-only by default) |
+| `knowledge` | standalone knowledge gateway config; no model-side tool injection in this phase |
+| `skillRuntime` | write policy for the independent `/skill-bridge` API |
 | `rateLimit` | Input TPM / QPM limiting per memory instance × actual model |
 | `clickhouse` | per-turn usage reporting (billing data source) |
+| `nativeProxyTools` | Anthropic streaming Native Tool limits, TTL and ClickHouse state table |
 | `creditReport` / `creditPricing` | Credit billing report and pricing table |
 | `upstream.agents` | override upstream URL + apiKey per agent name (e.g. route `claude-code` through CCR) |
 
@@ -352,7 +356,7 @@ npm run test:watch
 
 - When listening on a non-loopback address or deploying multi-node, enable `auth.enabled=true` and inject `TDAI_PROXY_ADMIN_API_KEY` via env to protect ops endpoints.
 - Inject all secrets via environment variables or a Secret Manager; never commit real `apiKey` / `serviceToken` / STS credentials / billing URLs into the config repo.
-- For multi-node deployments you must use `storage.backend=cos` and explicitly set `injection.externalGatewayUrl`, otherwise each instance caches independently and causes upstream KV-cache misses.
+- For multi-node deployments use a shared `storage.backend=cos`; Native Tool state separately requires the configured shared ClickHouse table.
 - Do not commit generated data, local databases, logs or env files (`logs/`, `*.db`, `.env`, `dump.rdb`, `session*.json`, `*.pid`, ...).
 
 ## License

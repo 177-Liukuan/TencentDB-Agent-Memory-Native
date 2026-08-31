@@ -56,6 +56,7 @@ export { HookRegistryImpl } from "./registry.js";
 
 // Pipeline
 export { InjectionPipeline } from "./pipeline.js";
+export { CriticalInjectionHookError } from "./pipeline.js";
 
 // Observer (injection pipeline observability)
 export type { InjectionObserver, HookResult } from "./observer.js";
@@ -72,11 +73,8 @@ export { AnthropicAdapter } from "./adapters/anthropic.js";
 
 // Injectors
 export { SkillInjector } from "./injectors/skill-injector.js";
-export { SkillToolsInjector } from "./injectors/skill-tools-injector.js";
 export { TdaiL1RecallInjector } from "./injectors/tdai-l1-recall-injector.js";
 export { TdaiProfileMemoryInjector } from "./injectors/tdai-profile-memory-injector.js";
-export { TdaiToolsInjector } from "./injectors/tdai-tools-injector.js";
-export { KnowledgeToolsInjector } from "./injectors/knowledge-tools-injector.js";
 export { AssetReflectionInjector, renderAssetReflectionBlock } from "./injectors/asset-reflection-injector.js";
 
 // CodeBuddy
@@ -100,18 +98,16 @@ export {
 
 // ── Pipeline Factory ──────────────────────────────────────────────────────────
 
-import os from "os";
 import type { ProxyConfig } from "../types.js";
 import { InjectionPipeline } from "./pipeline.js";
 import { HookRegistryImpl } from "./registry.js";
 import { OpenAIAdapter } from "./adapters/openai.js";
 import { AnthropicAdapter } from "./adapters/anthropic.js";
 import { SkillInjector } from "./injectors/skill-injector.js";
-import { SkillToolsInjector } from "./injectors/skill-tools-injector.js";
 import { TdaiProfileMemoryInjector } from "./injectors/tdai-profile-memory-injector.js";
-import { TdaiToolsInjector } from "./injectors/tdai-tools-injector.js";
-import { KnowledgeToolsInjector } from "./injectors/knowledge-tools-injector.js";
 import { AssetReflectionInjector } from "./injectors/asset-reflection-injector.js";
+import { NativeProxyToolsInjector } from "../native-proxy-tools/native-proxy-tools-injector.js";
+import { getNativeProxyToolRuntime } from "../native-proxy-tools/runtime.js";
 import type { ProtocolAdapter } from "./adapters/interface.js";
 import type { AgentProfile } from "./agents/interface.js";
 import { CodeBuddyProfile } from "./agents/codebuddy/profile.js";
@@ -217,49 +213,17 @@ function buildPipelineBundle(config: ProxyConfig): PipelineBundle {
   // (`coreSkill`, `tdai`, ...); there is no shared external endpoint anymore.
   const injectors = config.injection?.injectors ?? [];
 
-  // proxyBaseUrl 在 skill-tools-injector 和 tdai-tools-injector 之间共享。
-  //
-  // ⚠️ 多节点部署必须显式配 `injection.externalGatewayUrl`（gateway 对外域名，
-  // 例如 https://gateway.example.com）—— 否则每个 pod 会把
-  // 自己的 host:port 嵌进 `<skill_tools>` / `<tdai_memory_tools>` 文本，
-  // pods 互相覆盖 hook cache，同时上游 KV cache 每次 miss。
-  //
-  // 未配时 fallback 到本机 host:port（仅单节点 / 本地开发场景可用），启动时 warn 一次。
-  let proxyBaseUrl: string | undefined;
-  if (injectors.includes("skill") || (injectors.includes("tdai-memory") && config.tdai.enabled)) {
-    const externalBase = config.injection?.externalGatewayUrl;
-    if (externalBase && externalBase.length > 0) {
-      proxyBaseUrl = externalBase.replace(/\/$/, "");
-      console.log(`[injection] proxyBaseUrl (from injection.externalGatewayUrl) = ${proxyBaseUrl}`);
-    } else {
-      let hostIp = config.server.host;
-      // A wildcard listener needs a concrete address in the generated curl
-      // recipes. An explicit loopback listener must stay loopback: replacing
-      // 127.0.0.1 with a NIC address produces a URL the listener cannot serve.
-      if (hostIp === "0.0.0.0") {
-        const interfaces = os.networkInterfaces();
-        let foundIp = "";
-        for (const name of Object.keys(interfaces)) {
-          const iface = interfaces[name];
-          if (!iface) continue;
-          for (const entry of iface) {
-            if (entry.family === "IPv4" && !entry.internal) {
-              foundIp = entry.address;
-              break;
-            }
-          }
-          if (foundIp) break;
-        }
-        hostIp = foundIp || "127.0.0.1";
-      }
-      proxyBaseUrl = `http://${hostIp}:${config.server.port}`;
-      console.warn(
-        `[injection] injection.externalGatewayUrl not set — falling back to ` +
-        `${proxyBaseUrl}. This causes hook cache thrashing + upstream KV-cache misses ` +
-        `in multi-node deployments; set injection.externalGatewayUrl to the shared ` +
-        `gateway domain (e.g. https://gateway.example.com).`,
-      );
-    }
+  if (config.nativeProxyTools.enabled) {
+    registry.register(new NativeProxyToolsInjector({
+      enabled: true,
+      registry: getNativeProxyToolRuntime(config).registry,
+      memoryEnabled: config.tdai.enabled && config.tdai.memory.enabled,
+      // Native Skill capability is independent from legacy Skill RAG prompt
+      // injection; the Bridge is available whenever its trusted service token
+      // is configured.
+      skillEnabled: config.coreSkill.serviceToken.length > 0,
+      allowSkillWrite: config.skillRuntime?.allowLlmWrite ?? false,
+    }));
   }
 
   if (injectors.includes("skill")) {
@@ -269,24 +233,11 @@ function buildPipelineBundle(config: ProxyConfig): PipelineBundle {
     registry.register(
       new SkillInjector({ coreSkill: config.coreSkill }),
     );
-
-    // Always inject the curl-recipe `<skill_tools>` block alongside the
-    // dynamic `<cloud_skills>` block. Even when there are no skills to
-    // recommend, the LLM still needs to know how to create / search them.
-    const allowLlmWrite = config.skillRuntime?.allowLlmWrite ?? false;
-    registry.register(new SkillToolsInjector({ proxyBaseUrl: proxyBaseUrl!, allowLlmWrite }));
   }
 
-  if (injectors.includes("knowledge")) {
-    // Knowledge tools injector — fetches team knowledge from kernel and
-    // renders <knowledge_tools> prompt block with two-step self-discovery flow.
-    // Independent `knowledge:` config (endpoint can diverge from skill).
-    if (shouldRegisterKnowledgeInjector(config)) {
-      registry.register(new KnowledgeToolsInjector({
-        coreSkill: config.knowledge,
-      }));
-    }
-  }
+  // The Phase 2/3 Native project deliberately has no model-facing Knowledge
+  // tool family. Keep the config for other host integrations, but do not emit
+  // a half-functional prompt block or curl recipe here.
 
   if (injectors.includes("tdai-memory") && config.tdai.enabled && config.tdai.memory.enabled && config.tdai.memory.inject) {
     // Base TdaiClient config. `TdaiProfileMemoryInjector` rebuilds a per-request
@@ -310,15 +261,9 @@ function buildPipelineBundle(config: ProxyConfig): PipelineBundle {
     if (config.tdai.memory.injectL2L3) {
       registry.register(new TdaiProfileMemoryInjector(tdaiBaseConfig, config.coreSkill));
     }
-    // 注意：L0/L1 不再每轮自动召回注入到 user prompt（会破坏 KV/prompt cache）。
-    // 改为只在 system prompt 暴露只读工具（见 TdaiToolsInjector），借助 system
-    // prompt cache 复用。L1 recall injector 已下线，recallL1 配置保留但不再注册。
-    // 配套 profile-memory-injector：L2 仅注入 path 索引；LLM 通过 Bash curl
-    // <proxy>/memory-bridge/v3/* 调用只读工具。proxy 自动注入身份。
-    // proxyBaseUrl 复用 skill-tools-injector 算出来的（同一 host:port）。
-    if (typeof proxyBaseUrl !== "undefined") {
-      registry.register(new TdaiToolsInjector({ proxyBaseUrl }));
-    }
+    // L0/L1 are not auto-recalled into the prompt. The only model-facing
+    // retrieval capability is the structured `tdai_memory_search` Native Tool
+    // registered above; no text/curl fallback is emitted.
   }
 
   // ── Asset Reflection (内部效果评估) ─────────────────────────────────────
@@ -329,17 +274,14 @@ function buildPipelineBundle(config: ProxyConfig): PipelineBundle {
   if (config.injection?.assetReflection?.markerOptIn) {
     const registeredIds = new Set(registry.getAll().map((h) => h.id));
     const activeAssetTags: string[] = [];
-    // Skill 家族：SkillInjector 出 <available_skills>，SkillToolsInjector 出 <skill_tools>；
-    // 两个 injector 一起启用（见上文 `if (injectors.includes("skill"))`），任一存在都算 skill 资产命中。
-    if (registeredIds.has("skill-injector") || registeredIds.has("skill-tools-injector")) {
-      activeAssetTags.push("skill_tools");
+    if (registeredIds.has("skill-injector")) {
       activeAssetTags.push("available_skills");
     }
-    if (registeredIds.has("tdai-memory-tools-injector")) {
-      activeAssetTags.push("tdai_memory_tools");
+    if (registeredIds.has("tdai-profile-memory-injector")) {
+      activeAssetTags.push("tdai_profile_memory");
     }
-    if (registeredIds.has("knowledge-tools-injector")) {
-      activeAssetTags.push("knowledge_tools");
+    if (registeredIds.has("native-proxy-tools-injector")) {
+      activeAssetTags.push("tdai_memory_search");
     }
     if (activeAssetTags.length > 0) {
       registry.register(new AssetReflectionInjector({ activeAssetTags }));
@@ -398,6 +340,7 @@ function getOrBuildBundle(config: ProxyConfig): PipelineBundle {
     tdai: config.tdai,
     coreSkill: config.coreSkill,
     knowledge: config.knowledge,
+    nativeProxyTools: config.nativeProxyTools,
     server: config.server,
   });
   if (cachedBundle && cachedConfigHash === configHash) {
@@ -442,21 +385,6 @@ export async function prewarmFromConfig(
     );
     return { cachedHookIds: [], skipped: [], durationMs: 0 };
   }
-}
-
-/**
- * Pure predicate: should the knowledge-tools injector be registered?
- * Exposed for unit tests (registry itself is not publicly introspectable).
- *
- * Conditions (all must hold):
- *   1. `injection.injectors` includes "knowledge"
- *   2. `knowledge.enabled` is true
- *   3. `knowledge.serviceToken` is non-empty
- */
-export function shouldRegisterKnowledgeInjector(config: ProxyConfig): boolean {
-  return config.injection.injectors.includes("knowledge")
-    && config.knowledge.enabled
-    && !!config.knowledge.serviceToken;
 }
 
 /** Test-only: drop the cached pipeline so the next call rebuilds from config. */
