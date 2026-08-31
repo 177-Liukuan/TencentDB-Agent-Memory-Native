@@ -9,6 +9,8 @@
  */
 
 import type { ProtocolAdapter } from "./interface.js";
+import type { NativeProxyToolRegistry } from "../../native-proxy-tools/tool-registry.js";
+import { AnthropicStreamParser } from "./anthropic-stream.js";
 import type {
   AgentContext,
   AgentContextMetadata,
@@ -19,6 +21,10 @@ import type {
 
 export class AnthropicAdapter implements ProtocolAdapter {
   readonly protocol = "anthropic" as const;
+
+  createStreamParser(registry: NativeProxyToolRegistry): AnthropicStreamParser {
+    return new AnthropicStreamParser(registry);
+  }
 
   parse(body: Record<string, unknown>, metadata: AgentContextMetadata): AgentContext {
     const messages: ContextMessage[] = [];
