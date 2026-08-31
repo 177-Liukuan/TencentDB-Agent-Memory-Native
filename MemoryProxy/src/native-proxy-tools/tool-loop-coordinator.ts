@@ -1,10 +1,4 @@
-import { Buffer } from "node:buffer";
-import { randomUUID } from "node:crypto";
-
-import {
-  isReplaySafeResponseHeader,
-  type ToolExecutionStorageAdapter,
-} from "../db/tool-execution-storage-adapter.js";
+import type { ToolExecutionStorageAdapter } from "../db/tool-execution-storage-adapter.js";
 import {
   AnthropicStreamParser,
   type AnthropicStreamSnapshot,
@@ -23,17 +17,18 @@ import {
 } from "./anthropic-response-rebuilder.js";
 import type { NativeProxyToolDispatcher } from "./native-proxy-tool-dispatcher.js";
 import type { NativeProxyToolRegistry } from "./tool-registry.js";
-import { nativeToolLeaseDurationMs } from "./types.js";
+import {
+  persistToolLoopResponse,
+  ToolLoopCoreFailure,
+  ToolLoopExecutionCore,
+} from "./tool-loop-execution-core.js";
 import type {
   JsonValue,
   NativeProxyToolsConfig,
-  NativeToolResult,
   NativeToolLeakMarker,
   ToolCallSlot,
-  ToolExecutionContext,
   ToolExecutionScope,
   ToolExecutionStateKey,
-  PersistedResponseSnapshot,
   UpstreamRequestSnapshot,
 } from "./types.js";
 
@@ -108,13 +103,13 @@ export interface AnthropicToolLoopCoordinatorOptions {
   }): Promise<void>;
 }
 
-class CoordinatorFailure extends Error {
+class CoordinatorFailure extends ToolLoopCoreFailure {
   constructor(
-    readonly code: string,
+    code: string,
     message: string,
-    readonly status: number,
+    status: number,
   ) {
-    super(message);
+    super(code, message, status);
     this.name = "CoordinatorFailure";
   }
 }
@@ -134,20 +129,6 @@ function assertSafeClientDispatch(
   }
 }
 
-function slotsFromSnapshot(snapshot: AnthropicStreamSnapshot): ToolCallSlot[] {
-  return snapshot.toolCalls.map((call) => ({
-    callId: call.callId,
-    slotIndex: call.slotIndex,
-    contentBlockIndex: call.contentBlockIndex,
-    toolName: call.toolName,
-    owner: call.owner,
-    ...(call.input !== undefined ? { input: structuredClone(call.input) } : {}),
-    argumentsComplete: call.argumentsComplete,
-    status: "pending",
-    executionAttempt: 0,
-  }));
-}
-
 function skeletonFromSnapshot(snapshot: AnthropicStreamSnapshot): JsonValue[] {
   return [...snapshot.blocks]
     .filter((entry) => entry.completed)
@@ -164,34 +145,6 @@ function asAssistantMessage(skeleton: readonly JsonValue[]): JsonValue {
 
 function asToolResultMessage(slots: readonly ToolCallSlot[]): JsonValue {
   return buildToolResultMessage(slots) as unknown as JsonValue;
-}
-
-function genericExecutionError(): NativeToolResult {
-  return {
-    isError: true,
-    value: {
-      code: "native_tool_execution_failed",
-      message: "Native Proxy Tool execution failed",
-      retryable: true,
-    },
-  };
-}
-
-function persistResponseSnapshot(
-  bytes: Uint8Array,
-  status: number,
-  sourceHeaders: Headers,
-): PersistedResponseSnapshot {
-  const headers: Record<string, string> = {};
-  for (const [rawName, value] of sourceHeaders.entries()) {
-    const name = rawName.toLowerCase();
-    if (isReplaySafeResponseHeader(name)) headers[name] = value;
-  }
-  return {
-    status,
-    headers,
-    bodyBase64: Buffer.from(bytes).toString("base64"),
-  };
 }
 
 function appendBytes(left: Uint8Array, right: Uint8Array): Uint8Array {
@@ -255,14 +208,10 @@ async function drainStream(stream: ReadableStream<Uint8Array>): Promise<void> {
 }
 
 export class AnthropicToolLoopCoordinator {
-  private readonly now: () => Date;
-  private readonly createId: () => string;
-  private readonly maxStorageAttempts: number;
+  private readonly core: ToolLoopExecutionCore;
 
   constructor(private readonly options: AnthropicToolLoopCoordinatorOptions) {
-    this.now = options.now ?? (() => new Date());
-    this.createId = options.createId ?? randomUUID;
-    this.maxStorageAttempts = options.maxStorageAttempts ?? 8;
+    this.core = new ToolLoopExecutionCore(options);
   }
 
   async handleRound(input: ToolLoopRoundInput): Promise<ToolLoopDecision> {
@@ -284,9 +233,9 @@ export class AnthropicToolLoopCoordinator {
       );
     }
     if (decision.kind === "final" && decision.observationStateKey) {
-      const prepared = await this.prepareObservation(
+      const prepared = await this.core.prepareObservation(
         decision.observationStateKey,
-        persistResponseSnapshot(decision.bytes, decision.status, decision.headers),
+        persistToolLoopResponse(decision.bytes, decision.status, decision.headers),
       ).catch(() => false);
       if (!prepared) {
         return this.errorDecision(
@@ -338,14 +287,14 @@ export class AnthropicToolLoopCoordinator {
     let messageCompleted = false;
     let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
 
-    const fail = async (failure: CoordinatorFailure): Promise<ToolLoopDecision> => {
-      if (stateKey) await this.markAborted(stateKey);
+    const fail = async (failure: ToolLoopCoreFailure): Promise<ToolLoopDecision> => {
+      if (stateKey) await this.core.markAborted(stateKey);
       return this.errorDecision(failure, input, parser.snapshot());
     };
 
     const scheduleExecution = (call: UnifiedToolCall): void => {
       if (executionTasks.has(call.callId)) return;
-      const persistOperation = () => this.executeAndPersist(call, input.scope, stateKey!);
+      const persistOperation = () => this.core.executeAndPersist(call, input.scope, stateKey!);
       const task = (this.options.trackBackgroundOperation
         ? this.options.trackBackgroundOperation(persistOperation)
         : persistOperation()).catch(() => {});
@@ -393,7 +342,11 @@ export class AnthropicToolLoopCoordinator {
             if (event.type === "tool_call_completed" && event.call.owner === "proxy") {
               const currentSnapshot = parser.snapshot();
               const nativeCalls = currentSnapshot.toolCalls.filter((call) => call.owner === "proxy");
-              const limitFailure = this.checkLimits(input, nativeCalls.length);
+              const limitFailure = this.core.limitFailure({
+                round: input.round,
+                totalCalls: input.totalCalls,
+                callsThisRound: nativeCalls.length,
+              });
               if (limitFailure) {
                 await reader.cancel().catch(() => {});
                 return fail(limitFailure);
@@ -464,11 +417,11 @@ export class AnthropicToolLoopCoordinator {
             ...(input.upstreamSnapshot.nativeLeakMarkers ?? []),
             ...buildNativeRegistryLeakMarkers(this.options.registry),
           ]);
-          const pending = await this.transitionClientDispatch(
+          const pending = await this.core.transitionClientDispatch(
             stateKey,
             "none",
             "pending",
-            persistResponseSnapshot(bytes, input.status, headers),
+            persistToolLoopResponse(bytes, input.status, headers),
           );
           if (pending) {
             await this.options.onClientDispatchPrepared?.({
@@ -479,7 +432,7 @@ export class AnthropicToolLoopCoordinator {
             });
           }
           const dispatched = pending
-            && await this.transitionClientDispatch(stateKey, "pending", "dispatched");
+            && await this.core.transitionClientDispatch(stateKey, "pending", "dispatched");
           if (!dispatched) {
             return fail(new CoordinatorFailure(
               "client_tool_dispatch_conflict",
@@ -529,11 +482,11 @@ export class AnthropicToolLoopCoordinator {
           ...nativeCalls,
           ...buildNativeRegistryLeakMarkers(this.options.registry),
         ]);
-        const pending = await this.transitionClientDispatch(
+        const pending = await this.core.transitionClientDispatch(
           stateKey,
           "none",
           "pending",
-          persistResponseSnapshot(bytes, input.status, headers),
+          persistToolLoopResponse(bytes, input.status, headers),
         );
         if (pending) {
           await this.options.onClientDispatchPrepared?.({
@@ -544,7 +497,7 @@ export class AnthropicToolLoopCoordinator {
           });
         }
         const dispatched = pending
-          && await this.transitionClientDispatch(stateKey, "pending", "dispatched");
+          && await this.core.transitionClientDispatch(stateKey, "pending", "dispatched");
         if (!dispatched) {
           return fail(new CoordinatorFailure(
             "client_tool_dispatch_conflict",
@@ -626,7 +579,7 @@ export class AnthropicToolLoopCoordinator {
         : nextDecision;
       return this.prependRound(snapshot, observableDecision);
     } catch (error) {
-      const failure = error instanceof CoordinatorFailure
+      const failure = error instanceof ToolLoopCoreFailure
         ? error
         : new CoordinatorFailure(
             "native_tool_state_unavailable",
@@ -639,60 +592,27 @@ export class AnthropicToolLoopCoordinator {
     }
   }
 
-  private checkLimits(
-    input: ToolLoopRoundInput,
-    callsThisRound: number,
-  ): CoordinatorFailure | null {
-    if (
-      input.round > this.options.limits.maxRounds
-      || callsThisRound > this.options.limits.maxCallsPerRound
-      || input.totalCalls + callsThisRound > this.options.limits.maxTotalCalls
-    ) {
-      return new CoordinatorFailure(
-        "native_tool_limit_exceeded",
-        "Native Proxy Tool loop limit exceeded",
-        400,
-      );
-    }
-    return null;
-  }
-
   private async createBatch(
     input: ToolLoopRoundInput,
     snapshot: AnthropicStreamSnapshot,
   ): Promise<ToolExecutionStateKey> {
-    const timestamp = this.now();
-    const nativeCount = snapshot.toolCalls.filter((call) => call.owner === "proxy").length;
-    const key: ToolExecutionStateKey = {
-      ...input.scope,
-      toolBatchId: this.createId(),
-    };
-    const context: ToolExecutionContext = {
-      key,
-      turnSeq: input.turnSeq,
+    return this.core.createBatch({
       protocol: "anthropic",
+      scope: input.scope,
+      turnSeq: input.turnSeq,
+      upstreamSnapshot: input.upstreamSnapshot,
       round: input.round,
-      totalCalls: input.totalCalls + nativeCount,
+      totalCalls: input.totalCalls,
+      calls: snapshot.toolCalls,
       assistantSkeleton: skeletonFromSnapshot(snapshot),
-      slots: slotsFromSnapshot(snapshot),
       responseStreamStatus: "streaming",
-      clientDispatchStatus: "none",
       ...(input.parentStateKey && input.parentReentryAttempt !== undefined
         ? {
-            parentStateKey: structuredClone(input.parentStateKey),
+            parentStateKey: input.parentStateKey,
             parentReentryAttempt: input.parentReentryAttempt,
           }
         : {}),
-      upstreamSnapshot: structuredClone(input.upstreamSnapshot),
-      revision: 0,
-      expiresAt: new Date(
-        timestamp.getTime() + this.options.limits.stateTtlSeconds * 1_000,
-      ).toISOString(),
-      createdAt: timestamp.toISOString(),
-      updatedAt: timestamp.toISOString(),
-    };
-    await this.options.storage.create(context);
-    return key;
+    });
   }
 
   private async persistSnapshot(
@@ -701,141 +621,17 @@ export class AnthropicToolLoopCoordinator {
     responseStreamStatus: "streaming" | "completed",
     totalCalls: number,
   ): Promise<void> {
-    for (let attempt = 0; attempt < this.maxStorageAttempts; attempt++) {
-      const current = await this.options.storage.get(key);
-      if (!current) throw new CoordinatorFailure(
-        "native_tool_state_unavailable",
-        "Native Proxy Tool state expired or disappeared",
-        503,
-      );
-      if (current.responseStreamStatus === "aborted") {
-        throw new CoordinatorFailure(
-          "native_tool_state_aborted",
-          "Native Proxy Tool batch was aborted",
-          409,
-        );
-      }
-      const updated = await this.options.storage.compareAndSetStreamSnapshot({
-        key,
-        expectedRevision: current.revision,
-        assistantSkeleton: skeletonFromSnapshot(snapshot),
-        slots: slotsFromSnapshot(snapshot),
-        responseStreamStatus,
-        totalCalls,
-      });
-      if (updated) return;
-    }
-    throw new CoordinatorFailure(
-      "native_tool_state_conflict",
-      "Native Proxy Tool state could not be updated",
-      503,
-    );
-  }
-
-  private async executeAndPersist(
-    call: UnifiedToolCall,
-    scope: ToolExecutionScope,
-    key: ToolExecutionStateKey,
-  ): Promise<void> {
-    const leaseOwner = `native-tool-worker-${this.createId()}`;
-    const leaseUntil = new Date(
-      this.now().getTime() + nativeToolLeaseDurationMs(this.options.limits.toolTimeoutMs),
-    ).toISOString();
-    let claimed = false;
-    for (let attempt = 0; attempt < this.maxStorageAttempts; attempt++) {
-      const current = await this.options.storage.get(key);
-      if (!current) return;
-      const slot = current.slots.find((candidate) => candidate.callId === call.callId);
-      if (!slot || slot.status === "succeeded" || slot.status === "failed") return;
-      if (slot.status === "running") return;
-      claimed = await this.options.storage.tryClaimSlotExecution({
-        key,
-        callId: call.callId,
-        expectedRevision: current.revision,
-        leaseOwner,
-        leaseUntil,
-      });
-      if (claimed) break;
-    }
-    if (!claimed) return;
-
-    let result: NativeToolResult;
-    try {
-      result = await this.options.dispatcher.execute(call, scope);
-    } catch {
-      result = genericExecutionError();
-    }
-    for (let attempt = 0; attempt < this.maxStorageAttempts; attempt++) {
-      const current = await this.options.storage.get(key);
-      if (!current) return;
-      const slot = current.slots.find((candidate) => candidate.callId === call.callId);
-      if (!slot || slot.status === "succeeded" || slot.status === "failed") return;
-      if (slot.executionLeaseOwner !== leaseOwner) return;
-      const saved = await this.options.storage.compareAndSetSlotResult({
-        key,
-        callId: call.callId,
-        expectedRevision: current.revision,
-        leaseOwner,
-        result: result.value,
-        isError: result.isError,
-      });
-      if (saved) return;
-    }
-  }
-
-  private async transitionClientDispatch(
-    key: ToolExecutionStateKey,
-    expectedStatus: ToolExecutionContext["clientDispatchStatus"],
-    nextStatus: ToolExecutionContext["clientDispatchStatus"],
-    dispatchOutcome?: PersistedResponseSnapshot,
-  ): Promise<boolean> {
-    for (let attempt = 0; attempt < this.maxStorageAttempts; attempt++) {
-      const current = await this.options.storage.get(key);
-      if (!current) return false;
-      if (current.clientDispatchStatus === nextStatus) return false;
-      if (current.clientDispatchStatus !== expectedStatus) return false;
-      if (await this.options.storage.compareAndSetClientDispatchStatus({
-        key,
-        expectedRevision: current.revision,
-        expectedStatus,
-        nextStatus,
-        ...(dispatchOutcome ? { dispatchOutcome } : {}),
-      })) return true;
-    }
-    return false;
-  }
-
-  private async prepareObservation(
-    key: ToolExecutionStateKey,
-    outcome: PersistedResponseSnapshot,
-  ): Promise<boolean> {
-    for (let attempt = 0; attempt < this.maxStorageAttempts; attempt++) {
-      const current = await this.options.storage.get(key);
-      if (!current) return false;
-      if (current.observationStatus === "pending") {
-        return JSON.stringify(current.observationOutcome) === JSON.stringify(outcome);
-      }
-      if (current.observationStatus && current.observationStatus !== "none") return false;
-      if (await this.options.storage.prepareObservation({
-        key,
-        expectedRevision: current.revision,
-        outcome,
-      })) return true;
-    }
-    return false;
-  }
-
-  private async markAborted(key: ToolExecutionStateKey): Promise<void> {
-    for (let attempt = 0; attempt < this.maxStorageAttempts; attempt++) {
-      const current = await this.options.storage.get(key).catch(() => null);
-      if (!current || current.responseStreamStatus === "aborted") return;
-      if (current.responseStreamStatus !== "streaming") return;
-      if (await this.options.storage.markAborted(key, current.revision).catch(() => false)) return;
-    }
+    await this.core.persistStreamSnapshot({
+      key,
+      assistantSkeleton: skeletonFromSnapshot(snapshot),
+      calls: snapshot.toolCalls,
+      responseStreamStatus,
+      totalCalls,
+    });
   }
 
   private errorDecision(
-    failure: CoordinatorFailure,
+    failure: ToolLoopCoreFailure,
     input: ToolLoopRoundInput,
     snapshot: AnthropicStreamSnapshot,
   ): ToolLoopDecision {
