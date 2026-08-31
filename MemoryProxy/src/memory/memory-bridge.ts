@@ -52,7 +52,7 @@ const ALLOWED_SUBPATHS = new Set<string>([
   "scenario/read",        // L2 按 path 读全文
 ]);
 
-interface SessionIdFields {
+export interface MemoryBridgeSessionIdentity {
   user_id: string;
   team_id: string;
   agent_id: string;
@@ -73,6 +73,8 @@ interface SessionIdFields {
    */
   composite_key?: string;
 }
+
+type SessionIdFields = MemoryBridgeSessionIdentity;
 
 /**
  * curl 模板固定 2 header:
@@ -135,14 +137,17 @@ function bindingToIdFields(
  * L1 fast path — try in-memory Map with prefix fallback.
  * Returns null on miss (caller decides whether to probe L2).
  */
-function loadSessionIdsL1(sessionId: string): SessionIdFields | null {
+function loadSessionIdsL1(
+  sessionId: string,
+  store = getSessionStore(),
+): SessionIdFields | null {
   // handler 层存的 L1 key 形如 `${agentSource}:${sessionId}`; curl 拿到的
   // 通常是 bare sessionId。按候选前缀顺序探,命中即返回。
   const candidates = sessionId.includes(":")
     ? [sessionId]
     : [sessionId, `codebuddy:${sessionId}`, `claude-code:${sessionId}`];
   for (const k of candidates) {
-    const state = getSessionStore().get(k);
+    const state = store.get(k);
     if (state) {
       const fields = toIdFields(state, k);
       if (fields) return fields;
@@ -245,17 +250,260 @@ function limitFromBody(body: Record<string, unknown>, fallback = 5): number {
 export interface MemoryBridgeDeps {
   fetcher?: typeof fetch;
   now?: () => number;
+  loadSessionIdentity?: (input: {
+    config: ProxyConfig;
+    sessionId: string;
+    spaceId: string;
+  }) => Promise<MemoryBridgeSessionIdentity | null>;
+  resolveMemoryContexts?: (
+    config: ProxyConfig,
+    identity: MemoryBridgeSessionIdentity,
+    sessionKey: string,
+  ) => Promise<FixedAssetCtx[]>;
+  emitTelemetry?: typeof emitBridgeToolCallTelemetry;
+}
+
+export interface MemoryBridgeExecutionInput {
+  config: ProxyConfig;
+  subpath: string;
+  body: Record<string, unknown>;
+  sessionId: string;
+  spaceId?: string;
+  signal?: AbortSignal;
+}
+
+export interface MemoryBridgeExecutionResult {
+  status: number;
+  text: string;
+  contentType: string;
+}
+
+function executionEnvelope(
+  code: number,
+  message: string,
+  httpStatus: number,
+  now: () => number,
+): MemoryBridgeExecutionResult {
+  return {
+    status: httpStatus,
+    contentType: "application/json",
+    text: JSON.stringify({ code, message, request_id: `mem-bridge-${now()}` }),
+  };
+}
+
+async function loadDefaultSessionIdentity(input: {
+  config: ProxyConfig;
+  sessionId: string;
+  spaceId: string;
+}): Promise<MemoryBridgeSessionIdentity | null> {
+  const store = getSessionStore();
+  let ids = loadSessionIdsL1(input.sessionId, store);
+  const bindingRepo = store.getBindingRepo() ?? null;
+  if (!ids && bindingRepo && input.spaceId) {
+    console.log(`${TAG} session=${input.sessionId} L1 miss → L2 binding lookup (space=${input.spaceId})`);
+    ids = await loadSessionIdsL2(bindingRepo, input.spaceId, input.sessionId);
+  }
+  return ids;
+}
+
+/**
+ * Protocol-independent read-only Memory Bridge executor. Both the Hono route
+ * and Native Proxy Tool dispatcher enter through this boundary so identity,
+ * authorization, imported-agent fan-out, response mapping, and telemetry stay
+ * identical without a localhost HTTP round trip.
+ */
+export async function executeMemoryBridge(
+  input: MemoryBridgeExecutionInput,
+  deps: MemoryBridgeDeps = {},
+): Promise<MemoryBridgeExecutionResult> {
+  const now = deps.now ?? Date.now;
+  const t0 = now();
+  const sub = input.subpath.replace(/^\/+|\/+$/g, "");
+  if (!ALLOWED_SUBPATHS.has(sub)) {
+    return executionEnvelope(
+      40301,
+      `${TAG} subpath '${sub}' not allowed via bridge`,
+      403,
+      now,
+    );
+  }
+
+  const spaceId = input.spaceId
+    ?? input.config.tdai?.serviceId
+    ?? input.config.coreSkill?.serviceId
+    ?? "";
+  const loadIdentity = deps.loadSessionIdentity ?? loadDefaultSessionIdentity;
+  const ids = await loadIdentity({
+    config: input.config,
+    sessionId: input.sessionId,
+    spaceId,
+  });
+  if (!ids) {
+    return executionEnvelope(
+      40101,
+      `${TAG} session not initialized; cannot derive identity`,
+      401,
+      now,
+    );
+  }
+
+  const inboundBody = input.body;
+  const modelSessionId =
+    typeof inboundBody.session_id === "string" && inboundBody.session_id.trim()
+      ? inboundBody.session_id.trim()
+      : undefined;
+  const modelTaskId =
+    typeof inboundBody.task_id === "string" && inboundBody.task_id.trim()
+      ? inboundBody.task_id.trim()
+      : undefined;
+
+  const upstreamUrl = `${input.config.coreSkill.endpoint.replace(/\/$/, "")}/v3/${sub}`;
+  const upstreamToken =
+    input.config.tdai?.apiKey || input.config.coreSkill.serviceToken || "local-proxy";
+  const upstreamServiceId =
+    ids.space_id || input.config.tdai?.serviceId || input.config.coreSkill.serviceId;
+  const headers: Record<string, string> = {
+    "Authorization": `Bearer ${upstreamToken}`,
+    "x-tdai-service-id": upstreamServiceId,
+    "Content-Type": "application/json",
+  };
+
+  const resolveContexts = deps.resolveMemoryContexts ?? resolveMemoryCtxs;
+  const ctxs = await resolveContexts(input.config, ids, input.sessionId);
+  const effectiveTaskId = modelTaskId ?? ids.task_id;
+  const makeOutbound = (target: FixedAssetCtx): Record<string, unknown> => ({
+    ...inboundBody,
+    user_id: target.userId,
+    team_id: target.teamId,
+    agent_id: target.agentId,
+    ...(modelSessionId ? { session_id: modelSessionId } : {}),
+    ...(effectiveTaskId ? { task_id: effectiveTaskId } : {}),
+  });
+  const fetcher = deps.fetcher ?? globalThis.fetch.bind(globalThis);
+  const emitTelemetry = deps.emitTelemetry ?? emitBridgeToolCallTelemetry;
+
+  const callUpstream = async (
+    target: FixedAssetCtx,
+  ): Promise<{ status: number; text: string; contentType: string }> => {
+    const outboundBody = JSON.stringify(makeOutbound(target));
+    const callStart = now();
+    let status = 0;
+    let text = "";
+    let contentType = "application/json";
+    try {
+      const resp = await fetcher(upstreamUrl, {
+        method: "POST",
+        headers,
+        body: outboundBody,
+        signal: input.signal
+          ?? AbortSignal.timeout(Math.max(5_000, input.config.coreSkill.timeoutMs * 4)),
+      });
+      status = resp.status;
+      text = await resp.text().catch(() => "");
+      contentType = resp.headers.get("content-type") ?? "application/json";
+      return { status, text, contentType };
+    } finally {
+      const emitKey = ids.composite_key ?? input.sessionId;
+      emitTelemetry({
+        sessionKey: emitKey,
+        spaceId: ids.space_id,
+        userId: target.userId,
+        teamId: target.teamId,
+        agentId: target.agentId,
+        agentSource: agentSourceFromSessionKey(emitKey),
+        bridgeSource: "memory-bridge",
+        executedEndpoint: sub,
+        requestBody: outboundBody.slice(0, 512),
+        upstreamStatus: status,
+        elapsedMs: now() - callStart,
+      });
+    }
+  };
+
+  if (MULTI_SEARCH_SUBPATHS.has(sub) && typeof inboundBody.agent_id !== "string") {
+    const limit = limitFromBody(inboundBody);
+    const isConversationSearch = sub === "conversation/search";
+    const resultKey: "items" | "messages" = isConversationSearch ? "messages" : "items";
+    const settled = await Promise.allSettled(
+      ctxs.map(async (target) => ({ target, ...(await callUpstream(target)) })),
+    );
+    const collected: Record<string, unknown>[] = [];
+    let okCount = 0;
+    for (const result of settled) {
+      if (
+        result.status !== "fulfilled"
+        || result.value.status < 200
+        || result.value.status >= 300
+      ) continue;
+      okCount++;
+      try {
+        const env = JSON.parse(result.value.text) as {
+          data?: { items?: unknown[]; messages?: unknown[] };
+        };
+        const rows = (isConversationSearch ? env.data?.messages : env.data?.items) ?? [];
+        for (const item of rows) {
+          if (!item || typeof item !== "object") continue;
+          collected.push({
+            ...(item as Record<string, unknown>),
+            source_agent_id: result.value.target.agentId,
+            source_agent_name: result.value.target.agentName,
+            source_agent_role: result.value.target.isSelf ? "self" : "imported_from",
+          });
+        }
+      } catch {
+        // A malformed response from one imported source does not discard the
+        // other independently authorized search results.
+      }
+    }
+    collected.sort(
+      (a, b) => (typeof b.score === "number" ? b.score : 0)
+        - (typeof a.score === "number" ? a.score : 0),
+    );
+    console.log(
+      `${TAG} sub=${sub} multi targets=${ctxs.length} ok=${okCount} ${resultKey}=${collected.length} elapsed=${now() - t0}ms`,
+    );
+    const searchedAgents = ctxs.map((ctx) => ({
+      agent_id: ctx.agentId,
+      name: ctx.agentName,
+      role: ctx.isSelf ? "self" : "imported_from",
+    }));
+    const responseData: Record<string, unknown> = isConversationSearch
+      ? { messages: collected.slice(0, limit), searched_agents: searchedAgents }
+      : { items: collected.slice(0, limit), searched_agents: searchedAgents };
+    return {
+      status: 200,
+      contentType: "application/json",
+      text: JSON.stringify({
+        code: 0,
+        message: "ok",
+        request_id: `mem-bridge-${now()}`,
+        data: responseData,
+      }),
+    };
+  }
+
+  let upstream: { status: number; text: string; contentType: string };
+  try {
+    upstream = await callUpstream(selectTargetCtx(ctxs, inboundBody.agent_id));
+  } catch (err) {
+    console.warn(`${TAG} upstream fetch failed sub=${sub} err=${(err as Error).message}`);
+    return executionEnvelope(
+      50301,
+      `${TAG} upstream unavailable: ${(err as Error).message}`,
+      502,
+      now,
+    );
+  }
+
+  console.log(`${TAG} sub=${sub} status=${upstream.status} elapsed=${now() - t0}ms`);
+  return upstream;
 }
 
 export function createMemoryBridgeHandler(
   config: ProxyConfig,
   deps: MemoryBridgeDeps = {},
 ): (c: Context) => Promise<Response> {
-  const fetcher = deps.fetcher ?? globalThis.fetch.bind(globalThis);
-
   return async (c: Context): Promise<Response> => {
-    const t0 = (deps.now ?? Date.now)();
-
     const path = new URL(c.req.url).pathname;
     const sub = extractSubpath(path);
     if (!sub) {
@@ -281,17 +529,6 @@ export function createMemoryBridgeHandler(
       ?? config.tdai?.serviceId
       ?? config.coreSkill?.serviceId
       ?? "";
-    const bindingRepo = getSessionStore().getBindingRepo() ?? null;
-
-    let ids = loadSessionIdsL1(sessionKey);
-    if (!ids && bindingRepo && spaceId) {
-      console.log(`${TAG} session=${sessionKey} L1 miss → L2 binding lookup (space=${spaceId})`);
-      ids = await loadSessionIdsL2(bindingRepo, spaceId, sessionKey);
-    }
-    if (!ids) {
-      return envelope(40101, `${TAG} session not initialized; cannot derive identity`, 401);
-    }
-
     let inboundBody: Record<string, unknown> = {};
     try {
       const raw = await c.req.text();
@@ -307,155 +544,17 @@ export function createMemoryBridgeHandler(
       return envelope(40001, `${TAG} invalid JSON body: ${(err as Error).message}`, 400);
     }
 
-    // 强制注入 session IdFields — LLM 不能伪造身份。
-    // search 类默认同时查 self + 借入 chat_memory；非 search 类默认 self，可通过 body.agent_id
-    // 选择 <tdai_profile_memory> 里暴露的 imported agent_id。
-    const modelSessionId =
-      typeof inboundBody.session_id === "string" && inboundBody.session_id.trim()
-        ? inboundBody.session_id.trim()
-        : undefined;
-    const modelTaskId =
-      typeof inboundBody.task_id === "string" && inboundBody.task_id.trim()
-        ? inboundBody.task_id.trim()
-        : undefined;
-
-    const upstreamUrl = `${config.coreSkill.endpoint.replace(/\/$/, "")}/v3/${sub}`;
-    const upstreamToken =
-      config.tdai?.apiKey || config.coreSkill.serviceToken || "local-proxy";
-    const upstreamServiceId =
-      ids.space_id || config.tdai?.serviceId || config.coreSkill.serviceId;
-    const headers: Record<string, string> = {
-      "Authorization": `Bearer ${upstreamToken}`,
-      "x-tdai-service-id": upstreamServiceId,
-      "Content-Type": "application/json",
-    };
-
-    const ctxs = await resolveMemoryCtxs(config, ids, sessionKey);
-    // task_id 优先级：caller 显式传 > session 注入。session_id 保持"仅 caller 显式传"，
-    // 因为 search 类希望默认跨 session（agent 维度）；task_id 属于身份维度，仍应强制。
-    const effectiveTaskId = modelTaskId ?? ids.task_id;
-    const makeOutbound = (target: FixedAssetCtx): Record<string, unknown> => ({
-      ...inboundBody,
-      user_id: target.userId,
-      team_id: target.teamId,
-      agent_id: target.agentId,
-      ...(modelSessionId ? { session_id: modelSessionId } : {}),
-      ...(effectiveTaskId ? { task_id: effectiveTaskId } : {}),
-    });
-
-    const callUpstream = async (target: FixedAssetCtx): Promise<{ status: number; text: string; contentType: string }> => {
-      const outboundBody = JSON.stringify(makeOutbound(target));
-      const callStart = (deps.now ?? Date.now)();
-      let status = 0;
-      let text = "";
-      let contentType = "application/json";
-      try {
-        const resp = await fetcher(upstreamUrl, {
-          method: "POST",
-          headers,
-          body: outboundBody,
-          signal: AbortSignal.timeout(Math.max(5000, config.coreSkill.timeoutMs * 4)),
-        });
-        status = resp.status;
-        text = await resp.text().catch(() => "");
-        contentType = resp.headers.get("content-type") ?? "application/json";
-        return { status, text, contentType };
-      } finally {
-        // 埋点：每次实际调用 upstream 都记一条（成功/失败都算，方案 §5.1）
-        // 优先用 loadSessionIdsL1 里真实命中的 compositeKey，跟 session_init_logs 对齐；
-        // 拿不到才回落 raw sessionKey（L1/L2 miss 路径不该走到这里，但保底）。
-        const emitKey = ids.composite_key ?? sessionKey;
-        emitBridgeToolCallTelemetry({
-          sessionKey: emitKey,
-          spaceId: ids.space_id,
-          userId: target.userId,
-          teamId: target.teamId,
-          agentId: target.agentId,
-          agentSource: agentSourceFromSessionKey(emitKey),
-          bridgeSource: "memory-bridge",
-          executedEndpoint: sub,
-          requestBody: outboundBody.slice(0, 512),
-          upstreamStatus: status,
-          elapsedMs: (deps.now ?? Date.now)() - callStart,
-        });
-      }
-    };
-
-    if (MULTI_SEARCH_SUBPATHS.has(sub) && typeof inboundBody.agent_id !== "string") {
-      const limit = limitFromBody(inboundBody);
-      // 两类 search 的响应 shape 不同：
-      //   - /v3/atomic/search       → data.items[]（L1 hit）
-      //   - /v3/conversation/search → data.messages[]（L0 hit）
-      // 早期代码固定读 data.items，导致 conversation/search 在 multi 分支
-      // 永远返回空（历史 bug）。这里按 sub 分派读写字段，保持透传语义。
-      const isConversationSearch = sub === "conversation/search";
-      const resultKey: "items" | "messages" = isConversationSearch ? "messages" : "items";
-      const settled = await Promise.allSettled(ctxs.map(async (target) => ({ target, ...(await callUpstream(target)) })));
-      const collected: Record<string, unknown>[] = [];
-      let okCount = 0;
-      for (const r of settled) {
-        if (r.status !== "fulfilled" || r.value.status < 200 || r.value.status >= 300) continue;
-        okCount++;
-        try {
-          const env = JSON.parse(r.value.text) as {
-            data?: { items?: unknown[]; messages?: unknown[] };
-          };
-          const rows = (isConversationSearch ? env.data?.messages : env.data?.items) ?? [];
-          for (const item of rows) {
-            if (!item || typeof item !== "object") continue;
-            collected.push({
-              ...(item as Record<string, unknown>),
-              source_agent_id: r.value.target.agentId,
-              source_agent_name: r.value.target.agentName,
-              source_agent_role: r.value.target.isSelf ? "self" : "imported_from",
-            });
-          }
-        } catch {
-          // ignore malformed upstream response from this target
-        }
-      }
-      collected.sort((a, b) => (typeof b.score === "number" ? b.score : 0) - (typeof a.score === "number" ? a.score : 0));
-      const elapsed = (deps.now ?? Date.now)() - t0;
-      console.log(`${TAG} sub=${sub} multi targets=${ctxs.length} ok=${okCount} ${resultKey}=${collected.length} elapsed=${elapsed}ms`);
-      const truncated = collected.slice(0, limit);
-      const searchedAgents = ctxs.map((x) => ({
-        agent_id: x.agentId,
-        name: x.agentName,
-        role: x.isSelf ? "self" : "imported_from",
-      }));
-      // 保持透传语义：返回字段名与上游一致（items vs messages）。
-      const responseData: Record<string, unknown> = isConversationSearch
-        ? { messages: truncated, searched_agents: searchedAgents }
-        : { items: truncated, searched_agents: searchedAgents };
-      return new Response(JSON.stringify({
-        code: 0,
-        message: "ok",
-        request_id: `mem-bridge-${Date.now()}`,
-        data: responseData,
-      }), {
-        status: 200,
-        headers: { "content-type": "application/json" },
-      });
-    }
-
-    let upstream;
-    try {
-      upstream = await callUpstream(selectTargetCtx(ctxs, inboundBody.agent_id));
-    } catch (err) {
-      console.warn(
-        `${TAG} upstream fetch failed sub=${sub} err=${(err as Error).message}`,
-      );
-      return envelope(50301, `${TAG} upstream unavailable: ${(err as Error).message}`, 502);
-    }
-
-    const respText = upstream.text;
-    const elapsed = (deps.now ?? Date.now)() - t0;
-    console.log(`${TAG} sub=${sub} status=${upstream.status} elapsed=${elapsed}ms`);
-
-    return new Response(respText, {
-      status: upstream.status,
+    const result = await executeMemoryBridge({
+      config,
+      subpath: sub,
+      body: inboundBody,
+      sessionId: sessionKey,
+      spaceId,
+    }, deps);
+    return new Response(result.text, {
+      status: result.status,
       headers: {
-        "content-type": upstream.contentType,
+        "content-type": result.contentType,
       },
     });
   };
