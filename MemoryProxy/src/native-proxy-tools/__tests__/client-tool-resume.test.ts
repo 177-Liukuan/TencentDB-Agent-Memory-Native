@@ -8,6 +8,7 @@ import type { UnifiedToolCall } from "../../injection/adapters/interface.js";
 import {
   completeClientToolReentry,
   createPersistedClientReentryOutcome,
+  extractClientToolResults,
   extractAnthropicClientToolResults,
   resumeClientToolResults,
   type ClientToolResumeInput,
@@ -221,6 +222,20 @@ async function eventually(
 }
 
 describe("extractAnthropicClientToolResults", () => {
+  it("extracts a contiguous OpenAI Tool Result suffix", () => {
+    expect(extractClientToolResults({
+      messages: [
+        { role: "user", content: "question" },
+        { role: "assistant", content: null, tool_calls: [] },
+        { role: "tool", tool_call_id: "c1", content: "first" },
+        { role: "tool", tool_call_id: "c2", content: { output: "second" } },
+      ],
+    })).toEqual([
+      { callId: "c1", content: "first", isError: false },
+      { callId: "c2", content: { output: "second" }, isError: false },
+    ]);
+  });
+
   it("preserves string and structured text-block result content", () => {
     expect(extractAnthropicClientToolResults(resultBody())).toEqual([
       {

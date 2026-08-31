@@ -116,7 +116,7 @@ export interface PersistedToolObservationIntent {
  * this persisted shape.
  */
 export interface UpstreamRequestSnapshot {
-  protocol: "anthropic";
+  protocol: "anthropic" | "openai";
   baseMessages: JsonValue[];
   /** Original client-visible history used only for ordinary telemetry/writeback. */
   logicalBaseMessages?: JsonValue[];
@@ -126,6 +126,8 @@ export interface UpstreamRequestSnapshot {
   requestFingerprint?: string;
   /** Original, allowlisted identity and enabled effects for durable writeback. */
   observationIntent?: PersistedToolObservationIntent;
+  /** Successful Context Compression checkpoint that covers this hidden batch. */
+  compressionCheckpoint?: { id: string; coveredAt: string };
   system?: JsonValue;
   tools?: JsonValue[];
   requestParameters: { [key: string]: JsonValue };
@@ -162,7 +164,7 @@ export interface PersistedReentryOutcome extends PersistedResponseSnapshot {
 export interface ToolExecutionContext {
   key: ToolExecutionStateKey;
   turnSeq: number;
-  protocol: "anthropic";
+  protocol: "anthropic" | "openai";
   round: number;
   totalCalls: number;
   assistantSkeleton: JsonValue[];

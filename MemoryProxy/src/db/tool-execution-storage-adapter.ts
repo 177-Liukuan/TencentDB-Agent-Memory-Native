@@ -126,6 +126,13 @@ export interface ObservationCompletion {
   leaseOwner: string;
 }
 
+export interface CompressionCheckpointCas {
+  key: ToolExecutionStateKey;
+  expectedRevision: number;
+  checkpointId: string;
+  coveredAt: string;
+}
+
 export interface ToolExecutionStorageAdapter {
   initializeAndProbe(): Promise<void>;
   create(context: ToolExecutionContext): Promise<void>;
@@ -146,6 +153,7 @@ export interface ToolExecutionStorageAdapter {
   prepareObservation(preparation: ObservationPreparation): Promise<boolean>;
   tryClaimObservation(claim: ObservationClaim): Promise<boolean>;
   completeObservation(completion: ObservationCompletion): Promise<boolean>;
+  compareAndSetCompressionCheckpoint(checkpoint: CompressionCheckpointCas): Promise<boolean>;
   markAborted(key: ToolExecutionStateKey, expectedRevision: number): Promise<boolean>;
   close(): Promise<void>;
 }
@@ -369,6 +377,7 @@ export function validateToolExecutionContext(context: ToolExecutionContext): voi
     "nativeLeakMarkers",
     "requestFingerprint",
     "observationIntent",
+    "compressionCheckpoint",
     "system",
     "tools",
     "requestParameters",
@@ -457,6 +466,17 @@ export function validateToolExecutionContext(context: ToolExecutionContext): voi
       throw new ToolExecutionValidationError("Tool observation intent is invalid");
     }
   }
+  if (context.upstreamSnapshot.compressionCheckpoint !== undefined) {
+    const checkpoint = context.upstreamSnapshot.compressionCheckpoint;
+    if (
+      !isRecord(checkpoint)
+      || typeof checkpoint.id !== "string"
+      || checkpoint.id.length === 0
+      || typeof checkpoint.coveredAt !== "string"
+      || !Number.isFinite(Date.parse(checkpoint.coveredAt))
+      || Object.keys(checkpoint).some((name) => !["id", "coveredAt"].includes(name))
+    ) throw new ToolExecutionValidationError("Context Compression checkpoint is invalid");
+  }
   const targetKeys = new Set(["id", "url", "model", "authSource"]);
   if (Object.keys(context.upstreamSnapshot.target).some((name) => !targetKeys.has(name))) {
     throw new ToolExecutionValidationError("Persisted forward target contains a non-allowlisted field");
@@ -473,6 +493,13 @@ export function validateToolExecutionContext(context: ToolExecutionContext): voi
     "tool_choice",
     "metadata",
     "service_tier",
+    "max_completion_tokens",
+    "frequency_penalty",
+    "presence_penalty",
+    "parallel_tool_calls",
+    "response_format",
+    "seed",
+    "stream_options",
   ]);
   if (Object.keys(context.upstreamSnapshot.requestParameters).some((name) => !requestParameterKeys.has(name))) {
     throw new ToolExecutionValidationError("Upstream request parameters contain a non-allowlisted field");

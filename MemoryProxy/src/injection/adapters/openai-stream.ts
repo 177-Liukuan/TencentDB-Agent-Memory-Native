@@ -66,7 +66,11 @@ export class OpenAIStreamParser implements ProtocolStreamParser {
       this.pendingText = "";
     }
     if (!this.completed) {
-      events.push(...this.complete("stream_end"));
+      events.push({
+        type: "protocol_error",
+        code: "unexpected_eof",
+        message: "OpenAI stream ended before finish_reason or [DONE]",
+      });
     }
     return events;
   }

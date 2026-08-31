@@ -218,7 +218,10 @@ function buildPipelineBundle(config: ProxyConfig): PipelineBundle {
       enabled: true,
       registry: getNativeProxyToolRuntime(config).registry,
       memoryEnabled: config.tdai.enabled && config.tdai.memory.enabled,
-      skillEnabled: injectors.includes("skill"),
+      // Native Skill capability is independent from legacy Skill RAG prompt
+      // injection; the Bridge is available whenever its trusted service token
+      // is configured.
+      skillEnabled: config.coreSkill.serviceToken.length > 0,
       allowSkillWrite: config.skillRuntime?.allowLlmWrite ?? false,
     }));
   }

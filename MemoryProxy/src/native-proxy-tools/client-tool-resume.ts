@@ -204,6 +204,55 @@ export function extractAnthropicClientToolResults(
   return results;
 }
 
+function extractOpenAIClientToolResults(body: Record<string, unknown>): AnthropicClientToolResult[] {
+  if (!Array.isArray(body.messages) || body.messages.length === 0) return [];
+  const suffix: Record<string, unknown>[] = [];
+  for (let index = body.messages.length - 1; index >= 0; index--) {
+    const message = body.messages[index];
+    if (!isRecord(message) || message.role !== "tool") break;
+    suffix.push(message);
+  }
+  suffix.reverse();
+  const seen = new Set<string>();
+  return suffix.map((message) => {
+    if (typeof message.tool_call_id !== "string" || message.tool_call_id.length === 0) {
+      throw new ClientToolResumeFailure(
+        "invalid_client_tool_result",
+        "Client Tool Result is missing tool_call_id",
+        400,
+      );
+    }
+    if (seen.has(message.tool_call_id)) {
+      throw new ClientToolResumeFailure(
+        "duplicate_client_tool_result",
+        "Client request contains a duplicate Tool Result call ID",
+        409,
+      );
+    }
+    if (!isJsonValue(message.content)) {
+      throw new ClientToolResumeFailure(
+        "invalid_client_tool_result",
+        "Client Tool Result content is not valid JSON data",
+        400,
+      );
+    }
+    seen.add(message.tool_call_id);
+    return {
+      callId: message.tool_call_id,
+      content: structuredClone(message.content),
+      isError: false,
+    };
+  });
+}
+
+/** Extract the current protocol's most recent Client Tool Result batch. */
+export function extractClientToolResults(body: Record<string, unknown>): AnthropicClientToolResult[] {
+  const latest = Array.isArray(body.messages) ? body.messages.at(-1) : undefined;
+  return isRecord(latest) && latest.role === "tool"
+    ? extractOpenAIClientToolResults(body)
+    : extractAnthropicClientToolResults(body);
+}
+
 function genericExecutionError(): NativeToolResult {
   return {
     isError: true,
@@ -216,6 +265,36 @@ function genericExecutionError(): NativeToolResult {
 }
 
 function validateAssistantSkeleton(context: ToolExecutionContext): void {
+  if (context.protocol === "openai") {
+    const toolCalls = new Map<string, { position: number; name: string }>();
+    for (const [position, value] of context.assistantSkeleton.entries()) {
+      if (!isRecord(value) || value.type !== "function" || !isRecord(value.function)) continue;
+      const fn = value.function;
+      if (
+        typeof value.id !== "string"
+        || typeof fn.name !== "string"
+        || toolCalls.has(value.id)
+      ) throw new ClientToolResumeFailure(
+        "corrupt_assistant_skeleton",
+        "Persisted assistant Tool Call skeleton is invalid",
+        500,
+      );
+      toolCalls.set(value.id, { position, name: fn.name });
+    }
+    let previousPosition = -1;
+    for (const slot of [...context.slots].sort((left, right) => left.slotIndex - right.slotIndex)) {
+      const call = toolCalls.get(slot.callId);
+      if (!call || call.name !== slot.toolName || call.position <= previousPosition) {
+        throw new ClientToolResumeFailure(
+          "corrupt_assistant_skeleton",
+          "Persisted assistant Tool Call skeleton does not match its slots",
+          500,
+        );
+      }
+      previousPosition = call.position;
+    }
+    return;
+  }
   const toolBlocks = new Map<string, { position: number; name: string }>();
   for (const [position, value] of context.assistantSkeleton.entries()) {
     if (!isRecord(value) || value.type !== "tool_use") continue;
@@ -243,15 +322,27 @@ function validateAssistantSkeleton(context: ToolExecutionContext): void {
   }
 }
 
-function asAssistantMessage(skeleton: readonly JsonValue[]): JsonValue {
+function asAssistantMessage(context: ToolExecutionContext): JsonValue {
+  if (context.protocol === "openai") {
+    return { role: "assistant", content: null, tool_calls: structuredClone(context.assistantSkeleton) };
+  }
   return {
     role: "assistant",
-    content: structuredClone([...skeleton]),
+    content: structuredClone(context.assistantSkeleton),
   };
 }
 
-function asToolResultMessage(slots: readonly ToolCallSlot[]): JsonValue {
-  return buildToolResultMessage(slots) as unknown as JsonValue;
+function asToolResultMessages(context: ToolExecutionContext): JsonValue[] {
+  if (context.protocol === "openai") {
+    return [...context.slots]
+      .sort((left, right) => left.slotIndex - right.slotIndex)
+      .map((slot) => ({
+        role: "tool",
+        tool_call_id: slot.callId,
+        content: typeof slot.result === "string" ? slot.result : JSON.stringify(slot.result ?? null),
+      }));
+  }
+  return [buildToolResultMessage(context.slots) as unknown as JsonValue];
 }
 
 function logicalMessages(context: ToolExecutionContext): JsonValue[] {
@@ -321,7 +412,7 @@ export async function resumeClientToolResults(
 ): Promise<ClientToolResumeDecision> {
   let results: AnthropicClientToolResult[];
   try {
-    results = extractAnthropicClientToolResults(input.body);
+    results = extractClientToolResults(input.body);
   } catch (error) {
     return errorDecision(error);
   }
@@ -493,8 +584,8 @@ export async function resumeClientToolResults(
 
     const messages: JsonValue[] = [
       ...structuredClone(context.upstreamSnapshot.baseMessages),
-      asAssistantMessage(context.assistantSkeleton),
-      asToolResultMessage(context.slots),
+      asAssistantMessage(context),
+      ...asToolResultMessages(context),
     ];
     const round = context.round + 1;
     let upstreamRound: UpstreamRound;

@@ -442,6 +442,25 @@ describe("Native Proxy Tool injection", () => {
     })]));
   });
 
+  it("exposes Native Skill tools without enabling legacy Skill prompt injection", async () => {
+    const config = structuredClone(DEFAULT_CONFIG);
+    config.injection.enabled = false;
+    config.injection.injectors = [];
+    config.nativeProxyTools.enabled = true;
+    config.coreSkill.serviceToken = "trusted-service-token";
+
+    const output = await getInjectionPipeline(config).process({
+      model: "claude-test",
+      stream: true,
+      messages: [{ role: "user", content: "find a skill" }],
+    }, metadata);
+
+    expect(output.tools).toEqual(expect.arrayContaining([
+      expect.objectContaining({ name: "skill_search" }),
+      expect.objectContaining({ name: "skill_extract" }),
+    ]));
+  });
+
   it("never emits Fake Tool tags or curl recipes beside the Native tool", async () => {
     const config = structuredClone(DEFAULT_CONFIG);
     config.injection.enabled = true;

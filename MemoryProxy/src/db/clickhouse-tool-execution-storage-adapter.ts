@@ -18,6 +18,7 @@ import {
   mergeToolCallSlots,
   validateToolExecutionContext,
   type ClientDispatchCas,
+  type CompressionCheckpointCas,
   type ReentryClaim,
   type ReentryCompletion,
   type ReentryRenewal,
@@ -222,7 +223,7 @@ export function decodeToolExecutionStateRow(
       toolBatchId: row.tool_batch_id,
     },
     turnSeq: finiteInteger(row.turn_seq),
-    protocol: row.protocol as "anthropic",
+    protocol: row.protocol as ToolExecutionContext["protocol"],
     round: finiteInteger(row.round),
     totalCalls: finiteInteger(row.total_calls),
     assistantSkeleton: parseJsonField<JsonValue[]>(row.assistant_skeleton_json),
@@ -268,7 +269,7 @@ export function decodeToolExecutionStateRow(
   if (
     finiteInteger(row.schema_version ?? 1) !== 1
     ||
-    row.protocol !== "anthropic"
+    !["anthropic", "openai"].includes(row.protocol)
     || !row.mutation_token
     || row.call_ids.length !== slots.length
     || row.call_ids.some((callId, index) => callId !== slots[index]?.callId)
@@ -610,6 +611,19 @@ export class ClickHouseToolExecutionStorageAdapter implements ToolExecutionStora
         || current.observationLeaseOwner !== completion.leaseOwner
       ) return null;
       current.observationStatus = "completed";
+      return current;
+    });
+  }
+
+  async compareAndSetCompressionCheckpoint(checkpoint: CompressionCheckpointCas): Promise<boolean> {
+    if (!checkpoint.checkpointId || !Number.isFinite(Date.parse(checkpoint.coveredAt))) return false;
+    return this.mutate(checkpoint.key, checkpoint.expectedRevision, (current) => {
+      if (current.responseStreamStatus !== "completed") return null;
+      if (current.upstreamSnapshot.compressionCheckpoint) return null;
+      current.upstreamSnapshot.compressionCheckpoint = {
+        id: checkpoint.checkpointId,
+        coveredAt: checkpoint.coveredAt,
+      };
       return current;
     });
   }

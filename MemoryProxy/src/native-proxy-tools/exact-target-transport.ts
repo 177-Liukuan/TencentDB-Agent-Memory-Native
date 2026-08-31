@@ -16,6 +16,7 @@ import type {
 const REQUEST_PARAMETER_ALLOWLIST = new Set([
   "model",
   "max_tokens",
+  "max_completion_tokens",
   "temperature",
   "top_p",
   "top_k",
@@ -25,6 +26,12 @@ const REQUEST_PARAMETER_ALLOWLIST = new Set([
   "tool_choice",
   "metadata",
   "service_tier",
+  "frequency_penalty",
+  "presence_penalty",
+  "parallel_tool_calls",
+  "response_format",
+  "seed",
+  "stream_options",
 ]);
 
 const SKIP_REQUEST_HEADERS = new Set([
@@ -50,6 +57,7 @@ export class NativeToolTargetUnavailableError extends Error {
 }
 
 export interface BuildUpstreamRequestSnapshotInput {
+  protocol?: UpstreamRequestSnapshot["protocol"];
   body: Record<string, unknown>;
   url: string;
   model: string;
@@ -136,7 +144,7 @@ export function buildUpstreamRequestSnapshot(
     ? baseMessages
     : asJsonArray(input.logicalBaseMessages, "logicalBaseMessages");
   return {
-    protocol: "anthropic",
+    protocol: input.protocol ?? "anthropic",
     baseMessages,
     logicalBaseMessages: cloneJson(logicalBaseMessages),
     ...(input.requestFingerprint !== undefined
@@ -161,7 +169,7 @@ export function buildUpstreamRequestSnapshot(
 }
 
 function validateSnapshot(snapshot: UpstreamRequestSnapshot): void {
-  if (snapshot.protocol !== "anthropic") throw new NativeToolTargetUnavailableError();
+  if (!["anthropic", "openai"].includes(snapshot.protocol)) throw new NativeToolTargetUnavailableError();
   if (
     snapshot.requestParameters.model !== snapshot.target.model
     || snapshot.requestParameters.stream !== true
@@ -318,13 +326,19 @@ function restartCandidates(options: RestartExactTargetTransportOptions): Restart
 function restartHeaders(
   candidate: RestartCandidate,
   options: RestartExactTargetTransportOptions,
+  protocol: UpstreamRequestSnapshot["protocol"],
 ): Record<string, string> {
   const headers = sanitizeRequestHeaders(options.currentRequestHeaders);
   if (candidate.authSource !== "client") {
     if (!candidate.apiKey) throw new NativeToolTargetUnavailableError();
-    headers["x-api-key"] = candidate.apiKey;
-    delete headers.authorization;
-    delete headers.Authorization;
+    if (protocol === "openai") {
+      headers.authorization = `Bearer ${candidate.apiKey}`;
+      delete headers["x-api-key"];
+    } else {
+      headers["x-api-key"] = candidate.apiKey;
+      delete headers.authorization;
+      delete headers.Authorization;
+    }
   }
   headers["x-vertex-ai-session-id"] = options.sessionId;
   return headers;
@@ -348,6 +362,6 @@ export function createRestartExactTargetTransport(
       && entry.authSource === snapshot.target.authSource
     ));
     if (!candidate) throw new NativeToolTargetUnavailableError();
-    return sendExactRound(request, restartHeaders(candidate, options), options);
+    return sendExactRound(request, restartHeaders(candidate, options, snapshot.protocol), options);
   };
 }
