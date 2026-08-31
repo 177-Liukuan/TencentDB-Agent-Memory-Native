@@ -49,6 +49,16 @@ export interface InjectionPipelineOptions {
   hookCacheRepo?: HookCacheRepo;
 }
 
+export class CriticalInjectionHookError extends Error {
+  readonly hookId: string;
+
+  constructor(hookId: string, cause: Error) {
+    super(`Critical injection hook failed: ${hookId}`, { cause });
+    this.name = "CriticalInjectionHookError";
+    this.hookId = hookId;
+  }
+}
+
 /**
  * The injection pipeline. Orchestrates parse → inject → serialize.
  */
@@ -247,6 +257,10 @@ export class InjectionPipeline {
             error: error.message,
             cacheStrategy: hook.cacheStrategy ?? "none",
           });
+
+          if (hook.critical) {
+            throw new CriticalInjectionHookError(hook.id, error);
+          }
         }
       }
     }

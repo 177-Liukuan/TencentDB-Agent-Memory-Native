@@ -57,6 +57,7 @@ import {
   isRateLimitExceededError,
   recordInputTokenUsage,
 } from "./rate-limit/guard.js";
+import { describeNativeProxyToolInjectionFailure } from "./native-proxy-tools/native-proxy-tools-injector.js";
 
 const SKIP_REQUEST_HEADERS = new Set([
   "host",
@@ -993,7 +994,13 @@ export async function handleAnthropicMessages(
   //   - FORK: 走 pipeline 但 readOnly=true（miss 时不 self-heal 写 cache，避免破坏主对话 cache）
   //   - MAIN: 走完整 pipeline（含 self-heal）
   const skipInjection = requestKind === "sidequery";
-  if (!injectedSkipped && !skipInjection && config.injection?.enabled && config.injection.injectors.length > 0) {
+  const legacyInjectionEnabled = config.injection?.enabled
+    && config.injection.injectors.length > 0;
+  const nativeToolInjectionEnabled = config.nativeProxyTools.enabled
+    && isStream
+    && config.tdai.enabled
+    && config.tdai.memory.enabled;
+  if (!injectedSkipped && !skipInjection && (legacyInjectionEnabled || nativeToolInjectionEnabled)) {
     try {
       console.log(`[injection-debug] entering injection pipeline session=${sessionKey} turnSeq=${countHumanTurns(messages, "anthropic")} injectors=${config.injection.injectors} kind=${requestKind}`);
       const injectionTurnSeq = countHumanTurns(messages, "anthropic");
@@ -1021,6 +1028,10 @@ export async function handleAnthropicMessages(
       hasTools = Array.isArray(body.tools) && body.tools.length > 0;
     } catch (err: unknown) {
       console.error("[injection] anthropic pipeline error:", err instanceof Error ? err.message : String(err));
+      const nativeFailure = describeNativeProxyToolInjectionFailure(err);
+      if (nativeFailure) {
+        return c.json({ type: "error", error: nativeFailure }, 400);
+      }
     }
   } else if (skipInjection) {
     console.log(`[injection-debug] skipping injection for kind=sidequery session=${sessionKey}`);

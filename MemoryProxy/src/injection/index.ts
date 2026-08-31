@@ -56,6 +56,7 @@ export { HookRegistryImpl } from "./registry.js";
 
 // Pipeline
 export { InjectionPipeline } from "./pipeline.js";
+export { CriticalInjectionHookError } from "./pipeline.js";
 
 // Observer (injection pipeline observability)
 export type { InjectionObserver, HookResult } from "./observer.js";
@@ -112,6 +113,8 @@ import { TdaiProfileMemoryInjector } from "./injectors/tdai-profile-memory-injec
 import { TdaiToolsInjector } from "./injectors/tdai-tools-injector.js";
 import { KnowledgeToolsInjector } from "./injectors/knowledge-tools-injector.js";
 import { AssetReflectionInjector } from "./injectors/asset-reflection-injector.js";
+import { NativeProxyToolsInjector } from "../native-proxy-tools/native-proxy-tools-injector.js";
+import { createDefaultNativeProxyToolRegistry } from "../native-proxy-tools/tool-registry.js";
 import type { ProtocolAdapter } from "./adapters/interface.js";
 import type { AgentProfile } from "./agents/interface.js";
 import { CodeBuddyProfile } from "./agents/codebuddy/profile.js";
@@ -216,6 +219,17 @@ function buildPipelineBundle(config: ProxyConfig): PipelineBundle {
   // Register configured injectors. Each injector reads its own kernel config
   // (`coreSkill`, `tdai`, ...); there is no shared external endpoint anymore.
   const injectors = config.injection?.injectors ?? [];
+
+  if (
+    config.nativeProxyTools.enabled
+    && config.tdai.enabled
+    && config.tdai.memory.enabled
+  ) {
+    registry.register(new NativeProxyToolsInjector({
+      enabled: true,
+      registry: createDefaultNativeProxyToolRegistry(),
+    }));
+  }
 
   // proxyBaseUrl 在 skill-tools-injector 和 tdai-tools-injector 之间共享。
   //
@@ -398,6 +412,7 @@ function getOrBuildBundle(config: ProxyConfig): PipelineBundle {
     tdai: config.tdai,
     coreSkill: config.coreSkill,
     knowledge: config.knowledge,
+    nativeProxyTools: config.nativeProxyTools,
     server: config.server,
   });
   if (cachedBundle && cachedConfigHash === configHash) {
