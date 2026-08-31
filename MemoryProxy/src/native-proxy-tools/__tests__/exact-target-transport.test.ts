@@ -200,6 +200,56 @@ describe("exact Anthropic target transport", () => {
     expect(JSON.stringify(init?.headers)).not.toContain("client-secret");
   });
 
+  it("reconstructs OpenAI Bearer auth and replay-safe Chat Completions parameters", async () => {
+    const config = structuredClone(DEFAULT_CONFIG);
+    config.upstream.agents.codebuddy = {
+      url: "https://openai-agent.example/v1",
+      apiKey: "openai-agent-secret",
+    };
+    const body = {
+      model: "gpt-test",
+      stream: true,
+      stream_options: { include_usage: true },
+      parallel_tool_calls: true,
+      messages: [{ role: "user", content: "question" }],
+    };
+    const snapshot = buildUpstreamRequestSnapshot({
+      protocol: "openai",
+      body,
+      url: "https://openai-agent.example/v1/chat/completions",
+      model: "gpt-test",
+      authSource: "agent",
+    });
+    const fetchImpl = vi.fn<typeof fetch>(async () => new Response(responseStream(), {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    }));
+    const reenter = createRestartExactTargetTransport({
+      config,
+      currentModel: "gpt-test",
+      agentSource: "codebuddy",
+      requestPath: "/chat/completions",
+      sessionId: "session-1",
+      currentRequestHeaders: { authorization: "Bearer client-secret", "x-api-key": "wrong-shape" },
+      timeoutMs: 5_000,
+      fetchImpl,
+    });
+
+    await reenter({ upstreamSnapshot: snapshot, messages: snapshot.baseMessages, round: 2, totalCalls: 1 });
+
+    expect(snapshot.requestParameters).toMatchObject({
+      stream_options: { include_usage: true },
+      parallel_tool_calls: true,
+    });
+    expect(fetchImpl).toHaveBeenCalledWith(
+      "https://openai-agent.example/v1/chat/completions",
+      expect.objectContaining({
+        headers: expect.objectContaining({ authorization: "Bearer openai-agent-secret" }),
+      }),
+    );
+    expect(JSON.stringify(fetchImpl.mock.calls[0][1]?.headers)).not.toContain("wrong-shape");
+  });
+
   it("reconstructs an agent credential retained across a retry to the configured default URL", async () => {
     const config = structuredClone(DEFAULT_CONFIG);
     config.upstream.url = "https://global.example/v1";
