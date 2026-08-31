@@ -112,23 +112,23 @@ class RecordingClickHouseClient implements ToolStateClickHouseClient {
       round: Number(params.nextRound),
       total_calls: Number(params.nextTotalCalls),
       call_ids: structuredClone(params.nextCallIds as string[]),
-      assistant_skeleton_json: String(params.nextAssistantSkeletonJson),
-      slots_json: String(params.nextSlotsJson),
+      assistant_skeleton_json: this.decodeStringAssignment(command, "assistant_skeleton_json", params.nextAssistantSkeletonJson),
+      slots_json: this.decodeStringAssignment(command, "slots_json", params.nextSlotsJson),
       response_stream_status: String(params.nextResponseStreamStatus),
       client_dispatch_status: String(params.nextClientDispatchStatus),
-      parent_state_key_json: String(params.nextParentStateKeyJson ?? ""),
+      parent_state_key_json: this.decodeStringAssignment(command, "parent_state_key_json", params.nextParentStateKeyJson),
       parent_reentry_attempt: Number(params.nextParentReentryAttempt ?? 0),
-      client_dispatch_outcome_json: String(params.nextClientDispatchOutcomeJson ?? ""),
+      client_dispatch_outcome_json: this.decodeStringAssignment(command, "client_dispatch_outcome_json", params.nextClientDispatchOutcomeJson),
       reentry_lease_owner: String(params.nextReentryLeaseOwner ?? ""),
       reentry_lease_until: String(params.nextReentryLeaseUntil ?? ""),
       reentry_attempt: Number(params.nextReentryAttempt ?? 0),
-      reentry_outcome_json: String(params.nextReentryOutcomeJson ?? ""),
+      reentry_outcome_json: this.decodeStringAssignment(command, "reentry_outcome_json", params.nextReentryOutcomeJson),
       observation_status: String(params.nextObservationStatus ?? "none"),
       observation_lease_owner: String(params.nextObservationLeaseOwner ?? ""),
       observation_lease_until: String(params.nextObservationLeaseUntil ?? ""),
       observation_attempt: Number(params.nextObservationAttempt ?? 0),
-      observation_outcome_json: String(params.nextObservationOutcomeJson ?? ""),
-      upstream_snapshot_json: String(params.nextUpstreamSnapshotJson),
+      observation_outcome_json: this.decodeStringAssignment(command, "observation_outcome_json", params.nextObservationOutcomeJson),
+      upstream_snapshot_json: this.decodeStringAssignment(command, "upstream_snapshot_json", params.nextUpstreamSnapshotJson),
       revision: Number(params.nextRevision),
       mutation_token: String(params.mutationToken),
       expires_at: String(params.nextExpiresAt),
@@ -189,6 +189,19 @@ class RecordingClickHouseClient implements ToolStateClickHouseClient {
       params.contextVersion,
       params.toolBatchId,
     ]);
+  }
+
+  private decodeStringAssignment(
+    command: ToolStateClickHouseCommand,
+    column: string,
+    parameterValue: unknown,
+  ): string {
+    if (typeof parameterValue === "string") return parameterValue;
+    const match = command.query.match(new RegExp(
+      `${column}\\s*=\\s*base64Decode\\('([A-Za-z0-9+/=]*)'\\)`,
+    ));
+    if (!match) throw new Error(`Missing encoded assignment for ${column}`);
+    return Buffer.from(match[1], "base64").toString("utf8");
   }
 }
 
@@ -280,6 +293,37 @@ describe("ClickHouseToolExecutionStorageAdapter", () => {
       nextExpiresAt: "2026-08-31 00:01:00.000",
       nextUpdatedAt: "2026-08-31 00:00:00.000",
     });
+  });
+
+  it("keeps large persisted snapshots out of ClickHouse HTTP form fields", async () => {
+    const client = new RecordingClickHouseClient();
+    const adapter = new ClickHouseToolExecutionStorageAdapter(config(), {
+      client,
+      now: () => fixedNow,
+      createMutationToken: tokenSequence(),
+    });
+    const largeContext = context();
+    largeContext.upstreamSnapshot.tools = [{
+      name: "client_tool_with_large_schema",
+      description: "x".repeat(256 * 1024),
+      input_schema: { type: "object" },
+    }];
+    await adapter.create(largeContext);
+
+    await expect(adapter.compareAndSetClientDispatchStatus({
+      key: largeContext.key,
+      expectedRevision: 0,
+      expectedStatus: "none",
+      nextStatus: "pending",
+    })).resolves.toBe(true);
+
+    const update = [...client.commands].reverse()
+      .find((command) => /^\s*UPDATE\s/i.test(command.query));
+    const formStringBytes = Object.values(update?.query_params ?? {})
+      .filter((value): value is string => typeof value === "string")
+      .map((value) => Buffer.byteLength(value));
+    expect(Math.max(...formStringBytes)).toBeLessThan(64 * 1024);
+    expect(update?.query.length).toBeGreaterThan(256 * 1024);
   });
 
   it("returns false for an initially stale revision without issuing UPDATE", async () => {

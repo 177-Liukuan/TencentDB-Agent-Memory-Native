@@ -119,6 +119,15 @@ export class NativeToolStateCapabilityError extends ToolExecutionStorageError {
 }
 
 const IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const NATIVE_TOOL_STATE_MAX_QUERY_SIZE = 16 * 1024 * 1024;
+
+function base64StringExpression(value: string): string {
+  // ClickHouse transports query_params as HTTP form fields, whose per-field
+  // limit is smaller than a valid persisted Native Tool context. Base64 has a
+  // fixed safe alphabet, so embedding the encoded value in the SQL request
+  // body avoids both that transport limit and SQL-string injection.
+  return `base64Decode('${Buffer.from(value, "utf8").toString("base64")}')`;
+}
 
 function assertIdentifier(value: string, path: string): void {
   if (!IDENTIFIER.test(value)) {
@@ -774,23 +783,23 @@ export class ClickHouseToolExecutionStorageAdapter implements ToolExecutionStora
       "  round = {nextRound:UInt32},",
       "  total_calls = {nextTotalCalls:UInt32},",
       "  call_ids = {nextCallIds:Array(String)},",
-      "  assistant_skeleton_json = {nextAssistantSkeletonJson:String},",
-      "  slots_json = {nextSlotsJson:String},",
+      `  assistant_skeleton_json = ${base64StringExpression(row.assistant_skeleton_json)},`,
+      `  slots_json = ${base64StringExpression(row.slots_json)},`,
       "  response_stream_status = {nextResponseStreamStatus:String},",
       "  client_dispatch_status = {nextClientDispatchStatus:String},",
-      "  parent_state_key_json = {nextParentStateKeyJson:String},",
+      `  parent_state_key_json = ${base64StringExpression(row.parent_state_key_json ?? "")},`,
       "  parent_reentry_attempt = {nextParentReentryAttempt:UInt32},",
-      "  client_dispatch_outcome_json = {nextClientDispatchOutcomeJson:String},",
+      `  client_dispatch_outcome_json = ${base64StringExpression(row.client_dispatch_outcome_json ?? "")},`,
       "  reentry_lease_owner = {nextReentryLeaseOwner:String},",
       "  reentry_lease_until = {nextReentryLeaseUntil:String},",
       "  reentry_attempt = {nextReentryAttempt:UInt32},",
-      "  reentry_outcome_json = {nextReentryOutcomeJson:String},",
+      `  reentry_outcome_json = ${base64StringExpression(row.reentry_outcome_json ?? "")},`,
       "  observation_status = {nextObservationStatus:String},",
       "  observation_lease_owner = {nextObservationLeaseOwner:String},",
       "  observation_lease_until = {nextObservationLeaseUntil:String},",
       "  observation_attempt = {nextObservationAttempt:UInt32},",
-      "  observation_outcome_json = {nextObservationOutcomeJson:String},",
-      "  upstream_snapshot_json = {nextUpstreamSnapshotJson:String},",
+      `  observation_outcome_json = ${base64StringExpression(row.observation_outcome_json ?? "")},`,
+      `  upstream_snapshot_json = ${base64StringExpression(row.upstream_snapshot_json)},`,
       "  revision = {nextRevision:UInt64},",
       "  mutation_token = {mutationToken:String},",
       "  expires_at = {nextExpiresAt:DateTime64(3)},",
@@ -814,23 +823,16 @@ export class ClickHouseToolExecutionStorageAdapter implements ToolExecutionStora
           nextRound: row.round,
           nextTotalCalls: row.total_calls,
           nextCallIds: row.call_ids,
-          nextAssistantSkeletonJson: row.assistant_skeleton_json,
-          nextSlotsJson: row.slots_json,
           nextResponseStreamStatus: row.response_stream_status,
           nextClientDispatchStatus: row.client_dispatch_status,
-          nextParentStateKeyJson: row.parent_state_key_json,
           nextParentReentryAttempt: row.parent_reentry_attempt,
-          nextClientDispatchOutcomeJson: row.client_dispatch_outcome_json,
           nextReentryLeaseOwner: row.reentry_lease_owner,
           nextReentryLeaseUntil: row.reentry_lease_until,
           nextReentryAttempt: row.reentry_attempt,
-          nextReentryOutcomeJson: row.reentry_outcome_json,
           nextObservationStatus: row.observation_status,
           nextObservationLeaseOwner: row.observation_lease_owner,
           nextObservationLeaseUntil: row.observation_lease_until,
           nextObservationAttempt: row.observation_attempt,
-          nextObservationOutcomeJson: row.observation_outcome_json,
-          nextUpstreamSnapshotJson: row.upstream_snapshot_json,
           nextRevision: row.revision,
           mutationToken,
           nextExpiresAt: row.expires_at,
@@ -843,6 +845,7 @@ export class ClickHouseToolExecutionStorageAdapter implements ToolExecutionStora
           update_sequential_consistency: 1,
           wait_end_of_query: 1,
           date_time_input_format: "best_effort",
+          max_query_size: NATIVE_TOOL_STATE_MAX_QUERY_SIZE,
         },
       });
     } catch {

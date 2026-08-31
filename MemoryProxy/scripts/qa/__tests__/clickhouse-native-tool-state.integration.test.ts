@@ -153,6 +153,26 @@ describeIntegration("real ClickHouse Native Tool state", () => {
     expect(await primary.get(state.key)).toMatchObject({ key: state.key, revision: 0 });
   }, 30_000);
 
+  it("updates a Claude Code-sized upstream snapshot without HTTP form overflow", async () => {
+    const state = testContext(randomUUID());
+    state.upstreamSnapshot.tools = [{
+      name: "client_tool_with_large_schema",
+      description: "x".repeat(256 * 1024),
+      input_schema: { type: "object" },
+    }];
+    await primary.create(state);
+
+    expect(await primary.compareAndSetClientDispatchStatus({
+      key: state.key,
+      expectedRevision: 0,
+      expectedStatus: "none",
+      nextStatus: "pending",
+    })).toBe(true);
+
+    const stored = await secondary.get(state.key);
+    expect(stored?.upstreamSnapshot.tools).toEqual(state.upstreamSnapshot.tools);
+  }, 30_000);
+
   it("leases and completes Client-result re-entry across Adapter instances", async () => {
     const state = testContext(randomUUID());
     state.responseStreamStatus = "completed";
