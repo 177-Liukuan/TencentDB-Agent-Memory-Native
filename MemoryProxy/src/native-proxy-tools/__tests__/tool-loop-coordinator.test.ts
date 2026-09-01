@@ -330,7 +330,7 @@ describe("AnthropicToolLoopCoordinator", () => {
   });
 
   it("defers a mutating Skill tool until message_stop", async () => {
-    const gates = controlledNativeStream("skill_delete", { skill_id: "skill-1" });
+    const gates = controlledNativeStream("tdai_skill_delete", { skill_id: "skill-1" });
     const { coordinator, execute } = coordinatorHarness();
     const promise = coordinator.handleRound(roundInput(gates.stream));
 
@@ -344,7 +344,7 @@ describe("AnthropicToolLoopCoordinator", () => {
   });
 
   it("never executes a deferred Skill mutation when SSE ends before message_stop", async () => {
-    const gates = controlledNativeStream("skill_files_write", {
+    const gates = controlledNativeStream("tdai_skill_files_write", {
       skill_id: "skill-1",
       path: "SKILL.md",
       content: "changed",
