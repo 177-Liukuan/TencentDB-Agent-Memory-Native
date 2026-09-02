@@ -500,6 +500,11 @@ export function createSkillBridgeHandler(
 ): (c: Context) => Promise<Response> {
   const fetcher = deps.fetcher ?? globalThis.fetch.bind(globalThis);
 
+  const upstreamSignal = (request: Request): AbortSignal => AbortSignal.any([
+    request.signal,
+    AbortSignal.timeout(Math.max(5_000, config.coreSkill.timeoutMs * 4)),
+  ]);
+
   return async (c: Context): Promise<Response> => {
     const t0 = (deps.now ?? Date.now)();
 
@@ -869,7 +874,7 @@ export function createSkillBridgeHandler(
         method: "POST",
         headers,
         body: outboundBody,
-        signal: AbortSignal.timeout(Math.max(5000, config.coreSkill.timeoutMs * 4)),
+        signal: upstreamSignal(c.req.raw),
       });
     } catch (err) {
       console.warn(

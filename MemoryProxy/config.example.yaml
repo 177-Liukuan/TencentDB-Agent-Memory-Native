@@ -328,7 +328,7 @@ nativeProxyTools:
   maxRounds: 5
   maxCallsPerRound: 8
   maxTotalCalls: 20
-  toolTimeoutMs: 5000
+  toolTimeoutMs: 20000
   maxResultBytes: 65536
   stateTtlSeconds: 1800
   stateStorage:

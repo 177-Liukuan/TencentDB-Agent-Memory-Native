@@ -91,4 +91,46 @@ describe("executeSkillBridge", () => {
     expect(JSON.parse(result.text)).toMatchObject({ code: 40302 });
     expect(fetcher).not.toHaveBeenCalled();
   });
+
+  it("cancels the upstream Skill request when the Native caller aborts", async () => {
+    await installSession();
+    const controller = new AbortController();
+    let notifyFetchStarted!: () => void;
+    const fetchStarted = new Promise<void>((resolve) => {
+      notifyFetchStarted = resolve;
+    });
+    const fetcher = vi.fn((_url: string | URL | Request, init?: RequestInit) => (
+      new Promise<Response>((resolve, reject) => {
+        const signal = init?.signal;
+        const timer = setTimeout(() => {
+          resolve(new Response(JSON.stringify({ code: 0, data: { skill_id: "skl-1" } }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          }));
+        }, 50);
+        signal?.addEventListener("abort", () => {
+          clearTimeout(timer);
+          reject(signal.reason);
+        }, { once: true });
+        notifyFetchStarted();
+      })
+    ));
+
+    const execution = executeSkillBridge({
+      config: config(),
+      subpath: "get",
+      body: { skill_id: "skl-1" },
+      sessionId: "session-1",
+      spaceId: "space-1",
+      signal: controller.signal,
+    }, { fetcher });
+    await fetchStarted;
+    controller.abort(new Error("Native caller stopped waiting"));
+
+    const result = await execution;
+
+    expect(result.status).toBe(502);
+    expect(JSON.parse(result.text)).toMatchObject({ code: 50301 });
+    expect(fetcher.mock.calls[0][1]?.signal?.aborted).toBe(true);
+  });
 });

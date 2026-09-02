@@ -73,7 +73,7 @@ describe("Native Proxy Tool configuration", () => {
       maxRounds: 5,
       maxCallsPerRound: 8,
       maxTotalCalls: 20,
-      toolTimeoutMs: 5_000,
+      toolTimeoutMs: 20_000,
       maxResultBytes: 65_536,
       stateTtlSeconds: 1_800,
       stateStorage: {
