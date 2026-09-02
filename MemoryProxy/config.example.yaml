@@ -315,10 +315,10 @@ clickhouse:
   ttlDays: 30                        # 数据保留天数（0 = 不自动过期；启动时通过 CREATE TABLE TTL 生效）
 
 
-# ── Anthropic Native Proxy Tool（仅流式 Messages API） ───────────────────────
-# 开启后，Proxy 在已初始化 Session 的 Anthropic stream 请求中注入唯一的结构化
-# 只读工具 `tdai_memory_search`。工具参数完整（content_block_stop）后立即执行；
-# Proxy 内部回填 Tool Result 并 Re-entry，Native Tool 帧不会下发给客户端。
+# ── Native Proxy Tool ───────────────────────────────────────────────────────
+# 支持 Anthropic Messages、OpenAI Chat Completions 与 OpenAI Responses。
+# 短期表保存未完成执行；长期表保存客户端不可见的调用与结果，以便后续请求按
+# 原位置恢复完整模型历史。两类数据的保存时间相互独立。
 #
 # 状态可靠性依赖 ClickHouse（复用上面的 clickhouse 连接配置）：启动会探测
 # Lightweight UPDATE / 严格同步能力；不可用时 health=503、请求 fail-closed，绝不
@@ -334,6 +334,11 @@ nativeProxyTools:
   stateStorage:
     backend: clickhouse
     table: native_proxy_tool_execution_state
+  historyStorage:
+    backend: clickhouse
+    table: native_proxy_tool_history
+    checkpointTable: native_proxy_tool_context_checkpoint
+    ttlDays: 30            # 0 = 不自动删除；未填写时继承 clickhouse.ttlDays
 
 
 # ── Auth 鉴权（user_key 校验 → user_id 解析） ─────────────────────────────────

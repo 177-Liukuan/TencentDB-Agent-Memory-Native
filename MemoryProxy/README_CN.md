@@ -71,7 +71,9 @@ MemoryProxy 对齐 MemoryCore 的四层记忆结构，按“注入 + 工具化�
 - 本 Native 阶段关闭 Knowledge 模型工具提示注入
 - `<session_context>` —— session init 完成后每轮追加的 agent/task 信息
 
-`nativeProxyTools.enabled=false` 时不注入 Native 定义，也不会回退到 Fake Tool、shell 或 curl 文本。开启后，状态能力对 ClickHouse fail-closed，绝不替换成内存或 Redis；执行租约采用 at-least-once，结果接纳和 Client Tool 下发通过 CAS 防止重复应用。
+`nativeProxyTools.enabled=false` 时不注入 Native 定义，也不会回退到 Fake Tool、shell 或 curl 文本。开启后，状态能力对 ClickHouse fail-closed，绝不替换成内存或 Redis；短期执行状态默认保留 1800 秒，已完成的隐藏工具历史默认保留 30 天，并在后续请求中按原位置恢复。
+
+升级后会在会话首次请求时补写仍存在的已完成短期记录；升级前已经被 1800 秒 TTL 删除的记录无法恢复。
 
 ## 环境要求
 
@@ -226,7 +228,7 @@ Anthropic Messages 客户端：
 | `skillRuntime` | 独立 `/skill-bridge` API 的写权限策略 |
 | `rateLimit` | Memory 实例 × 实际模型的 Input TPM / QPM 限流 |
 | `clickhouse` | 按 turn 的用量上报（计费数据源） |
-| `nativeProxyTools` | Anthropic 流式 Native Tool 限制、TTL 与 ClickHouse 状态表 |
+| `nativeProxyTools` | 多协议 Native Tool 限制、短期状态表、长期历史表与压缩记录 |
 | `creditReport` / `creditPricing` | Credit 计费上报与定价表 |
 | `upstream.agents` | 按 agent name 覆盖上游 URL + apiKey（如 `claude-code` 单独走 CCR） |
 

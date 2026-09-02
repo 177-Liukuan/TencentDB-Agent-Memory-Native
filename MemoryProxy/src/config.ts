@@ -42,6 +42,12 @@ export const DEFAULT_CONFIG: ProxyConfig = {
       backend: "clickhouse",
       table: "native_proxy_tool_execution_state",
     },
+    historyStorage: {
+      backend: "clickhouse",
+      table: "native_proxy_tool_history",
+      checkpointTable: "native_proxy_tool_context_checkpoint",
+      ttlDays: 30,
+    },
   },
   redis: {
     enabled: false,
@@ -317,6 +323,22 @@ function parseNativeProxyTools(yaml: RawYamlConfig): ProxyConfig["nativeProxyToo
     throw new Error("nativeProxyTools.stateStorage.table must be a safe ClickHouse identifier");
   }
 
+  const historyBackend = raw?.historyStorage?.backend ?? defaults.historyStorage.backend;
+  if (historyBackend !== "clickhouse") {
+    throw new Error("nativeProxyTools.historyStorage.backend must be clickhouse");
+  }
+  const historyTable = raw?.historyStorage?.table ?? defaults.historyStorage.table;
+  if (typeof historyTable !== "string" || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(historyTable)) {
+    throw new Error("nativeProxyTools.historyStorage.table must be a safe ClickHouse identifier");
+  }
+  const checkpointTable = raw?.historyStorage?.checkpointTable ?? defaults.historyStorage.checkpointTable;
+  if (typeof checkpointTable !== "string" || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(checkpointTable)) {
+    throw new Error("nativeProxyTools.historyStorage.checkpointTable must be a safe ClickHouse identifier");
+  }
+  const inheritedHistoryTtl = yaml.clickhouse?.ttlDays === undefined
+    ? defaults.historyStorage.ttlDays
+    : yaml.clickhouse.ttlDays;
+
   return {
     enabled: typeof raw?.enabled === "boolean" ? raw.enabled : defaults.enabled,
     maxRounds: boundedInt(
@@ -350,6 +372,18 @@ function parseNativeProxyTools(yaml: RawYamlConfig): ProxyConfig["nativeProxyToo
       86_400,
     ),
     stateStorage: { backend, table },
+    historyStorage: {
+      backend: historyBackend,
+      table: historyTable,
+      checkpointTable,
+      ttlDays: boundedInt(
+        "nativeProxyTools.historyStorage.ttlDays",
+        raw?.historyStorage?.ttlDays,
+        inheritedHistoryTtl,
+        0,
+        3_650,
+      ),
+    },
   };
 }
 

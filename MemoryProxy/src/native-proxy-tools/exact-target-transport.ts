@@ -10,6 +10,8 @@ import type {
   JsonValue,
   PersistedForwardTarget,
   PersistedToolObservationIntent,
+  HistoryAnchor,
+  NativeToolProtocol,
   UpstreamRequestSnapshot,
 } from "./types.js";
 
@@ -74,6 +76,9 @@ export interface BuildUpstreamRequestSnapshotInput {
   requestFingerprint?: string;
   observationIntent?: PersistedToolObservationIntent;
   logicalBaseMessages?: unknown[];
+  clientProtocol?: NativeToolProtocol;
+  historyAnchor?: HistoryAnchor;
+  logicalTurnId?: string;
 }
 
 export interface ExactTargetTransportOptions {
@@ -160,11 +165,14 @@ export function buildUpstreamRequestSnapshot(
     : asJsonArray(input.logicalBaseMessages, "logicalBaseMessages");
   return {
     protocol: input.protocol ?? "anthropic",
+    ...(input.clientProtocol ? { clientProtocol: input.clientProtocol } : {}),
     baseMessages,
     logicalBaseMessages: cloneJson(logicalBaseMessages),
     ...(input.requestFingerprint !== undefined
       ? { requestFingerprint: input.requestFingerprint }
       : {}),
+    ...(input.historyAnchor ? { historyAnchor: structuredClone(input.historyAnchor) } : {}),
+    ...(input.logicalTurnId ? { logicalTurnId: input.logicalTurnId } : {}),
     ...(input.observationIntent !== undefined
       ? { observationIntent: structuredClone(input.observationIntent) }
       : {}),

@@ -7,12 +7,15 @@ import {
   serializeToolExecutionStateKey,
   type ToolExecutionStorageAdapter,
 } from "../db/tool-execution-storage-adapter.js";
+import type { NativeToolHistoryStorageAdapter } from "../db/native-tool-history-storage-adapter.js";
 import type { UnifiedToolCall } from "../injection/adapters/interface.js";
 import {
   buildToolResultMessage,
   mergeNativeToolLeakMarkers,
 } from "./anthropic-response-rebuilder.js";
 import { NativeToolTargetUnavailableError } from "./exact-target-transport.js";
+import { openAIAssistantMessageFromSkeleton } from "./openai-response-rebuilder.js";
+import { buildNativeToolHistoryRecord } from "./native-tool-history-record.js";
 import type { NativeProxyToolDispatcher } from "./native-proxy-tool-dispatcher.js";
 import type {
   NativeReentryRequest,
@@ -42,6 +45,7 @@ export interface ClientToolResumeInput {
   body: Record<string, unknown>;
   scope: ToolExecutionScope;
   storage: ToolExecutionStorageAdapter;
+  historyStorage?: NativeToolHistoryStorageAdapter;
   dispatcher: Pick<NativeProxyToolDispatcher, "execute">;
   limits: NativeProxyToolsConfig;
   reenter(request: NativeReentryRequest, stateKey: ToolExecutionStateKey): Promise<UpstreamRound>;
@@ -370,7 +374,7 @@ function validateAssistantSkeleton(context: ToolExecutionContext): void {
 function asAssistantMessages(context: ToolExecutionContext): JsonValue[] {
   if (context.protocol === "responses") return structuredClone(context.assistantSkeleton);
   if (context.protocol === "openai") {
-    return [{ role: "assistant", content: null, tool_calls: structuredClone(context.assistantSkeleton) }];
+    return [openAIAssistantMessageFromSkeleton(context.assistantSkeleton)];
   }
   return [{
     role: "assistant",
@@ -640,6 +644,17 @@ export async function resumeClientToolResults(
       ...asAssistantMessages(context),
       ...asToolResultMessages(context),
     ];
+    if (input.historyStorage) {
+      try {
+        await input.historyStorage.appendCompletedBatch(buildNativeToolHistoryRecord(context));
+      } catch {
+        throw new ClientToolResumeFailure(
+          "native_tool_history_unavailable",
+          "Native Proxy Tool history could not be saved",
+          503,
+        );
+      }
+    }
     const round = context.round + 1;
     let upstreamRound: UpstreamRound;
     try {

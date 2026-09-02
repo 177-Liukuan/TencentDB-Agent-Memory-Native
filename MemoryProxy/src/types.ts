@@ -755,6 +755,12 @@ export interface RawYamlConfig {
       backend?: "clickhouse";
       table?: string;
     };
+    historyStorage?: {
+      backend?: "clickhouse";
+      table?: string;
+      checkpointTable?: string;
+      ttlDays?: number;
+    };
   };
   langfuse?: {
     enabled?: boolean;

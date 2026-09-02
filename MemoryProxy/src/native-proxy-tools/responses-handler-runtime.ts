@@ -11,11 +11,18 @@ import {
 } from "./client-tool-resume.js";
 import { ResponsesToolLoopCoordinator } from "./responses-tool-loop-coordinator.js";
 import { getNativeProxyToolRuntime } from "./runtime.js";
-import type { PersistedForwardTarget, ToolExecutionScope } from "./types.js";
+import type { JsonValue, PersistedForwardTarget, ToolExecutionScope } from "./types.js";
+import { createHistoryAnchor, createLogicalTurnId } from "./history-anchor.js";
+import {
+  backfillActiveCompletedNativeToolHistory,
+  materializeNativeToolHistory,
+} from "./native-tool-history-materializer.js";
+import { confirmPendingNativeToolCompressions } from "./native-tool-compression-receipt.js";
 
 export interface ResponsesNativeRequestContext {
   scope: ToolExecutionScope;
   turnSeq: number;
+  originalInput: JsonValue[];
 }
 
 function streamFrom(bytes: Uint8Array): ReadableStream<Uint8Array> {
@@ -50,13 +57,22 @@ export async function runResponsesNativeToolLoop(input: {
   await runtime.ready();
   if (!runtime.storage || !runtime.dispatcher) throw new Error("Native Proxy Tool runtime is unavailable");
 
+  const historyAnchor = createHistoryAnchor(input.request.originalInput);
   const snapshot = buildUpstreamRequestSnapshot({
     protocol: "responses",
+    clientProtocol: "responses",
     body: input.body,
     url: input.upstreamUrl,
     model: input.model,
     authSource: input.authSource,
-    logicalBaseMessages: Array.isArray(input.body.input) ? input.body.input : undefined,
+    logicalBaseMessages: input.request.originalInput,
+    historyAnchor,
+    logicalTurnId: createLogicalTurnId({
+      scope: input.request.scope,
+      clientProtocol: "responses",
+      anchor: historyAnchor,
+      requestFingerprint: historyAnchor.prefixDigest,
+    }),
   });
   const reenter = createRetainedExactTargetTransport({
     capturedSnapshot: snapshot,
@@ -66,6 +82,7 @@ export async function runResponsesNativeToolLoop(input: {
   const coordinator = new ResponsesToolLoopCoordinator({
     registry: runtime.registry,
     storage: runtime.storage,
+    historyStorage: runtime.historyStorage ?? undefined,
     dispatcher: runtime.dispatcher,
     limits: input.config.nativeProxyTools,
     reenter,
@@ -85,6 +102,45 @@ export async function runResponsesNativeToolLoop(input: {
   return new Response(streamFrom(decision.bytes), { status: decision.status, headers: decision.headers });
 }
 
+/** Restore hidden Native Tool history before any Responses request is sent upstream. */
+export async function materializeResponsesNativeToolHistory(input: {
+  config: ProxyConfig;
+  body: Record<string, unknown>;
+  request: ResponsesNativeRequestContext | null;
+  originalInput?: readonly JsonValue[];
+  confirmCompression?: boolean;
+}): Promise<{ body: Record<string, unknown>; historyIds: string[] }> {
+  if (!input.config.nativeProxyTools.enabled || !input.request || !Array.isArray(input.body.input)) {
+    return { body: input.body, historyIds: [] };
+  }
+  const runtime = getNativeProxyToolRuntime(input.config);
+  await runtime.ready();
+  if (!runtime.storage || !runtime.historyStorage) throw new Error("Native Proxy Tool history storage is unavailable");
+  if (input.confirmCompression !== false) {
+    await confirmPendingNativeToolCompressions({
+      scope: input.request.scope,
+      currentItems: input.originalInput ?? input.body.input as JsonValue[],
+      storage: runtime.historyStorage,
+    });
+  }
+  await backfillActiveCompletedNativeToolHistory({
+    scope: input.request.scope,
+    stateStorage: runtime.storage,
+    historyStorage: runtime.historyStorage,
+  });
+  const restored = await materializeNativeToolHistory({
+    protocol: "responses",
+    items: input.body.input as JsonValue[],
+    anchorItems: input.originalInput ?? input.body.input as JsonValue[],
+    scope: input.request.scope,
+    storage: runtime.historyStorage,
+  });
+  return {
+    body: restored.historyIds.length > 0 ? { ...input.body, input: restored.items } : input.body,
+    historyIds: restored.historyIds,
+  };
+}
+
 export function buildResponsesNativeRequestContext(input: {
   config: ProxyConfig;
   spaceId: string;
@@ -94,12 +150,14 @@ export function buildResponsesNativeRequestContext(input: {
   sessionInfo?: Record<string, unknown> | null;
   turnSeq: number;
   eligible: boolean;
+  originalInput?: readonly JsonValue[];
 }): ResponsesNativeRequestContext | null {
   if (!input.eligible || !input.config.nativeProxyTools.enabled) return null;
   const sessionSpace = typeof input.sessionInfo?.space_id === "string" ? input.sessionInfo.space_id : "";
   const sessionUser = typeof input.sessionInfo?.user_id === "string" ? input.sessionInfo.user_id : "";
   return {
     turnSeq: input.turnSeq,
+    originalInput: structuredClone([...(input.originalInput ?? [])]),
     scope: {
       spaceId: sessionSpace || input.spaceId || input.config.tdai.serviceId || input.config.coreSkill.serviceId,
       userId: sessionUser || input.userId || "anonymous",
@@ -139,6 +197,7 @@ export async function resumeResponsesNativeToolLoop(input: {
     body: input.body,
     scope: input.request!.scope,
     storage: runtime.storage!,
+    historyStorage: runtime.historyStorage ?? undefined,
     dispatcher: runtime.dispatcher!,
     limits: input.config.nativeProxyTools,
     reenter: async (request, stateKey) => {
@@ -159,6 +218,7 @@ export async function resumeResponsesNativeToolLoop(input: {
   const coordinator = new ResponsesToolLoopCoordinator({
     registry: runtime.registry,
     storage: runtime.storage,
+    historyStorage: runtime.historyStorage ?? undefined,
     dispatcher: runtime.dispatcher,
     limits: input.config.nativeProxyTools,
     reenter: selected,

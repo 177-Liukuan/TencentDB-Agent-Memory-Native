@@ -5,7 +5,9 @@ import {
   isReplaySafeResponseHeader,
   type ToolExecutionStorageAdapter,
 } from "../db/tool-execution-storage-adapter.js";
+import type { NativeToolHistoryStorageAdapter } from "../db/native-tool-history-storage-adapter.js";
 import type { UnifiedToolCall } from "../injection/adapters/interface.js";
+import { buildNativeToolHistoryRecord } from "./native-tool-history-record.js";
 import type { NativeProxyToolDispatcher } from "./native-proxy-tool-dispatcher.js";
 import { nativeToolLeaseDurationMs } from "./types.js";
 import type {
@@ -33,6 +35,7 @@ export class ToolLoopCoreFailure extends Error {
 
 export interface ToolLoopExecutionCoreOptions {
   storage: ToolExecutionStorageAdapter;
+  historyStorage?: NativeToolHistoryStorageAdapter;
   dispatcher: Pick<NativeProxyToolDispatcher, "execute">;
   limits: NativeProxyToolsConfig;
   now?: () => Date;
@@ -258,6 +261,27 @@ export class ToolLoopExecutionCore {
         result: result.value,
         isError: result.isError,
       })) return;
+    }
+  }
+
+  async persistCompletedHistory(key: ToolExecutionStateKey): Promise<void> {
+    if (!this.options.historyStorage) return;
+    const context = await this.options.storage.get(key);
+    if (!context) {
+      throw new ToolLoopCoreFailure(
+        "native_tool_state_unavailable",
+        "Native Proxy Tool state expired before history was saved",
+        503,
+      );
+    }
+    try {
+      await this.options.historyStorage.appendCompletedBatch(buildNativeToolHistoryRecord(context));
+    } catch {
+      throw new ToolLoopCoreFailure(
+        "native_tool_history_unavailable",
+        "Native Proxy Tool history could not be saved",
+        503,
+      );
     }
   }
 

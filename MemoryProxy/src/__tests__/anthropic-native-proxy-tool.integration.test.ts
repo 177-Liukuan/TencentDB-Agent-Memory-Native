@@ -5,6 +5,10 @@ import {
   createInMemoryToolExecutionBackend,
   InMemoryToolExecutionStorageAdapter,
 } from "../db/in-memory-tool-execution-storage-adapter.js";
+import {
+  createInMemoryNativeToolHistoryBackend,
+  InMemoryNativeToolHistoryStorageAdapter,
+} from "../db/in-memory-native-tool-history-storage-adapter.js";
 import { __resetInjectionPipelineForTests } from "../injection/index.js";
 import {
   __resetNativeProxyToolRuntimeForTests,
@@ -273,6 +277,38 @@ describe("Anthropic Native Proxy Tool handler", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
+  it("fails closed instead of forwarding when long-term history cannot be queried", async () => {
+    const proxyConfig = config();
+    const historyStorage = new InMemoryNativeToolHistoryStorageAdapter();
+    vi.spyOn(historyStorage, "findByAnchors").mockRejectedValue(new Error("secret database detail"));
+    const runtime = createNativeProxyToolRuntime(proxyConfig, {
+      createStorage: () => new InMemoryToolExecutionStorageAdapter(),
+      createHistoryStorage: () => historyStorage,
+    });
+    await runtime.ready();
+    __setNativeProxyToolRuntimeForTests(runtime);
+    await installInitializedSession();
+    const fetchMock = vi.fn(async (url: string | URL | Request) => {
+      if (String(url) === "https://tdai.example/v3/meta/config/user/get") {
+        return new Response(JSON.stringify({ code: 0, data: { items: [] } }), { status: 200 });
+      }
+      return new Response("unexpected upstream call", { status: 500 });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const response = await createApp(proxyConfig).request("/claude-code/space-1/v1/messages", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-user-id": "user-1", "x-conversation-id": "session-1" },
+      body: JSON.stringify({ model: "claude-test", stream: true, messages: [{ role: "user", content: "question" }] }),
+    });
+    const text = await response.text();
+
+    expect(response.status).toBe(503);
+    expect(text).toContain("native_tool_history_unavailable");
+    expect(text).not.toContain("secret database detail");
+    expect(fetchMock.mock.calls.some(([url]) => String(url) === "https://upstream.example/v1/messages")).toBe(false);
+  });
+
   it("uses the exact successful target and replays a pure-Native final after restart", async () => {
     const proxyConfig = config();
     const backend = createInMemoryToolExecutionBackend();
@@ -392,6 +428,103 @@ describe("Anthropic Native Proxy Tool handler", () => {
         observationAttempt: 1,
       }),
     ]);
+  });
+
+  it("restores a completed hidden Native call in the next Claude Code request exactly once", async () => {
+    const proxyConfig = config();
+    const stateBackend = createInMemoryToolExecutionBackend();
+    const historyBackend = createInMemoryNativeToolHistoryBackend();
+    let runtime = createNativeProxyToolRuntime(proxyConfig, {
+      createStorage: () => new InMemoryToolExecutionStorageAdapter({ backend: stateBackend }),
+      createHistoryStorage: () => new InMemoryNativeToolHistoryStorageAdapter({ backend: historyBackend }),
+      createDispatcher: () => ({
+        execute: async () => ({ isError: false, value: { items: [{ memory: "project rule" }] } }),
+      }),
+    });
+    await runtime.ready();
+    __setNativeProxyToolRuntimeForTests(runtime);
+    await installInitializedSession();
+
+    const upstreamBodies: Record<string, unknown>[] = [];
+    const responses = [
+      singleConsumerSse(nativeCallFixture()).response,
+      singleConsumerSse(finalTextFixture("first answer")).response,
+      singleConsumerSse(finalTextFixture("second answer")).response,
+    ];
+    vi.stubGlobal("fetch", vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      const href = String(url);
+      if (href === "https://tdai.example/v3/meta/config/user/get") {
+        return new Response(JSON.stringify({ code: 0, data: { items: [] } }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      if (href === "https://upstream.example/v1/messages") {
+        upstreamBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+        return responses[upstreamBodies.length - 1];
+      }
+      return new Response("not found", { status: 404 });
+    }));
+    const app = createApp(proxyConfig);
+    const headers = {
+      "content-type": "application/json",
+      "x-api-key": "client-key",
+      "x-user-id": "user-1",
+      "x-conversation-id": "session-1",
+    };
+
+    const first = await app.request("/claude-code/space-1/v1/messages", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: "claude-test",
+        max_tokens: 1_024,
+        stream: true,
+        messages: [{ role: "user", content: "What rules apply?" }],
+      }),
+    });
+    expect(await first.text()).toContain("first answer");
+
+    await shutdownNativeProxyToolRuntime();
+    __resetNativeProxyToolRuntimeForTests();
+    for (const state of stateBackend.rows.values()) {
+      state.expiresAt = "2026-01-01T00:00:00.000Z";
+    }
+    runtime = createNativeProxyToolRuntime(proxyConfig, {
+      createStorage: () => new InMemoryToolExecutionStorageAdapter({ backend: stateBackend }),
+      createHistoryStorage: () => new InMemoryNativeToolHistoryStorageAdapter({ backend: historyBackend }),
+      createDispatcher: () => ({
+        execute: async () => ({ isError: false, value: { items: [{ memory: "should not execute" }] } }),
+      }),
+    });
+    await runtime.ready();
+    __setNativeProxyToolRuntimeForTests(runtime);
+
+    const second = await app.request("/claude-code/space-1/v1/messages", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: "claude-test",
+        max_tokens: 1_024,
+        stream: true,
+        messages: [
+          { role: "user", content: "What rules apply?" },
+          { role: "assistant", content: "first answer" },
+          { role: "user", content: "What about now?" },
+        ],
+      }),
+    });
+    expect(await second.text()).toContain("second answer");
+    expect(upstreamBodies).toHaveLength(3);
+
+    const restoredMessages = upstreamBodies[2].messages as Array<Record<string, unknown>>;
+    expect(restoredMessages.map((message) => message.role)).toEqual([
+      "user", "assistant", "user", "assistant", "user",
+    ]);
+    const serialized = JSON.stringify(restoredMessages);
+    expect(serialized.match(/native-call-1/g)).toHaveLength(2);
+    expect(serialized.match(/tdai_memory_search/g)).toHaveLength(1);
+    expect(serialized).toContain("project rule");
   });
 
   it("keeps a durable final pending when its original observation intent is missing", async () => {

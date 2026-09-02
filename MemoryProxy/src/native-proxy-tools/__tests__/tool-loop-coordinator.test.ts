@@ -2,8 +2,11 @@ import { describe, expect, it, vi } from "vitest";
 
 import { DEFAULT_CONFIG } from "../../config.js";
 import { InMemoryToolExecutionStorageAdapter } from "../../db/in-memory-tool-execution-storage-adapter.js";
+import { InMemoryNativeToolHistoryStorageAdapter } from "../../db/in-memory-native-tool-history-storage-adapter.js";
+import type { NativeToolHistoryStorageAdapter } from "../../db/native-tool-history-storage-adapter.js";
 import type { UnifiedToolCall } from "../../injection/adapters/interface.js";
 import type { NativeToolResult, ToolExecutionScope, UpstreamRequestSnapshot } from "../types.js";
+import { createHistoryAnchor } from "../history-anchor.js";
 import {
   AnthropicToolLoopCoordinator,
   type NativeReentryRequest,
@@ -232,6 +235,7 @@ function coordinatorHarness(options: {
   configure?: (config: typeof DEFAULT_CONFIG) => void;
   beforeReenter?: () => Promise<void>;
   beforeClientDispatch?: () => Promise<void>;
+  historyStorage?: NativeToolHistoryStorageAdapter;
   onClientDispatchPrepared?: (dispatch: {
     stateKey: import("../types.js").ToolExecutionStateKey;
     bytes: Uint8Array;
@@ -243,6 +247,7 @@ function coordinatorHarness(options: {
   config.nativeProxyTools.enabled = true;
   options.configure?.(config);
   const storage = new InMemoryToolExecutionStorageAdapter({ now: () => fixedNow });
+  const historyStorage = options.historyStorage ?? new InMemoryNativeToolHistoryStorageAdapter();
   const execute = vi.fn(options.execute ?? (async (call: UnifiedToolCall) => ({
     isError: false,
     value: { memories: [`result:${call.callId}`] },
@@ -256,6 +261,7 @@ function coordinatorHarness(options: {
   const coordinator = new AnthropicToolLoopCoordinator({
     registry: createDefaultNativeProxyToolRegistry(),
     storage,
+    historyStorage,
     dispatcher: { execute },
     limits: config.nativeProxyTools,
     reenter,
@@ -265,7 +271,7 @@ function coordinatorHarness(options: {
     now: () => fixedNow,
     createId: () => `id-${++sequence}`,
   });
-  return { coordinator, storage, execute, reenter, config };
+  return { coordinator, storage, historyStorage, execute, reenter, config };
 }
 
 async function eventually(assertion: () => void, timeoutMs = 1_000): Promise<void> {
@@ -376,7 +382,7 @@ describe("AnthropicToolLoopCoordinator", () => {
 
   it("persists Native results and re-enters with the first request snapshot", async () => {
     const source = byteStream(nativeFixture());
-    const { coordinator, storage, reenter } = coordinatorHarness();
+    const { coordinator, storage, historyStorage, reenter } = coordinatorHarness();
 
     const decision = await coordinator.handleRound(roundInput(source.stream));
 
@@ -387,6 +393,10 @@ describe("AnthropicToolLoopCoordinator", () => {
       expect(decision.observationStateKey).toMatchObject({ toolBatchId: "id-1" });
     }
     expect(reenter).toHaveBeenCalledTimes(1);
+    await expect(historyStorage.findByAnchors(
+      { spaceId: "space-1", userId: "user-1", agentSource: "claude-code", sessionId: "session-1" },
+      [createHistoryAnchor(snapshot().baseMessages)],
+    )).resolves.toEqual([expect.objectContaining({ proxyCallIds: ["proxy-1"] })]);
     const request = reenter.mock.calls[0][0];
     expect(request).toMatchObject({
       round: 2,
@@ -429,6 +439,21 @@ describe("AnthropicToolLoopCoordinator", () => {
       },
       slots: [{ callId: "proxy-1", status: "succeeded" }],
     });
+  });
+
+  it("does not re-enter when completed Native history cannot be saved", async () => {
+    const historyStorage = new InMemoryNativeToolHistoryStorageAdapter();
+    vi.spyOn(historyStorage, "appendCompletedBatch").mockRejectedValue(new Error("database unavailable"));
+    const { coordinator, reenter } = coordinatorHarness({ historyStorage });
+
+    const decision = await coordinator.handleRound(roundInput(byteStream(nativeFixture()).stream));
+
+    expect(decision).toMatchObject({
+      kind: "error",
+      code: "native_tool_history_unavailable",
+      status: 503,
+    });
+    expect(reenter).not.toHaveBeenCalled();
   });
 
   it("sanitizes an internal re-entry non-2xx body without parsing or leaking it", async () => {

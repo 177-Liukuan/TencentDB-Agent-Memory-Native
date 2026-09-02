@@ -68,11 +68,19 @@ import {
 } from "./native-proxy-tools/client-tool-resume.js";
 import { describeNativeProxyToolInjectionFailure } from "./native-proxy-tools/native-proxy-tools-injector.js";
 import type { PersistedForwardTarget, ToolExecutionScope } from "./native-proxy-tools/types.js";
+import { createHistoryAnchor, createLogicalTurnId } from "./native-proxy-tools/history-anchor.js";
 import {
-  commitContextCompressionCheckpoint,
-  prepareContextCompression,
-  type ContextCompressionPreparation,
-} from "./native-proxy-tools/context-compression.js";
+  backfillActiveCompletedNativeToolHistory,
+  materializeNativeToolHistory,
+  NativeToolHistoryConflictError,
+} from "./native-proxy-tools/native-tool-history-materializer.js";
+import {
+  beginNativeToolCompression,
+  confirmPendingNativeToolCompressions,
+  looksLikeAnthropicCompressionRequest,
+  openAIChatResponseCompletedForCompression,
+  trackNativeToolCompressionResponse,
+} from "./native-proxy-tools/native-tool-compression-receipt.js";
 
 /**
  * Build a per-request TdaiClient. `spaceId` (extracted from the request path
@@ -679,15 +687,16 @@ export async function handleChatCompletions(
 
   let messages = Array.isArray(body.messages) ? body.messages : [];
   const isStream = body.stream === true;
-  const nativeToolRuntime = config.nativeProxyTools.enabled && isStream
+  const historyRuntime = config.nativeProxyTools.enabled
     ? getNativeProxyToolRuntime(config)
     : null;
-  const nativeLogicalRequestFingerprint = nativeToolRuntime
+  const nativeToolRuntime = isStream ? historyRuntime : null;
+  const nativeLogicalRequestFingerprint = historyRuntime
     ? fingerprintAnthropicLogicalRequest(body)
     : undefined;
-  const nativeLogicalBaseMessages = nativeToolRuntime ? structuredClone(messages) : undefined;
+  const nativeLogicalBaseMessages = historyRuntime ? structuredClone(messages) : undefined;
   const reservedClientToolName = Array.isArray(body.tools)
-    ? body.tools.map(openAINativeToolName).find((name) => name && nativeToolRuntime?.registry.owns(name))
+    ? body.tools.map(openAINativeToolName).find((name) => name && historyRuntime?.registry.owns(name))
     : undefined;
   if (reservedClientToolName) {
     return nativeToolErrorResponse(
@@ -696,9 +705,9 @@ export async function handleChatCompletions(
       `Tool name '${reservedClientToolName}' is reserved by the proxy`,
     );
   }
-  if (nativeToolRuntime) {
+  if (historyRuntime) {
     try {
-      await nativeToolRuntime.ready();
+      await historyRuntime.ready();
     } catch {
       return nativeToolErrorResponse(
         503,
@@ -1142,22 +1151,9 @@ export async function handleChatCompletions(
         sessionKey,
       });
   const tdaiUserMessage = extractLatestUserMessage(messages);
-  const toolExecutionScope = nativeToolRuntime
+  const toolExecutionScope = historyRuntime
     ? openAINativeScope({ spaceId, userId, agentSource, sessionKey, sessionInfo, config })
     : null;
-  let compressionPreparation: ContextCompressionPreparation | null = null;
-  if (isAuxiliary && nativeToolRuntime?.storage && toolExecutionScope) {
-    compressionPreparation = await prepareContextCompression({
-      body,
-      scope: toolExecutionScope,
-      storage: nativeToolRuntime.storage,
-    });
-    if (compressionPreparation) {
-      body = compressionPreparation.body;
-      messages = Array.isArray(body.messages) ? body.messages : messages;
-    }
-  }
-
   // Resume a previously dispatched OpenAI Client Tool batch before any new
   // injection or routing can alter its persisted target and hidden history.
   if (nativeToolRuntime?.storage && nativeToolRuntime.dispatcher && toolExecutionScope) {
@@ -1185,6 +1181,7 @@ export async function handleChatCompletions(
       body,
       scope: toolExecutionScope,
       storage: nativeStorage,
+      historyStorage: nativeToolRuntime.historyStorage ?? undefined,
       dispatcher: nativeDispatcher,
       limits: config.nativeProxyTools,
       reentryLeaseMs: (config.server.forwardTimeoutMs ?? 600_000)
@@ -1221,6 +1218,7 @@ export async function handleChatCompletions(
       const coordinator = new OpenAIToolLoopCoordinator({
         registry: nativeToolRuntime.registry,
         storage: nativeStorage,
+        historyStorage: nativeToolRuntime.historyStorage ?? undefined,
         dispatcher: nativeDispatcher,
         limits: config.nativeProxyTools,
         reenter: exactReentry,
@@ -1371,6 +1369,53 @@ export async function handleChatCompletions(
     useGuard: config.costGuard.markerOptIn ? hasCostGuardMarker(c.req.path) : true,
     agentName: agentFromPath,
   });
+
+  let nativeCompressionReceipt: Awaited<ReturnType<typeof beginNativeToolCompression>> = null;
+  if (historyRuntime?.storage && historyRuntime.historyStorage && toolExecutionScope) {
+    try {
+      await historyRuntime.runOperation(async () => {
+        await confirmPendingNativeToolCompressions({
+          scope: toolExecutionScope,
+          currentItems: (nativeLogicalBaseMessages ?? messages) as import("./native-proxy-tools/types.js").JsonValue[],
+          storage: historyRuntime.historyStorage!,
+        });
+        await backfillActiveCompletedNativeToolHistory({
+          scope: toolExecutionScope,
+          stateStorage: historyRuntime.storage!,
+          historyStorage: historyRuntime.historyStorage!,
+        });
+        const restored = await materializeNativeToolHistory({
+          protocol: "openai",
+          items: messages as import("./native-proxy-tools/types.js").JsonValue[],
+          anchorItems: (nativeLogicalBaseMessages ?? messages) as import("./native-proxy-tools/types.js").JsonValue[],
+          scope: toolExecutionScope,
+          storage: historyRuntime.historyStorage!,
+        });
+        if (restored.historyIds.length > 0) {
+          messages = restored.items;
+          body = { ...body, messages: restored.items };
+        }
+        if (looksLikeAnthropicCompressionRequest(
+          (nativeLogicalBaseMessages ?? messages) as import("./native-proxy-tools/types.js").JsonValue[],
+        )) {
+          nativeCompressionReceipt = await beginNativeToolCompression({
+            scope: toolExecutionScope,
+            sourceItems: (nativeLogicalBaseMessages ?? messages) as import("./native-proxy-tools/types.js").JsonValue[],
+            historyIds: restored.historyIds,
+            storage: historyRuntime.historyStorage!,
+          });
+        }
+      });
+    } catch (error) {
+      return nativeToolErrorResponse(
+        error instanceof NativeToolHistoryConflictError ? 409 : 503,
+        error instanceof NativeToolHistoryConflictError ? "native_tool_history_conflict" : "native_tool_history_unavailable",
+        error instanceof NativeToolHistoryConflictError
+          ? error.message
+          : "Native Proxy Tool history could not be restored",
+      );
+    }
+  }
 
   // ── Create pipeline logger ──────────────────────────────────────────────
   const pipe = createPipeline(config, traceId, target.model);
@@ -1612,8 +1657,11 @@ export async function handleChatCompletions(
         : upstreamHeaders;
       let upstreamSnapshot;
       try {
+        const logicalMessages = nativeLogicalBaseMessages ?? messages;
+        const historyAnchor = createHistoryAnchor(logicalMessages);
         upstreamSnapshot = buildUpstreamRequestSnapshot({
           protocol: "openai",
+          clientProtocol: "openai",
           body: successfulBody,
           url: successfulUrl,
           model: effectiveModel,
@@ -1624,7 +1672,14 @@ export async function handleChatCompletions(
             hasAgentEntry: agentUpstreamEntry !== undefined,
           }),
           ...(nativeLogicalRequestFingerprint ? { requestFingerprint: nativeLogicalRequestFingerprint } : {}),
-          logicalBaseMessages: nativeLogicalBaseMessages ?? messages,
+          logicalBaseMessages: logicalMessages,
+          historyAnchor,
+          logicalTurnId: createLogicalTurnId({
+            scope: toolExecutionScope,
+            clientProtocol: "openai",
+            anchor: historyAnchor,
+            requestFingerprint: nativeLogicalRequestFingerprint ?? historyAnchor.prefixDigest,
+          }),
         });
       } catch {
         pipe.streamDone(null);
@@ -1646,6 +1701,7 @@ export async function handleChatCompletions(
       const coordinator = new OpenAIToolLoopCoordinator({
         registry: nativeToolRuntime.registry,
         storage: nativeToolRuntime.storage,
+        historyStorage: nativeToolRuntime.historyStorage ?? undefined,
         dispatcher: nativeToolRuntime.dispatcher,
         limits: config.nativeProxyTools,
         reenter,
@@ -1665,10 +1721,18 @@ export async function handleChatCompletions(
         nativeToolRuntime.retainExactTarget(decision.stateKey, reenter);
       }
       pipe.streamDone(null);
-      return new Response(streamFromBytes(decision.bytes), {
+      const clientResponse = new Response(streamFromBytes(decision.bytes), {
         status: decision.status,
         headers: decision.headers,
       });
+      return nativeCompressionReceipt && historyRuntime?.historyStorage
+        ? trackNativeToolCompressionResponse({
+            response: clientResponse,
+            receipt: nativeCompressionReceipt,
+            storage: historyRuntime.historyStorage,
+            isComplete: openAIChatResponseCompletedForCompression,
+          })
+        : clientResponse;
     }
 
     pipe.streamStart();
@@ -1705,39 +1769,21 @@ export async function handleChatCompletions(
       preparedStats,
     };
     const passthrough = createUsageTapTransform(tapCtx);
-    let tappedStream = upstreamResp.body.pipeThrough(passthrough);
-    if (
-      compressionPreparation
-      && nativeToolRuntime?.storage
-      && upstreamResp.status >= 200
-      && upstreamResp.status < 300
-    ) {
-      const preparation = compressionPreparation;
-      const storage = nativeToolRuntime.storage;
-      tappedStream = tappedStream.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
-        transform(chunk, controller) { controller.enqueue(chunk); },
-        async flush() {
-          await commitContextCompressionCheckpoint({ preparation, storage });
-        },
-      }));
-    }
+    const tappedStream = upstreamResp.body.pipeThrough(passthrough);
 
-    return new Response(tappedStream, { status: upstreamResp.status, headers: respHeaders });
+    const clientResponse = new Response(tappedStream, { status: upstreamResp.status, headers: respHeaders });
+    return nativeCompressionReceipt && historyRuntime?.historyStorage
+      ? trackNativeToolCompressionResponse({
+          response: clientResponse,
+          receipt: nativeCompressionReceipt,
+          storage: historyRuntime.historyStorage,
+          isComplete: openAIChatResponseCompletedForCompression,
+        })
+      : clientResponse;
   }
 
   // ── Non-streaming response ───────────────────────────────────────────────
   const respText = await upstreamResp.text();
-  if (
-    compressionPreparation
-    && nativeToolRuntime?.storage
-    && upstreamResp.status >= 200
-    && upstreamResp.status < 300
-  ) {
-    await commitContextCompressionCheckpoint({
-      preparation: compressionPreparation,
-      storage: nativeToolRuntime.storage,
-    });
-  }
   const endTime = new Date().toISOString();
 
   let usage: Record<string, unknown> | null = null;
@@ -1982,7 +2028,15 @@ export async function handleChatCompletions(
     );
   }
 
-  return new Response(respText, { status: upstreamResp.status, headers: respHeaders });
+  const clientResponse = new Response(respText, { status: upstreamResp.status, headers: respHeaders });
+  return nativeCompressionReceipt && historyRuntime?.historyStorage
+    ? trackNativeToolCompressionResponse({
+        response: clientResponse,
+        receipt: nativeCompressionReceipt,
+        storage: historyRuntime.historyStorage,
+        isComplete: openAIChatResponseCompletedForCompression,
+      })
+    : clientResponse;
 }
 
 

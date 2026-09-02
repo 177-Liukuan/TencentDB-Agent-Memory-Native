@@ -71,7 +71,9 @@ Other prompt context is deliberately reference-only:
 - Knowledge tool prompt injection is disabled in this Native phase
 - `<session_context>` — agent/task info appended every turn after session init completes
 
-`nativeProxyTools.enabled=false` means no Native definition is injected. There is intentionally no Fake Tool, shell, or curl fallback. When enabled, Native state is fail-closed on ClickHouse capability/readiness: the proxy never substitutes in-memory or Redis state. Tool execution leases are at-least-once, while result acceptance and Client Tool dispatch are CAS-protected to prevent duplicate result application.
+`nativeProxyTools.enabled=false` means no Native definition is injected. There is intentionally no Fake Tool, shell, or curl fallback. When enabled, Native state is fail-closed on ClickHouse capability/readiness: short-lived execution state defaults to 1800 seconds, while completed hidden Tool history defaults to 30 days and is restored at its original position on later requests.
+
+On upgrade, completed short-lived records that still exist are backfilled on the session's next request. Records already deleted by the old 1800-second TTL cannot be recovered.
 
 ## Requirements
 
@@ -257,7 +259,7 @@ Config sections at a glance:
 | `skillRuntime` | write policy for the independent `/skill-bridge` API |
 | `rateLimit` | Input TPM / QPM limiting per memory instance × actual model |
 | `clickhouse` | per-turn usage reporting (billing data source) |
-| `nativeProxyTools` | Anthropic streaming Native Tool limits, TTL and ClickHouse state table |
+| `nativeProxyTools` | Multi-protocol Native Tool limits, short-lived state, long-term history, and compression records |
 | `creditReport` / `creditPricing` | Credit billing report and pricing table |
 | `upstream.agents` | override upstream URL + apiKey per agent name (e.g. route `claude-code` through CCR) |
 

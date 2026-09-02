@@ -60,6 +60,26 @@ describe("OpenAI Chat Completions stream parser", () => {
       ...data({ id: "chat-provider", choices: [{ index: 0, delta: {}, finish_reason: "stop" }] }),
       ...data("[DONE]"),
     ]));
+    expect(parser.snapshot()).toMatchObject({
+      assistantContent: null,
+      assistantExtras: {
+        provider_tool: { type: "web_search", id: "srv-1", status: "completed", result: { answer: "opaque" } },
+      },
+    });
+  });
+
+  it("retains assistant text and reasoning beside a function call for later history restoration", () => {
+    const parser = new OpenAIAdapter().createStreamParser!(createDefaultNativeProxyToolRegistry());
+    parser.push(data({ choices: [{ index: 0, delta: {
+      role: "assistant", content: "checking ", reasoning_content: "think ",
+      tool_calls: [{ index: 0, id: "proxy-1", type: "function", function: { name: "tdai_memory_search", arguments: "{}" } }],
+    }, finish_reason: null }] }));
+    parser.push(data({ choices: [{ index: 0, delta: { content: "now", reasoning_content: "again" }, finish_reason: "tool_calls" }] }));
+
+    expect(parser.snapshot()).toMatchObject({
+      assistantContent: "checking now",
+      assistantExtras: { reasoning_content: "think again" },
+    });
   });
 
   it("reports malformed function arguments at the conservative round boundary", () => {

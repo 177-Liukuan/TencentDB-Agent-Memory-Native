@@ -21,6 +21,54 @@ export interface NativeProxyToolsConfig {
     backend: "clickhouse";
     table: string;
   };
+  historyStorage: {
+    backend: "clickhouse";
+    table: string;
+    checkpointTable: string;
+    ttlDays: number;
+  };
+}
+
+export type NativeToolProtocol = "anthropic" | "openai" | "responses";
+
+export interface HistoryAnchor {
+  version: 1;
+  prefixDigest: string;
+  itemCount: number;
+}
+
+export interface NativeToolHistoryScope {
+  spaceId: string;
+  userId: string;
+  agentSource: string;
+  sessionId: string;
+}
+
+export interface NativeToolHistoryRecord {
+  historyId: string;
+  logicalTurnId: string;
+  scope: NativeToolHistoryScope;
+  clientProtocol: NativeToolProtocol;
+  upstreamProtocol: NativeToolProtocol;
+  anchor: HistoryAnchor;
+  round: number;
+  fullSegment: JsonValue[];
+  clientProjection: JsonValue[];
+  proxyCallIds: string[];
+  clientCallIds: string[];
+  createdAt: string;
+  expiresAt?: string;
+}
+
+export interface NativeToolCompressionReceipt {
+  receiptId: string;
+  scope: NativeToolHistoryScope;
+  sourceRootDigest: string;
+  historyIds: string[];
+  summaryDigest?: string;
+  nextContextRoot?: string;
+  createdAt: string;
+  confirmedAt?: string;
 }
 
 export interface ToolLoopLimits {
@@ -117,6 +165,8 @@ export interface PersistedToolObservationIntent {
  */
 export interface UpstreamRequestSnapshot {
   protocol: "anthropic" | "openai" | "responses";
+  /** Client wire format; differs from protocol for Anthropic-client/Responses-upstream. */
+  clientProtocol?: NativeToolProtocol;
   baseMessages: JsonValue[];
   /** Original client-visible history used only for ordinary telemetry/writeback. */
   logicalBaseMessages?: JsonValue[];
@@ -124,6 +174,10 @@ export interface UpstreamRequestSnapshot {
   nativeLeakMarkers?: PersistedNativeToolLeakMarker[];
   /** Stable digest of the client-visible logical request before Native injection. */
   requestFingerprint?: string;
+  /** Stable insertion point in the original client-visible history. */
+  historyAnchor?: HistoryAnchor;
+  /** Stable identity shared by every internal model round for one client request. */
+  logicalTurnId?: string;
   /** Original, allowlisted identity and enabled effects for durable writeback. */
   observationIntent?: PersistedToolObservationIntent;
   /** Successful Context Compression checkpoint that covers this hidden batch. */

@@ -4,6 +4,8 @@ import {
   createInMemoryToolExecutionBackend,
   InMemoryToolExecutionStorageAdapter,
 } from "../../db/in-memory-tool-execution-storage-adapter.js";
+import { InMemoryNativeToolHistoryStorageAdapter } from "../../db/in-memory-native-tool-history-storage-adapter.js";
+import type { NativeToolHistoryStorageAdapter } from "../../db/native-tool-history-storage-adapter.js";
 import type { UnifiedToolCall } from "../../injection/adapters/interface.js";
 import {
   completeClientToolReentry,
@@ -171,6 +173,7 @@ function resumeHarness(options: {
   execute?: (call: UnifiedToolCall, context: ToolExecutionScope) => Promise<NativeToolResult>;
   reenter?: (request: NativeReentryRequest) => Promise<UpstreamRound>;
   now?: () => Date;
+  historyStorage?: NativeToolHistoryStorageAdapter;
 } = {}) {
   const storage = options.storage ?? new InMemoryToolExecutionStorageAdapter({ now: () => fixedNow });
   const execute = vi.fn(options.execute ?? (async () => ({
@@ -183,6 +186,7 @@ function resumeHarness(options: {
     body,
     scope: inputScope,
     storage,
+    historyStorage: options.historyStorage ?? new InMemoryNativeToolHistoryStorageAdapter(),
     dispatcher: { execute },
     limits: {
       enabled: true,
@@ -193,6 +197,12 @@ function resumeHarness(options: {
       maxResultBytes: 65_536,
       stateTtlSeconds: 1_800,
       stateStorage: { backend: "clickhouse", table: "native_proxy_tool_execution_state" },
+      historyStorage: {
+        backend: "clickhouse",
+        table: "native_proxy_tool_history",
+        checkpointTable: "native_proxy_tool_context_checkpoint",
+        ttlDays: 30,
+      },
     },
     reenter,
     now: options.now ?? (() => fixedNow),
@@ -309,6 +319,27 @@ describe("resumeClientToolResults", () => {
         { type: "tool_result", tool_use_id: "p2", content: "{\"memories\":[\"p2-result\"]}" },
       ],
     });
+  });
+
+  it("does not re-enter a mixed call when its long-term history cannot be saved", async () => {
+    const historyStorage = new InMemoryNativeToolHistoryStorageAdapter();
+    vi.spyOn(historyStorage, "appendCompletedBatch").mockRejectedValue(new Error("database unavailable"));
+    const harness = resumeHarness({ historyStorage });
+    const state = mixedState({
+      p1: {
+        status: "succeeded",
+        result: { memories: ["p1-result"] },
+        isError: false,
+        executionLeaseOwner: undefined,
+        executionLeaseUntil: undefined,
+      },
+    });
+    await harness.storage.create(state);
+
+    const decision = await resumeClientToolResults(harness.input());
+
+    expect(decision).toMatchObject({ kind: "error", code: "native_tool_history_unavailable", status: 503 });
+    expect(harness.reenter).not.toHaveBeenCalled();
   });
 
   it("reclaims an expired read-only lease from a second Adapter instance", async () => {

@@ -372,10 +372,13 @@ export function validateToolExecutionContext(context: ToolExecutionContext): voi
   }
   const snapshotKeys = new Set([
     "protocol",
+    "clientProtocol",
     "baseMessages",
     "logicalBaseMessages",
     "nativeLeakMarkers",
     "requestFingerprint",
+    "historyAnchor",
+    "logicalTurnId",
     "observationIntent",
     "compressionCheckpoint",
     "system",

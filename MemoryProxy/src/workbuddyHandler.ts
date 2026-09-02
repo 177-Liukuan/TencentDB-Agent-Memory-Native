@@ -55,13 +55,17 @@ import { triggerSkillExtractIfReady } from "./skill/handler-glue.js";
 import { isExtractionAllowed, logExtractionSkipped } from "./extraction-gate.js";
 import { describeNativeProxyToolInjectionFailure } from "./native-proxy-tools/native-proxy-tools-injector.js";
 import { getNativeProxyToolRuntime } from "./native-proxy-tools/runtime.js";
-import { commitContextCompressionCheckpoint, prepareContextCompression } from "./native-proxy-tools/context-compression.js";
 import {
   buildResponsesNativeRequestContext,
+  materializeResponsesNativeToolHistory,
   resumeResponsesNativeToolLoop,
   runResponsesNativeToolLoop,
   type ResponsesNativeRequestContext,
 } from "./native-proxy-tools/responses-handler-runtime.js";
+import {
+  beginNativeToolCompression,
+  trackNativeToolCompressionResponse,
+} from "./native-proxy-tools/native-tool-compression-receipt.js";
 
 // ── Handler-level constants ──────────────────────────────────────────────────
 
@@ -898,19 +902,31 @@ export async function handleWorkbuddyEndpoint(
       const compactRequest = compactSessionId ? buildResponsesNativeRequestContext({
         config, spaceId, userId, agentSource: "workbuddy", sessionId: compactSessionId,
         turnSeq: countHumanTurnsWorkbuddy(body.input), eligible: true,
+        originalInput: Array.isArray(body.input) ? body.input as import("./native-proxy-tools/types.js").JsonValue[] : [],
       }) : null;
       if (compactRequest) {
         try {
+          const originalCompactInput = Array.isArray(body.input)
+            ? structuredClone(body.input) as import("./native-proxy-tools/types.js").JsonValue[]
+            : [];
+          const restored = await materializeResponsesNativeToolHistory({
+            config,
+            body,
+            request: compactRequest,
+            originalInput: originalCompactInput,
+            confirmCompression: false,
+          });
           const runtime = getNativeProxyToolRuntime(config);
           await runtime.ready();
-          if (!runtime.storage) throw new Error("Native Proxy Tool storage is unavailable");
-          const preparation = await prepareContextCompression({ body, scope: compactRequest.scope, storage: runtime.storage });
-          if (preparation) {
-            const response = await forwardToUpstream(c, config, preparation.body, traceId, startTime, keyId, modelId, pipe, null, null);
-            const completed = response.ok && (await response.clone().text()).includes("response.completed");
-            if (completed) await commitContextCompressionCheckpoint({ preparation, storage: runtime.storage });
-            return response;
-          }
+          if (!runtime.historyStorage) throw new Error("Native Proxy Tool history storage is unavailable");
+          const receipt = await beginNativeToolCompression({
+            scope: compactRequest.scope,
+            sourceItems: originalCompactInput,
+            historyIds: restored.historyIds,
+            storage: runtime.historyStorage,
+          });
+          const response = await forwardToUpstream(c, config, restored.body, traceId, startTime, keyId, modelId, pipe, null, null);
+          return trackNativeToolCompressionResponse({ response, receipt, storage: runtime.historyStorage });
         } catch (error) {
           return c.json({ error: { type: "api_error", code: "native_tool_compression_failed", message: error instanceof Error ? error.message : String(error) } }, 503);
         }
@@ -1259,7 +1275,8 @@ export async function handleWorkbuddyEndpoint(
 
   const nativeRequest = buildResponsesNativeRequestContext({
     config, spaceId, userId, agentSource, sessionId: sessionKey, sessionInfo, turnSeq,
-    eligible: body.stream === true && !injectionSkipped && Boolean(sessionInfo),
+    eligible: !injectionSkipped && Boolean(sessionInfo),
+    originalInput: input as import("./native-proxy-tools/types.js").JsonValue[],
   });
   const upstreamPath = path.replace(/^\/workbuddy\/[^/]+/, "");
   const resumedNativeResponse = await resumeResponsesNativeToolLoop({
@@ -1328,6 +1345,24 @@ export async function handleWorkbuddyEndpoint(
         err instanceof Error ? err.message : String(err),
       );
       // Degrade gracefully: forward without injection
+    }
+  }
+
+  if (config.nativeProxyTools.enabled && nativeRequest) {
+    try {
+      body = (await materializeResponsesNativeToolHistory({
+        config,
+        body,
+        request: nativeRequest,
+        originalInput: input as import("./native-proxy-tools/types.js").JsonValue[],
+      })).body;
+    } catch (error) {
+      const conflict = error instanceof Error && error.name === "NativeToolHistoryConflictError";
+      return c.json({ error: {
+        type: conflict ? "invalid_request_error" : "api_error",
+        code: conflict ? "native_tool_history_conflict" : "native_tool_history_unavailable",
+        message: error instanceof Error ? error.message : "Native Proxy Tool history could not be restored",
+      } }, conflict ? 409 : 503);
     }
   }
 

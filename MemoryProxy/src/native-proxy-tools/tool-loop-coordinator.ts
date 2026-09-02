@@ -1,4 +1,5 @@
 import type { ToolExecutionStorageAdapter } from "../db/tool-execution-storage-adapter.js";
+import type { NativeToolHistoryStorageAdapter } from "../db/native-tool-history-storage-adapter.js";
 import {
   AnthropicStreamParser,
   type AnthropicStreamSnapshot,
@@ -83,6 +84,7 @@ export type ToolLoopDecision =
 export interface AnthropicToolLoopCoordinatorOptions {
   registry: NativeProxyToolRegistry;
   storage: ToolExecutionStorageAdapter;
+  historyStorage?: NativeToolHistoryStorageAdapter;
   dispatcher: Pick<NativeProxyToolDispatcher, "execute">;
   limits: NativeProxyToolsConfig;
   reenter(request: NativeReentryRequest): Promise<UpstreamRound>;
@@ -532,6 +534,7 @@ export class AnthropicToolLoopCoordinator {
         asAssistantMessage(completedState.assistantSkeleton),
         asToolResultMessage(completedState.slots),
       ];
+      await this.core.persistCompletedHistory(stateKey);
       const nextRoundNumber = input.round + 1;
       await this.options.beforeReenter?.();
       const nextRound = await this.options.reenter({

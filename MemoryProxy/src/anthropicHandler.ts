@@ -108,6 +108,19 @@ import {
   createResponsesToAnthropicSseTransform,
 } from "./protocol-bridge/responses-anthropic-response.js";
 import { buildClientVisibleResponsesSse } from "./native-proxy-tools/responses-response-rebuilder.js";
+import { createHistoryAnchor, createLogicalTurnId } from "./native-proxy-tools/history-anchor.js";
+import {
+  backfillActiveCompletedNativeToolHistory,
+  materializeNativeToolHistory,
+  NativeToolHistoryConflictError,
+} from "./native-proxy-tools/native-tool-history-materializer.js";
+import {
+  anthropicResponseCompletedForCompression,
+  beginNativeToolCompression,
+  confirmPendingNativeToolCompressions,
+  looksLikeAnthropicCompressionRequest,
+  trackNativeToolCompressionResponse,
+} from "./native-proxy-tools/native-tool-compression-receipt.js";
 
 const SKIP_REQUEST_HEADERS = new Set([
   "host",
@@ -970,16 +983,17 @@ export async function handleAnthropicMessages(
   if (modelAliasApplied) body.model = modelId;
 
   const isStream = body.stream === true;
-  const nativeToolRuntime = config.nativeProxyTools.enabled && isStream
+  const historyRuntime = config.nativeProxyTools.enabled
     ? getNativeProxyToolRuntime(config)
     : null;
+  const nativeToolRuntime = isStream ? historyRuntime : null;
   // Capture the client-visible logical request before session/injection
   // mutations. This digest is the restart-replay key and must not depend on
   // mutable recovered session metadata.
-  const nativeLogicalRequestFingerprint = nativeToolRuntime
+  const nativeLogicalRequestFingerprint = historyRuntime
     ? fingerprintAnthropicLogicalRequest(body)
     : undefined;
-  const nativeLogicalBaseMessages = nativeToolRuntime && Array.isArray(body.messages)
+  const nativeLogicalBaseMessages = historyRuntime && Array.isArray(body.messages)
     ? structuredClone(body.messages)
     : undefined;
   const reservedClientTool = Array.isArray(body.tools)
@@ -987,7 +1001,7 @@ export async function handleAnthropicMessages(
         tool !== null
         && typeof tool === "object"
         && typeof (tool as Record<string, unknown>).name === "string"
-        && nativeToolRuntime?.registry.owns((tool as Record<string, unknown>).name as string)
+        && historyRuntime?.registry.owns((tool as Record<string, unknown>).name as string)
       )) as Record<string, unknown> | undefined
     : undefined;
   if (reservedClientTool) {
@@ -1018,9 +1032,9 @@ export async function handleAnthropicMessages(
   let messages = Array.isArray(body.messages) ? body.messages : [];
   let hasTools = Array.isArray(body.tools) && body.tools.length > 0;
   let nativeToolDefinitionInjected = false;
-  if (nativeToolRuntime) {
+  if (historyRuntime) {
     try {
-      await nativeToolRuntime.ready();
+      await historyRuntime.ready();
     } catch {
       return nativeToolErrorResponse(
         503,
@@ -1307,7 +1321,7 @@ export async function handleAnthropicMessages(
     }
   }
 
-  const toolExecutionScope = nativeToolRuntime
+  const toolExecutionScope = historyRuntime
     ? nativeToolScope({
         spaceId,
         userId,
@@ -1383,6 +1397,7 @@ export async function handleAnthropicMessages(
       body,
       scope: toolExecutionScope,
       storage: nativeStorage,
+      historyStorage: nativeToolRuntime.historyStorage ?? undefined,
       dispatcher: nativeDispatcher,
       limits: config.nativeProxyTools,
       reentryLeaseMs,
@@ -1451,6 +1466,7 @@ export async function handleAnthropicMessages(
       const coordinatorOptions = {
         registry: nativeToolRuntime.registry,
         storage: nativeStorage,
+        historyStorage: nativeToolRuntime.historyStorage ?? undefined,
         dispatcher: nativeDispatcher,
         limits: config.nativeProxyTools,
         reenter: exactReentry,
@@ -1931,6 +1947,53 @@ export async function handleAnthropicMessages(
     agentName: agentFromPath,
   });
 
+  let nativeCompressionReceipt: Awaited<ReturnType<typeof beginNativeToolCompression>> = null;
+  if (historyRuntime?.storage && historyRuntime.historyStorage && toolExecutionScope) {
+    try {
+      await historyRuntime.runOperation(async () => {
+        await confirmPendingNativeToolCompressions({
+          scope: toolExecutionScope,
+          currentItems: (nativeLogicalBaseMessages ?? messages) as import("./native-proxy-tools/types.js").JsonValue[],
+          storage: historyRuntime.historyStorage!,
+        });
+        await backfillActiveCompletedNativeToolHistory({
+          scope: toolExecutionScope,
+          stateStorage: historyRuntime.storage!,
+          historyStorage: historyRuntime.historyStorage!,
+        });
+        const restored = await materializeNativeToolHistory({
+          protocol: "anthropic",
+          items: messages as import("./native-proxy-tools/types.js").JsonValue[],
+          anchorItems: (nativeLogicalBaseMessages ?? messages) as import("./native-proxy-tools/types.js").JsonValue[],
+          scope: toolExecutionScope,
+          storage: historyRuntime.historyStorage!,
+        });
+        if (restored.historyIds.length > 0) {
+          messages = restored.items;
+          body = { ...body, messages: restored.items };
+        }
+        if (looksLikeAnthropicCompressionRequest(
+          (nativeLogicalBaseMessages ?? messages) as import("./native-proxy-tools/types.js").JsonValue[],
+        )) {
+          nativeCompressionReceipt = await beginNativeToolCompression({
+            scope: toolExecutionScope,
+            sourceItems: (nativeLogicalBaseMessages ?? messages) as import("./native-proxy-tools/types.js").JsonValue[],
+            historyIds: restored.historyIds,
+            storage: historyRuntime.historyStorage!,
+          });
+        }
+      });
+    } catch (error) {
+      return nativeToolErrorResponse(
+        error instanceof NativeToolHistoryConflictError ? 409 : 503,
+        error instanceof NativeToolHistoryConflictError ? "native_tool_history_conflict" : "native_tool_history_unavailable",
+        error instanceof NativeToolHistoryConflictError
+          ? error.message
+          : "Native Proxy Tool history could not be restored",
+      );
+    }
+  }
+
   // ── Create pipeline logger ──────────────────────────────────────────────
   const pipe = createPipeline(config, traceId, target.model);
   pipe.requestReceived(messages.length, isStream);
@@ -2276,8 +2339,10 @@ export async function handleAnthropicMessages(
       let upstreamSnapshot;
       try {
         const logicalMessages = nativeLogicalBaseMessages ?? messages;
+        const historyAnchor = createHistoryAnchor(logicalMessages);
         upstreamSnapshot = buildUpstreamRequestSnapshot({
           protocol: usesResponsesUpstream ? "responses" : "anthropic",
+          clientProtocol: "anthropic",
           body: successfulBody,
           url: successfulUrl,
           model: successfulModel,
@@ -2285,6 +2350,13 @@ export async function handleAnthropicMessages(
             ? { requestFingerprint: nativeLogicalRequestFingerprint }
             : {}),
           logicalBaseMessages: logicalMessages,
+          historyAnchor,
+          logicalTurnId: createLogicalTurnId({
+            scope: toolExecutionScope,
+            clientProtocol: "anthropic",
+            anchor: historyAnchor,
+            requestFingerprint: nativeLogicalRequestFingerprint ?? historyAnchor.prefixDigest,
+          }),
           observationIntent: buildPersistedToolObservationIntent({
             config,
             scope: toolExecutionScope,
@@ -2324,6 +2396,7 @@ export async function handleAnthropicMessages(
       const coordinatorOptions = {
         registry: nativeToolRuntime.registry,
         storage: nativeToolRuntime.storage,
+        historyStorage: nativeToolRuntime.historyStorage ?? undefined,
         dispatcher: nativeToolRuntime.dispatcher,
         limits: config.nativeProxyTools,
         reenter,
@@ -2418,9 +2491,14 @@ export async function handleAnthropicMessages(
       const clientStream = isSse
         ? streamFromBytes(decision.bytes).pipeThrough(createSseThinkingFixStream(pipe))
         : streamFromBytes(decision.bytes);
-      return new Response(clientStream, {
+      return trackNativeToolCompressionResponse({
+        response: new Response(clientStream, {
         status: decision.status,
         headers: decisionHeaders,
+        }),
+        receipt: nativeCompressionReceipt,
+        storage: historyRuntime!.historyStorage!,
+        isComplete: anthropicResponseCompletedForCompression,
       });
     }
 
@@ -2466,7 +2544,15 @@ export async function handleAnthropicMessages(
 
     const clientStream = rawClientStream.pipeThrough(createSseThinkingFixStream(pipe));
 
-    return new Response(clientStream, { status: upstreamResp.status, headers: respHeaders });
+    const clientResponse = new Response(clientStream, { status: upstreamResp.status, headers: respHeaders });
+    return nativeCompressionReceipt && historyRuntime?.historyStorage
+      ? trackNativeToolCompressionResponse({
+          response: clientResponse,
+          receipt: nativeCompressionReceipt,
+          storage: historyRuntime.historyStorage,
+          isComplete: anthropicResponseCompletedForCompression,
+        })
+      : clientResponse;
   }
 
   // ── Non-streaming response ───────────────────────────────────────────────
@@ -2739,7 +2825,15 @@ export async function handleAnthropicMessages(
     );
   }
 
-  return new Response(respText, { status: upstreamResp.status, headers: respHeaders });
+  const clientResponse = new Response(respText, { status: upstreamResp.status, headers: respHeaders });
+  return nativeCompressionReceipt && historyRuntime?.historyStorage
+    ? trackNativeToolCompressionResponse({
+        response: clientResponse,
+        receipt: nativeCompressionReceipt,
+        storage: historyRuntime.historyStorage,
+        isComplete: anthropicResponseCompletedForCompression,
+      })
+    : clientResponse;
 }
 
 

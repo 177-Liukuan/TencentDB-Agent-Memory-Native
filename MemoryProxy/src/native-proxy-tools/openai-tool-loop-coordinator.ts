@@ -1,9 +1,14 @@
 import type { ToolExecutionStorageAdapter } from "../db/tool-execution-storage-adapter.js";
+import type { NativeToolHistoryStorageAdapter } from "../db/native-tool-history-storage-adapter.js";
 import { OpenAIStreamParser } from "../injection/adapters/openai-stream.js";
 import type { ProtocolStreamEvent, UnifiedToolCall } from "../injection/adapters/interface.js";
 import { assertNoNativeToolLeak, buildNativeRegistryLeakMarkers, mergeNativeToolLeakMarkers } from "./anthropic-response-rebuilder.js";
 import type { NativeProxyToolDispatcher } from "./native-proxy-tool-dispatcher.js";
-import { buildClientVisibleOpenAISse, buildOpenAIToolMessages } from "./openai-response-rebuilder.js";
+import {
+  buildClientVisibleOpenAISse,
+  buildOpenAIAssistantSkeleton,
+  buildOpenAIToolMessages,
+} from "./openai-response-rebuilder.js";
 import type { NativeProxyToolRegistry } from "./tool-registry.js";
 import {
   persistToolLoopResponse,
@@ -31,6 +36,8 @@ export interface ToolStreamSnapshot {
   rawBytes: Uint8Array;
   messageCompleted: boolean;
   toolCalls: UnifiedToolCall[];
+  assistantContent?: string | null;
+  assistantExtras?: Record<string, JsonValue>;
 }
 
 export interface ToolStreamParser {
@@ -59,6 +66,7 @@ export type OpenAIToolLoopDecision =
 export interface OpenAIToolLoopCoordinatorOptions {
   registry: NativeProxyToolRegistry;
   storage: ToolExecutionStorageAdapter;
+  historyStorage?: NativeToolHistoryStorageAdapter;
   dispatcher: Pick<NativeProxyToolDispatcher, "execute">;
   limits: NativeProxyToolsConfig;
   reenter(request: NativeReentryRequest): Promise<UpstreamRound>;
@@ -79,11 +87,7 @@ export interface OpenAIToolLoopCoordinatorOptions {
 }
 
 function assistantSkeleton(calls: readonly UnifiedToolCall[]): JsonValue[] {
-  return [...calls].sort((a, b) => a.slotIndex - b.slotIndex).map((call) => ({
-    id: call.callId, type: "function", function: {
-      name: call.toolName, arguments: JSON.stringify(call.input ?? {}),
-    },
-  }));
+  return buildOpenAIAssistantSkeleton({ calls });
 }
 
 export class OpenAIToolLoopCoordinator {
@@ -95,8 +99,19 @@ export class OpenAIToolLoopCoordinator {
     this.codec = options.codec ?? {
       protocol: "openai",
       createParser: (registry) => new OpenAIStreamParser(registry),
-      assistantSkeleton: (snapshot) => assistantSkeleton(snapshot.toolCalls),
-      buildToolMessages: (_snapshot, persistedSlots) => buildOpenAIToolMessages(persistedSlots),
+      assistantSkeleton: (snapshot) => buildOpenAIAssistantSkeleton({
+        calls: snapshot.toolCalls,
+        content: snapshot.assistantContent,
+        extras: snapshot.assistantExtras,
+      }),
+      buildToolMessages: (snapshot, persistedSlots) => buildOpenAIToolMessages(
+        persistedSlots,
+        buildOpenAIAssistantSkeleton({
+          calls: snapshot.toolCalls,
+          content: snapshot.assistantContent,
+          extras: snapshot.assistantExtras,
+        }),
+      ),
       buildClientVisibleSse: buildClientVisibleOpenAISse,
     };
   }
@@ -242,6 +257,7 @@ export class OpenAIToolLoopCoordinator {
         ...structuredClone(input.upstreamSnapshot.baseMessages),
         ...this.codec.buildToolMessages(snapshot, context.slots),
       ];
+      await this.core.persistCompletedHistory(stateKey);
       await this.options.beforeReenter?.();
       const next = await this.options.reenter({
         upstreamSnapshot: structuredClone(input.upstreamSnapshot), messages: structuredClone(messages),

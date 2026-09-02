@@ -139,6 +139,56 @@ describe.each([
       expect.objectContaining({ type: "function_call", call_id: "call_native" }),
       expect.objectContaining({ type: "function_call_output", call_id: "call_native" }),
     ]));
+
+    const followUp = await createApp(config).request(route, {
+      method: "POST",
+      headers: { "content-type": "application/json", "authorization": "Bearer client-key", "x-user-id": "user-1", "session-id": "session-responses" },
+      body: JSON.stringify({
+        model: "gpt-5", stream: true,
+        input: [
+          { type: "message", role: "user", content: [{ type: "input_text", text: "What rules apply?" }] },
+          { type: "message", role: "assistant", content: [{ type: "output_text", text: "final from Responses" }] },
+          { type: "message", role: "user", content: [{ type: "input_text", text: "What about now?" }] },
+        ],
+      }),
+    });
+    expect(await followUp.text()).toContain("final from Responses");
+    expect(upstreamBodies).toHaveLength(3);
+    const restored = JSON.stringify(upstreamBodies[2].input);
+    expect(restored.match(/call_native/g)).toHaveLength(2);
+    expect(restored.match(/tdai_memory_search/g)).toHaveLength(1);
+    expect(restored).toContain("use formatter");
+
+    const compact = await createApp(config).request(`${route}/compact`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "authorization": "Bearer client-key", "x-user-id": "user-1", "session-id": "session-responses" },
+      body: JSON.stringify({
+        model: "gpt-5", stream: true,
+        input: [
+          { type: "message", role: "user", content: [{ type: "input_text", text: "What rules apply?" }] },
+          { type: "message", role: "assistant", content: [{ type: "output_text", text: "final from Responses" }] },
+        ],
+      }),
+    });
+    expect(await compact.text()).toContain("response.completed");
+    expect(JSON.stringify(upstreamBodies[3].input).match(/call_native/g)).toHaveLength(2);
+
+    const afterCompact = await createApp(config).request(route, {
+      method: "POST",
+      headers: { "content-type": "application/json", "authorization": "Bearer client-key", "x-user-id": "user-1", "session-id": "session-responses" },
+      body: JSON.stringify({
+        model: "gpt-5", stream: true,
+        input: [
+          { type: "message", role: "user", content: [{ type: "input_text", text: "Summary of the earlier conversation" }] },
+          { type: "message", role: "user", content: [{ type: "input_text", text: "Continue" }] },
+        ],
+      }),
+    });
+    await afterCompact.text();
+    expect(JSON.stringify(upstreamBodies[4].input)).not.toContain("call_native");
+    expect(await runtime.historyStorage!.findPendingCompressionReceipts({
+      spaceId: "space-1", userId: "anonymous", agentSource: _client === "Codex" ? "codex" : "workbuddy", sessionId: "session-responses",
+    })).toEqual([]);
   });
 
   it("keeps auxiliary Responses endpoints as single-call pass-through", async () => {

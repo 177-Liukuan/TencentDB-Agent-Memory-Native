@@ -382,6 +382,32 @@ describe("Claude Code Anthropic client with a Responses upstream", () => {
     expect(visible).not.toContain("tdai_memory_search");
     expect(visible).not.toContain("call_native");
     expect(visible).not.toContain("always run tests");
+
+    const followUp = await createApp(proxyConfig).request("/claude-code/space-1/v1/messages", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-api-key": "memory-user-key",
+        "x-user-id": "user-1",
+        "x-conversation-id": "native-session-1",
+      },
+      body: JSON.stringify({
+        model: "deepseek-v4-flash",
+        stream: true,
+        max_tokens: 1024,
+        messages: [
+          { role: "user", content: "What project rules apply?" },
+          { role: "assistant", content: "hello from Responses" },
+          { role: "user", content: "Repeat the conclusion" },
+        ],
+      }),
+    });
+    expect(await followUp.text()).toContain("hello from Responses");
+    expect(upstreamBodies).toHaveLength(3);
+    const restored = JSON.stringify(upstreamBodies[2].input);
+    expect(restored.match(/call_native/g)).toHaveLength(2);
+    expect(restored.match(/tdai_memory_search/g)).toHaveLength(1);
+    expect(restored).toContain("always run tests");
   });
 
   it("dispatches an Anthropic Client Tool, accepts its tool_result, and resumes the Responses batch", async () => {

@@ -16,6 +16,8 @@ interface PendingFunctionCall {
 
 export interface OpenAIStreamSnapshot extends ProtocolStreamSnapshot {
   toolCalls: UnifiedToolCall[];
+  assistantContent: string | null;
+  assistantExtras: Record<string, JsonValue>;
   stopReason?: string;
 }
 
@@ -41,6 +43,8 @@ export class OpenAIStreamParser implements ProtocolStreamParser {
   private completedCalls: UnifiedToolCall[] = [];
   private completed = false;
   private stopReason?: string;
+  private assistantContent = "";
+  private readonly assistantExtras: Record<string, JsonValue> = {};
 
   constructor(private readonly registry: NativeProxyToolRegistry) {}
 
@@ -80,6 +84,8 @@ export class OpenAIStreamParser implements ProtocolStreamParser {
       rawBytes: this.rawBytes.slice(),
       messageCompleted: this.completed,
       toolCalls: structuredClone(this.completedCalls),
+      assistantContent: this.assistantContent || null,
+      assistantExtras: structuredClone(this.assistantExtras),
       ...(this.stopReason ? { stopReason: this.stopReason } : {}),
     };
   }
@@ -117,6 +123,15 @@ export class OpenAIStreamParser implements ProtocolStreamParser {
   }
 
   private collectDelta(delta: Record<string, unknown>): void {
+    if (typeof delta.content === "string") this.assistantContent += delta.content;
+    for (const [key, rawValue] of Object.entries(delta)) {
+      if (["role", "content", "tool_calls"].includes(key) || rawValue === undefined) continue;
+      const value = structuredClone(rawValue) as JsonValue;
+      const existing = this.assistantExtras[key];
+      if (typeof existing === "string" && typeof value === "string") this.assistantExtras[key] = existing + value;
+      else if (Array.isArray(existing) && Array.isArray(value)) this.assistantExtras[key] = [...existing, ...value];
+      else this.assistantExtras[key] = value;
+    }
     if (!Array.isArray(delta.tool_calls)) return;
     for (const rawCall of delta.tool_calls) {
       if (!rawCall || typeof rawCall !== "object") continue;

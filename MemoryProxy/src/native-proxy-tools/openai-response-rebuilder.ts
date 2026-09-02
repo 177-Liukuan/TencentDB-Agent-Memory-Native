@@ -2,6 +2,46 @@ import type { JsonValue, ToolCallSlot } from "./types.js";
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
+const ASSISTANT_META_KEY = "__tdai_native_assistant_meta";
+
+export function buildOpenAIAssistantSkeleton(input: {
+  calls: readonly { callId: string; toolName: string; input?: JsonValue; slotIndex: number }[];
+  content?: string | null;
+  extras?: Record<string, JsonValue>;
+}): JsonValue[] {
+  const calls = [...input.calls].sort((left, right) => left.slotIndex - right.slotIndex).map((call) => ({
+    id: call.callId,
+    type: "function",
+    function: { name: call.toolName, arguments: JSON.stringify(call.input ?? {}) },
+  }));
+  return [...calls, {
+    [ASSISTANT_META_KEY]: {
+      content: input.content ?? null,
+      extras: structuredClone(input.extras ?? {}),
+    },
+  }];
+}
+
+export function openAIAssistantMessageFromSkeleton(skeleton: readonly JsonValue[]): JsonValue {
+  const toolCalls: JsonValue[] = [];
+  let content: JsonValue = null;
+  let extras: Record<string, JsonValue> = {};
+  for (const item of skeleton) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    const value = item as Record<string, JsonValue>;
+    const meta = value[ASSISTANT_META_KEY];
+    if (meta && typeof meta === "object" && !Array.isArray(meta)) {
+      const record = meta as Record<string, JsonValue>;
+      content = record.content ?? null;
+      if (record.extras && typeof record.extras === "object" && !Array.isArray(record.extras)) {
+        extras = structuredClone(record.extras as Record<string, JsonValue>);
+      }
+    } else if (value.type === "function") {
+      toolCalls.push(structuredClone(item));
+    }
+  }
+  return { role: "assistant", content, ...extras, tool_calls: toolCalls };
+}
 
 function stringifyResult(value: JsonValue | undefined): string {
   if (typeof value === "string") return value;
@@ -9,10 +49,13 @@ function stringifyResult(value: JsonValue | undefined): string {
 }
 
 /** Build the hidden assistant Tool Call turn and its ordered Tool messages. */
-export function buildOpenAIToolMessages(slots: readonly ToolCallSlot[]): JsonValue[] {
+export function buildOpenAIToolMessages(
+  slots: readonly ToolCallSlot[],
+  assistantSkeleton?: readonly JsonValue[],
+): JsonValue[] {
   const ordered = [...slots].sort((left, right) => left.slotIndex - right.slotIndex);
   return [
-    {
+    assistantSkeleton ? openAIAssistantMessageFromSkeleton(assistantSkeleton) : {
       role: "assistant",
       content: null,
       tool_calls: ordered.map((slot) => ({
