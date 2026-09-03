@@ -307,19 +307,15 @@ describe("AnthropicToolLoopCoordinator", () => {
     expect(reenter).not.toHaveBeenCalled();
   });
 
-  it("fails closed when an otherwise ordinary response echoes the Native Registry", async () => {
+  it("allows ordinary response text to mention a Native tool name", async () => {
     const { coordinator } = coordinatorHarness();
 
     const decision = await coordinator.handleRound(roundInput(byteStream(
       finalFixture("available tool: tdai_memory_search"),
     ).stream));
 
-    expect(decision).toMatchObject({
-      kind: "error",
-      code: "native_tool_leak_detected",
-      status: 500,
-    });
-    expect(decoder.decode(decision.bytes)).not.toContain("tdai_memory_search");
+    expect(decision).toMatchObject({ kind: "replay", status: 200 });
+    expect(decoder.decode(decision.bytes)).toContain("tdai_memory_search");
   });
 
   it("starts Native execution after block stop and before message_stop", async () => {
@@ -479,7 +475,7 @@ describe("AnthropicToolLoopCoordinator", () => {
     expect(decision.headers.has("x-request-id")).toBe(false);
   });
 
-  it("fails closed if a later model round repeats a hidden Native identifier", async () => {
+  it("allows a later model round to mention a Native tool name in text", async () => {
     const { coordinator } = coordinatorHarness({
       reenter: async () => ({
         stream: byteStream(finalFixture("internal tool tdai_memory_search")).stream,
@@ -490,8 +486,8 @@ describe("AnthropicToolLoopCoordinator", () => {
 
     const decision = await coordinator.handleRound(roundInput(byteStream(nativeFixture()).stream));
 
-    expect(decision).toMatchObject({ kind: "error", code: "native_tool_state_unavailable" });
-    expect(decoder.decode(decision.bytes)).not.toContain("tdai_memory_search");
+    expect(decision).toMatchObject({ kind: "final", status: 200 });
+    expect(decoder.decode(decision.bytes)).toContain("tdai_memory_search");
   });
 
   it("feeds a structured Native failure back as an Anthropic error result", async () => {
@@ -644,13 +640,6 @@ describe("AnthropicToolLoopCoordinator", () => {
         bodyBase64: expect.any(String),
       },
       slots: [{ callId: "client-1", owner: "client", status: "pending" }],
-      upstreamSnapshot: {
-        nativeLeakMarkers: [{
-          callId: "proxy-1",
-          toolName: "tdai_memory_search",
-          input: { query: "rules-1" },
-        }],
-      },
     });
     expect(states[1].upstreamSnapshot.baseMessages).toHaveLength(3);
   });
@@ -674,7 +663,7 @@ describe("AnthropicToolLoopCoordinator", () => {
     ]);
   });
 
-  it("does not commit a parent continuation before its Client-visible bytes pass leak scanning", async () => {
+  it("allows Client tool arguments to mention a Native tool name", async () => {
     const onClientDispatchPrepared = vi.fn(async () => {});
     const unsafeClient = concat(
       messageStart(),
@@ -692,10 +681,13 @@ describe("AnthropicToolLoopCoordinator", () => {
 
     const decision = await coordinator.handleRound(roundInput(byteStream(nativeFixture()).stream));
 
-    expect(decision).toMatchObject({ kind: "error", code: "native_tool_leak_detected" });
-    expect(onClientDispatchPrepared).not.toHaveBeenCalled();
+    expect(decision).toMatchObject({ kind: "client_dispatch", status: 200 });
+    expect(onClientDispatchPrepared).toHaveBeenCalledTimes(1);
     const states = await storage.findActiveBySession(scope());
-    expect(states.at(-1)).toMatchObject({ clientDispatchStatus: "none" });
+    expect(states.at(-1)).toMatchObject({
+      clientDispatchStatus: "dispatched",
+      slots: [{ callId: "client-unsafe", owner: "client", status: "pending" }],
+    });
   });
 
   it("enforces per-round, total-call, and round limits before offending execution", async () => {

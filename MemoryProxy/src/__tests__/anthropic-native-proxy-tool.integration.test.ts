@@ -870,7 +870,7 @@ describe("Anthropic Native Proxy Tool handler", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it("passes a streaming upstream non-2xx response through exactly instead of parsing it as SSE", async () => {
+  it("returns a generic streaming upstream error after Native schemas were injected", async () => {
     const proxyConfig = config();
     const storage = new InMemoryToolExecutionStorageAdapter();
     const execute = vi.fn(async () => ({ isError: false, value: null }));
@@ -913,7 +913,7 @@ describe("Anthropic Native Proxy Tool handler", () => {
     });
 
     expect(response.status).toBe(503);
-    expect(await response.text()).toBe(exactError);
+    expect(await response.text()).toContain("Upstream model request failed");
     expect(response.headers.get("x-request-id")).toBe("upstream-error");
     expect(execute).not.toHaveBeenCalled();
   });
@@ -964,8 +964,8 @@ describe("Anthropic Native Proxy Tool handler", () => {
     });
     const responseText = await response.text();
 
-    expect(response.status).toBe(500);
-    expect(responseText).toContain("native_tool_leak_detected");
+    expect(response.status).toBe(503);
+    expect(responseText).toContain("Upstream model request failed");
     expect(responseText).not.toContain("tdai_memory_search");
     expect(execute).not.toHaveBeenCalled();
   });
@@ -974,7 +974,7 @@ describe("Anthropic Native Proxy Tool handler", () => {
     ["tool name", "tdai_memory_search"],
     ["call ID", "native-call-1"],
     ["serialized input", '{"query":"project rules"}'],
-  ])("fails closed when a mixed resume echoes the old Native %s", async (_label, leakedMarker) => {
+  ])("allows mixed-resume text to mention the old Native %s", async (_label, leakedMarker) => {
     const proxyConfig = config();
     const storage = new InMemoryToolExecutionStorageAdapter();
     const runtime = createNativeProxyToolRuntime(proxyConfig, {
@@ -1052,9 +1052,8 @@ describe("Anthropic Native Proxy Tool handler", () => {
     });
     const responseText = await resumed.text();
 
-    expect(resumed.status).toBe(500);
-    expect(responseText).toContain("native_tool_leak_detected");
-    expect(responseText).not.toContain(leakedMarker);
+    expect(resumed.status).toBe(200);
+    expect(responseText).toContain(JSON.stringify(leakedMarker).slice(1, -1));
     expect(upstreamCalls).toBe(2);
   });
 

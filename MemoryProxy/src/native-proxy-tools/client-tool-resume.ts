@@ -9,10 +9,7 @@ import {
 } from "../db/tool-execution-storage-adapter.js";
 import type { NativeToolHistoryStorageAdapter } from "../db/native-tool-history-storage-adapter.js";
 import type { UnifiedToolCall } from "../injection/adapters/interface.js";
-import {
-  buildToolResultMessage,
-  mergeNativeToolLeakMarkers,
-} from "./anthropic-response-rebuilder.js";
+import { buildToolResultMessage } from "./anthropic-response-rebuilder.js";
 import { NativeToolTargetUnavailableError } from "./exact-target-transport.js";
 import { openAIAssistantMessageFromSkeleton } from "./openai-response-rebuilder.js";
 import { buildNativeToolHistoryRecord } from "./native-tool-history-record.js";
@@ -24,7 +21,6 @@ import type {
 import type {
   JsonValue,
   NativeProxyToolsConfig,
-  NativeToolLeakMarker,
   NativeToolResult,
   PersistedReentryOutcome,
   ToolCallSlot,
@@ -72,7 +68,6 @@ export type ClientToolResumeDecision =
       reentryLeaseOwner: string;
       reentryAttempt: number;
       logicalMessages: JsonValue[];
-      nativeLeakMarkers: NativeToolLeakMarker[];
     }
   | {
       kind: "replay";
@@ -84,7 +79,6 @@ export type ClientToolResumeDecision =
       childStateKey?: ToolExecutionStateKey;
       turnSeq: number;
       logicalMessages: JsonValue[];
-      nativeLeakMarkers: NativeToolLeakMarker[];
     }
   | {
       kind: "error";
@@ -163,7 +157,13 @@ export function extractAnthropicClientToolResults(
   body: Record<string, unknown>,
 ): AnthropicClientToolResult[] {
   if (!Array.isArray(body.messages) || body.messages.length === 0) return [];
-  const latest = body.messages[body.messages.length - 1];
+  let latestIndex = body.messages.length - 1;
+  while (latestIndex >= 0) {
+    const message = body.messages[latestIndex];
+    if (!isRecord(message) || message.role !== "system") break;
+    latestIndex--;
+  }
+  const latest = body.messages[latestIndex];
   if (!isRecord(latest) || latest.role !== "user" || !Array.isArray(latest.content)) return [];
 
   const results: AnthropicClientToolResult[] = [];
@@ -409,19 +409,6 @@ function logicalMessages(context: ToolExecutionContext): JsonValue[] {
   );
 }
 
-function nativeLeakMarkers(context: ToolExecutionContext): NativeToolLeakMarker[] {
-  return mergeNativeToolLeakMarkers(
-    context.upstreamSnapshot.nativeLeakMarkers ?? [],
-    context.slots
-      .filter((slot) => slot.owner === "proxy")
-      .map((slot) => ({
-        callId: slot.callId,
-        toolName: slot.toolName,
-        ...(slot.input !== undefined ? { input: structuredClone(slot.input) } : {}),
-      })),
-  );
-}
-
 function samePersistedReentryOutcome(
   left: PersistedReentryOutcome,
   right: PersistedReentryOutcome,
@@ -612,7 +599,6 @@ export async function resumeClientToolResults(
         ...restorePersistedClientReentryOutcome(context.reentryOutcome),
         turnSeq: context.turnSeq,
         logicalMessages: logicalMessages(context),
-        nativeLeakMarkers: nativeLeakMarkers(context),
       };
     }
 
@@ -685,7 +671,6 @@ export async function resumeClientToolResults(
       upstreamSnapshot: {
         ...structuredClone(context.upstreamSnapshot),
         baseMessages: structuredClone(messages),
-        nativeLeakMarkers: nativeLeakMarkers(context),
       },
       messages,
       round,
@@ -694,7 +679,6 @@ export async function resumeClientToolResults(
       reentryLeaseOwner: reentryClaim.leaseOwner,
       reentryAttempt: reentryClaim.attempt,
       logicalMessages: logicalMessages(context),
-      nativeLeakMarkers: nativeLeakMarkers(context),
     };
   } catch (error) {
     return errorDecision(error);

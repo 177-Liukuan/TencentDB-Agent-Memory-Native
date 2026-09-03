@@ -3,8 +3,6 @@ import { describe, expect, it } from "vitest";
 import { AnthropicStreamParser } from "../../injection/adapters/anthropic-stream.js";
 import type { ToolCallSlot } from "../types.js";
 import {
-  assertNoNativeToolLeak,
-  buildNativeRegistryLeakMarkers,
   buildClientVisibleAnthropicSse,
   buildFullAssistantMessage,
   buildToolResultMessage,
@@ -268,7 +266,7 @@ describe("Anthropic response rebuilder", () => {
     expect(() => buildFullAssistantMessage(incomplete)).toThrow(/message_stop/);
   });
 
-  it("fails closed if an unowned Provider frame repeats hidden Native identifiers", () => {
+  it("filters by Tool Call position without rewriting unrelated Provider frames", () => {
     const fixture = concat(
       messageStart(),
       blockStart(0, { type: "tool_use", id: "native-secret", name: "tdai_memory_search", input: {} }),
@@ -278,37 +276,9 @@ describe("Anthropic response rebuilder", () => {
       messageEnd(),
     );
 
-    expect(() => buildClientVisibleAnthropicSse(parse(fixture), new Set([0])))
-      .toThrow(/hidden Native Tool data/);
-  });
-
-  it("allows the final answer to use a Native result without exposing protocol markers", () => {
-    const visible = encoder.encode('{"preference":"dark mode"}');
-
-    expect(() => assertNoNativeToolLeak(visible, [{
-      callId: "native-call-1",
-      toolName: "tdai_memory_search",
-      input: { query: "preference" },
-      result: { preference: "dark mode" },
-    }])).not.toThrow();
-  });
-
-  it("treats Registry names, descriptions, and schemas as hidden sentinels", () => {
-    const registry = createDefaultNativeProxyToolRegistry();
-    const markers = buildNativeRegistryLeakMarkers(registry);
-    const definition = registry.list()[0];
-
-    expect(() => assertNoNativeToolLeak(
-      encoder.encode(`visible ${definition.name}`),
-      markers,
-    )).toThrow(/hidden Native Tool data/);
-    expect(() => assertNoNativeToolLeak(
-      encoder.encode(JSON.stringify(definition.inputSchema)),
-      markers,
-    )).toThrow(/hidden Native Tool data/);
-    expect(() => assertNoNativeToolLeak(
-      encoder.encode(definition.description),
-      markers,
-    )).toThrow(/hidden Native Tool data/);
+    const visible = decoder.decode(buildClientVisibleAnthropicSse(parse(fixture), new Set([0])));
+    expect(visible).not.toContain('"type":"tool_use"');
+    expect(visible).toContain('"type":"ping"');
+    expect(visible).toContain('"provider_trace":"native-secret"');
   });
 });

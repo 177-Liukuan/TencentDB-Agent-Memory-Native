@@ -50,6 +50,71 @@ function callRound(calls: Array<{ index: number; id: string; callId: string; nam
     });
 }
 
+function mixedCallRoundWithReasoning(reasoningDeltas: string[]): string {
+  const reasoning = {
+    type: "reasoning",
+    id: "rs_mixed",
+    content: [{ type: "reasoning_text", text: reasoningDeltas.join("") }],
+  };
+  const native = {
+    type: "function_call",
+    id: "fc_native",
+    call_id: "call_native",
+    name: "tdai_memory_search",
+    arguments: "{\"query\":\"hidden\"}",
+  };
+  const client = {
+    type: "function_call",
+    id: "fc_client",
+    call_id: "call_client",
+    name: "Bash",
+    arguments: "{\"command\":\"pwd\"}",
+  };
+  return event("response.created", { response: { id: "resp_mixed", model: "deepseek-v4-flash" } })
+    + event("response.output_item.added", {
+      output_index: 0,
+      item: { type: "reasoning", id: reasoning.id, content: [] },
+    })
+    + reasoningDeltas.map((delta) => event("response.reasoning_text.delta", {
+      output_index: 0,
+      item_id: reasoning.id,
+      delta,
+    })).join("")
+    + event("response.reasoning_text.done", { output_index: 0, item_id: reasoning.id })
+    + event("response.output_item.done", { output_index: 0, item: reasoning })
+    + event("response.output_item.added", { output_index: 1, item: { ...native, arguments: "" } })
+    + event("response.function_call_arguments.done", {
+      output_index: 1,
+      item_id: native.id,
+      arguments: native.arguments,
+    })
+    + event("response.output_item.done", { output_index: 1, item: native })
+    + event("response.output_item.added", { output_index: 2, item: { ...client, arguments: "" } })
+    + event("response.function_call_arguments.done", {
+      output_index: 2,
+      item_id: client.id,
+      arguments: client.arguments,
+    })
+    + event("response.output_item.done", { output_index: 2, item: client })
+    + event("response.completed", {
+      response: {
+        id: "resp_mixed",
+        model: "deepseek-v4-flash",
+        status: "completed",
+        output: [reasoning, native, client],
+        usage: { input_tokens: 10, output_tokens: 8 },
+      },
+    });
+}
+
+function anthropicEvents(bytes: Uint8Array): Record<string, unknown>[] {
+  return decoder.decode(bytes).split(/\r?\n\r?\n/).flatMap((frame) => {
+    const data = frame.split(/\r?\n/).find((line) => line.startsWith("data: "));
+    if (!data) return [];
+    return [JSON.parse(data.slice(6)) as Record<string, unknown>];
+  });
+}
+
 function finalRound(): string {
   const item = {
     type: "message",
@@ -172,6 +237,43 @@ describe("Anthropic client / Responses upstream Tool Loop", () => {
     expect(decoder.decode(prepared.mock.calls[0][0].bytes)).toBe(visible);
     const persisted = await storage.get(decision.stateKey);
     expect(Buffer.from(persisted!.clientDispatchOutcome!.bodyBase64, "base64").toString()).toBe(visible);
+  });
+
+  it.each([
+    ["one reasoning delta", ["tdai_memory_search"]],
+    ["several reasoning deltas", ["tdai_", "memory", "_search"]],
+  ])("allows a Native tool name in %s while hiding its Tool Call", async (_label, deltas) => {
+    const { coordinator } = harness();
+
+    const decision = await coordinator.handleRound({
+      stream: stream(mixedCallRoundWithReasoning(deltas)),
+      status: 200,
+      headers,
+      scope,
+      turnSeq: 1,
+      upstreamSnapshot: snapshot,
+      round: 1,
+      totalCalls: 0,
+    });
+
+    expect(decision.kind).toBe("client_dispatch");
+    const events = anthropicEvents(decision.bytes);
+    const thinking = events.flatMap((entry) => {
+      const delta = entry.delta as Record<string, unknown> | undefined;
+      return delta?.type === "thinking_delta" && typeof delta.thinking === "string"
+        ? [delta.thinking]
+        : [];
+    }).join("");
+    const toolUses = events.flatMap((entry) => {
+      const block = entry.content_block as Record<string, unknown> | undefined;
+      return entry.type === "content_block_start" && block?.type === "tool_use" ? [block] : [];
+    });
+    expect(thinking).toContain("tdai_memory_search");
+    expect(toolUses).toEqual([
+      expect.objectContaining({ id: "call_client", name: "Bash" }),
+    ]);
+    expect(JSON.stringify(toolUses)).not.toContain("call_native");
+    expect(JSON.stringify(toolUses)).not.toContain("hidden");
   });
 
   it("converts a pure Client response without creating durable state", async () => {

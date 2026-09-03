@@ -2,7 +2,6 @@ import type { ToolExecutionStorageAdapter } from "../db/tool-execution-storage-a
 import type { NativeToolHistoryStorageAdapter } from "../db/native-tool-history-storage-adapter.js";
 import { OpenAIStreamParser } from "../injection/adapters/openai-stream.js";
 import type { ProtocolStreamEvent, UnifiedToolCall } from "../injection/adapters/interface.js";
-import { assertNoNativeToolLeak, buildNativeRegistryLeakMarkers, mergeNativeToolLeakMarkers } from "./anthropic-response-rebuilder.js";
 import type { NativeProxyToolDispatcher } from "./native-proxy-tool-dispatcher.js";
 import {
   buildClientVisibleOpenAISse,
@@ -118,11 +117,6 @@ export class OpenAIToolLoopCoordinator {
 
   async handleRound(input: OpenAIToolLoopRoundInput): Promise<OpenAIToolLoopDecision> {
     const decision = await this.handleRoundInternal(input, false);
-    try {
-      assertNoNativeToolLeak(decision.bytes, buildNativeRegistryLeakMarkers(this.options.registry));
-    } catch {
-      return this.error("native_tool_leak_detected", "Native Proxy Tool response could not be returned safely", 500, []);
-    }
     if (decision.kind === "final" && decision.observationStateKey) {
       const ok = await this.core.prepareObservation(
         decision.observationStateKey,
@@ -232,7 +226,6 @@ export class OpenAIToolLoopCoordinator {
       if (clientCalls.length > 0) {
         await this.options.beforeClientDispatch?.();
         const bytes = this.codec.buildClientVisibleSse(snapshot.rawBytes, new Set(nativeCalls.map((call) => call.contentBlockIndex)));
-        assertNoNativeToolLeak(bytes, [...nativeCalls, ...buildNativeRegistryLeakMarkers(this.options.registry)]);
         const outcome = persistToolLoopResponse(bytes, input.status, input.headers);
         const pending = await this.core.transitionClientDispatch(stateKey, "none", "pending", outcome);
         if (pending) {
@@ -267,17 +260,12 @@ export class OpenAIToolLoopCoordinator {
         ...next, scope: input.scope, turnSeq: input.turnSeq,
         upstreamSnapshot: {
           ...structuredClone(input.upstreamSnapshot), baseMessages: structuredClone(messages),
-          nativeLeakMarkers: mergeNativeToolLeakMarkers(
-            input.upstreamSnapshot.nativeLeakMarkers ?? [],
-            nativeCalls.map((call) => ({ callId: call.callId, toolName: call.toolName, ...(call.input !== undefined ? { input: call.input } : {}) })),
-          ),
         },
         round: input.round + 1, totalCalls,
         ...(input.parentStateKey && input.parentReentryAttempt !== undefined
           ? { parentStateKey: input.parentStateKey, parentReentryAttempt: input.parentReentryAttempt }
           : {}),
       }, true);
-      assertNoNativeToolLeak(nextDecision.bytes, context.slots.filter((slot) => slot.owner === "proxy"));
       const observable = nextDecision.kind === "final" && !nextDecision.observationStateKey
         ? { ...nextDecision, observationStateKey: stateKey }
         : nextDecision;

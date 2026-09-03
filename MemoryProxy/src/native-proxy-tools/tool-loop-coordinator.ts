@@ -12,9 +12,6 @@ import {
   buildClientVisibleAnthropicSse,
   buildToolResultMessage,
   replayAnthropicBytes,
-  assertNoNativeToolLeak,
-  buildNativeRegistryLeakMarkers,
-  mergeNativeToolLeakMarkers,
 } from "./anthropic-response-rebuilder.js";
 import type { NativeProxyToolDispatcher } from "./native-proxy-tool-dispatcher.js";
 import type { NativeProxyToolRegistry } from "./tool-registry.js";
@@ -26,7 +23,6 @@ import {
 import type {
   JsonValue,
   NativeProxyToolsConfig,
-  NativeToolLeakMarker,
   ToolCallSlot,
   ToolExecutionScope,
   ToolExecutionStateKey,
@@ -113,21 +109,6 @@ class CoordinatorFailure extends ToolLoopCoreFailure {
   ) {
     super(code, message, status);
     this.name = "CoordinatorFailure";
-  }
-}
-
-function assertSafeClientDispatch(
-  bytes: Uint8Array,
-  markers: readonly NativeToolLeakMarker[],
-): void {
-  try {
-    assertNoNativeToolLeak(bytes, markers);
-  } catch {
-    throw new CoordinatorFailure(
-      "native_tool_leak_detected",
-      "Native Proxy Tool response could not be returned safely",
-      500,
-    );
   }
 }
 
@@ -218,22 +199,6 @@ export class AnthropicToolLoopCoordinator {
 
   async handleRound(input: ToolLoopRoundInput): Promise<ToolLoopDecision> {
     const decision = await this.handleRoundInternal(input, false);
-    try {
-      assertNoNativeToolLeak(
-        decision.bytes,
-        buildNativeRegistryLeakMarkers(this.options.registry),
-      );
-    } catch {
-      return this.errorDecision(
-        new CoordinatorFailure(
-          "native_tool_leak_detected",
-          "Native Proxy Tool response could not be returned safely",
-          500,
-        ),
-        input,
-        new AnthropicStreamParser(this.options.registry).snapshot(),
-      );
-    }
     if (decision.kind === "final" && decision.observationStateKey) {
       const prepared = await this.core.prepareObservation(
         decision.observationStateKey,
@@ -415,10 +380,6 @@ export class AnthropicToolLoopCoordinator {
           await this.persistSnapshot(stateKey, snapshot, "completed", input.totalCalls);
           const bytes = replayAnthropicBytes(snapshot);
           const headers = new Headers(input.headers);
-          assertSafeClientDispatch(bytes, [
-            ...(input.upstreamSnapshot.nativeLeakMarkers ?? []),
-            ...buildNativeRegistryLeakMarkers(this.options.registry),
-          ]);
           const pending = await this.core.transitionClientDispatch(
             stateKey,
             "none",
@@ -479,11 +440,6 @@ export class AnthropicToolLoopCoordinator {
           new Set(nativeCalls.map((call) => call.contentBlockIndex)),
         );
         const headers = new Headers(input.headers);
-        assertSafeClientDispatch(bytes, [
-          ...(input.upstreamSnapshot.nativeLeakMarkers ?? []),
-          ...nativeCalls,
-          ...buildNativeRegistryLeakMarkers(this.options.registry),
-        ]);
         const pending = await this.core.transitionClientDispatch(
           stateKey,
           "none",
@@ -546,16 +502,6 @@ export class AnthropicToolLoopCoordinator {
       const nextSnapshot: UpstreamRequestSnapshot = {
         ...structuredClone(input.upstreamSnapshot),
         baseMessages: structuredClone(messages),
-        nativeLeakMarkers: mergeNativeToolLeakMarkers(
-          input.upstreamSnapshot.nativeLeakMarkers ?? [],
-          completedState.slots
-            .filter((slot) => slot.owner === "proxy")
-            .map((slot) => ({
-              callId: slot.callId,
-              toolName: slot.toolName,
-              ...(slot.input !== undefined ? { input: structuredClone(slot.input) } : {}),
-            })),
-        ),
       };
       const nextDecision = await this.handleRoundInternal({
         ...nextRound,
@@ -571,10 +517,6 @@ export class AnthropicToolLoopCoordinator {
             }
           : {}),
       }, true);
-      assertNoNativeToolLeak(
-        nextDecision.bytes,
-        completedState.slots.filter((slot) => slot.owner === "proxy"),
-      );
       const observableDecision = nextDecision.kind === "final"
         && !input.parentStateKey
         && !nextDecision.observationStateKey

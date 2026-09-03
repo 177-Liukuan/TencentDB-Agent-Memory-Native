@@ -84,12 +84,7 @@ import type {
   ToolExecutionStateKey,
 } from "./native-proxy-tools/types.js";
 import { nativeToolLeaseDurationMs } from "./native-proxy-tools/types.js";
-import {
-  assertNoNativeToolLeak,
-  buildNativeRegistryLeakMarkers,
-  buildClientVisibleAnthropicSse,
-  mergeNativeToolLeakMarkers,
-} from "./native-proxy-tools/anthropic-response-rebuilder.js";
+import { buildClientVisibleAnthropicSse } from "./native-proxy-tools/anthropic-response-rebuilder.js";
 import { isLogicalFinalToolLoopDecision } from "./native-proxy-tools/observation-policy.js";
 import {
   claimToolObservation,
@@ -405,7 +400,6 @@ async function findRecoverableNativeObservation(input: {
 
 async function replayRecoverableNativeObservation(input: {
   storage: ToolExecutionStorageAdapter;
-  registry: NativeProxyToolRegistry;
   scope: ToolExecutionScope;
   requestFingerprint: string;
   leaseMs: number;
@@ -427,28 +421,6 @@ async function replayRecoverableNativeObservation(input: {
     recoverable.observationOutcome.bodyBase64,
     "base64",
   ));
-  const persistedMarkers = mergeNativeToolLeakMarkers(
-    recoverable.upstreamSnapshot.nativeLeakMarkers ?? [],
-    recoverable.slots
-      .filter((slot) => slot.owner === "proxy")
-      .map((slot) => ({
-        callId: slot.callId,
-        toolName: slot.toolName,
-        ...(slot.input !== undefined ? { input: structuredClone(slot.input) } : {}),
-      })),
-  );
-  try {
-    assertNoNativeToolLeak(recoveryBytes, [
-      ...persistedMarkers,
-      ...buildNativeRegistryLeakMarkers(input.registry),
-    ]);
-  } catch {
-    return nativeToolErrorResponse(
-      500,
-      "native_tool_leak_detected",
-      "Persisted Native Proxy Tool response could not be replayed safely",
-    );
-  }
   try {
     await flushDurableNativeToolObservation({
       storage: input.storage,
@@ -1105,7 +1077,6 @@ export async function handleAnthropicMessages(
     const recoveredResponse = await nativeToolRuntime.runOperation(() => (
       replayRecoverableNativeObservation({
         storage: earlyNativeStorage,
-        registry: nativeToolRuntime.registry,
         scope: earlyObservationScope,
         requestFingerprint: nativeLogicalRequestFingerprint,
         leaseMs: nativeReentryLeaseWindowMs(config),
@@ -1382,7 +1353,6 @@ export async function handleAnthropicMessages(
       const recoveredResponse = await nativeToolRuntime.runOperation(() => (
         replayRecoverableNativeObservation({
           storage: nativeStorage,
-          registry: nativeToolRuntime.registry,
           scope: toolExecutionScope,
           requestFingerprint: nativeLogicalRequestFingerprint,
           leaseMs: reentryLeaseMs,
@@ -1407,20 +1377,7 @@ export async function handleAnthropicMessages(
       return nativeToolErrorResponse(resume.status, resume.code, resume.message);
     }
     if (resume.kind === "replay") {
-      try {
-        assertNoNativeToolLeak(resume.bytes, [
-          ...resume.nativeLeakMarkers,
-          ...buildNativeRegistryLeakMarkers(nativeToolRuntime.registry),
-        ]);
-      } catch {
-        return nativeToolErrorResponse(
-          500,
-          "native_tool_leak_detected",
-          "Persisted Native Proxy Tool response could not be replayed safely",
-        );
-      } finally {
-        nativeToolRuntime.releaseExactTarget(resume.stateKey);
-      }
+      nativeToolRuntime.releaseExactTarget(resume.stateKey);
       if (isLogicalFinalToolLoopDecision(resume.outcomeKind)) {
         try {
           await nativeToolRuntime.runOperation(() => flushDurableNativeToolObservation({
@@ -1512,18 +1469,6 @@ export async function handleAnthropicMessages(
         : await nativeToolRuntime.runOperation(() => new AnthropicToolLoopCoordinator(
             coordinatorOptions,
           ).handleRound(resumedRoundInput));
-      try {
-        assertNoNativeToolLeak(decision.bytes, [
-          ...resume.nativeLeakMarkers,
-          ...buildNativeRegistryLeakMarkers(nativeToolRuntime.registry),
-        ]);
-      } catch {
-        return nativeToolErrorResponse(
-          500,
-          "native_tool_leak_detected",
-          "Native Proxy Tool response could not be returned safely",
-        );
-      }
       if (parentContinuationCommitted && decision.kind !== "client_dispatch") {
         nativeToolRuntime.releaseExactTarget(resume.stateKey);
         return nativeToolErrorResponse(
@@ -2249,22 +2194,12 @@ export async function handleAnthropicMessages(
           && nativeToolRuntime.registry.owns((tool as Record<string, unknown>).name as string)
         ));
       if (sentNativeToolDefinition) {
-        try {
-          assertNoNativeToolLeak(
-            errBytes,
-            buildNativeRegistryLeakMarkers(nativeToolRuntime.registry),
-          );
-        } catch {
-          pipe.error("NATIVE_TOOL_LEAK", "upstream error response echoed Native Tool data");
-          pipe.streamDone(null);
-          return nativeToolErrorResponse(
-            500,
-            "native_tool_leak_detected",
-            "Anthropic upstream error response could not be returned safely",
-          );
-        }
-      }
-      if (usesResponsesUpstream) {
+        errText = JSON.stringify({
+          type: "error",
+          error: { type: "api_error", message: "Upstream model request failed" },
+        });
+        errBytes = new TextEncoder().encode(errText);
+      } else if (usesResponsesUpstream) {
         try {
           const converted = convertResponsesJsonToAnthropic(JSON.parse(errText));
           errText = JSON.stringify(converted);

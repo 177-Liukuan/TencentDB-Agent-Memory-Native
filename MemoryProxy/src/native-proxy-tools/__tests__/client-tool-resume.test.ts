@@ -257,6 +257,33 @@ describe("extractAnthropicClientToolResults", () => {
     ]);
   });
 
+  it("reads Tool Results immediately before trailing Claude Code system messages", () => {
+    const body = resultBody();
+    (body.messages as unknown[]).push({
+      role: "system",
+      content: "A queued user message is available.",
+    });
+
+    expect(extractAnthropicClientToolResults(body)).toEqual([
+      {
+        callId: "c2",
+        content: [{ type: "text", text: "second output" }],
+        isError: false,
+      },
+      { callId: "c1", content: "first output", isError: false },
+    ]);
+  });
+
+  it("does not scan past a newer ordinary conversation message", () => {
+    const body = resultBody();
+    (body.messages as unknown[]).push(
+      { role: "system", content: "A queued user message is available." },
+      { role: "user", content: "new question" },
+    );
+
+    expect(extractAnthropicClientToolResults(body)).toEqual([]);
+  });
+
   it("rejects duplicate call IDs in one Client request", () => {
     expect(() => extractAnthropicClientToolResults(resultBody([
       { callId: "c1", content: "first" },
@@ -283,6 +310,29 @@ describe("OpenAI Responses Client Tool Result extraction", () => {
 });
 
 describe("resumeClientToolResults", () => {
+  it("registers Tool Results before a trailing system control message and re-enters", async () => {
+    const harness = resumeHarness();
+    await harness.storage.create(mixedState({
+      p1: { status: "succeeded", result: "p1-result", isError: false },
+    }));
+    const body = resultBody();
+    (body.messages as unknown[]).push({
+      role: "system",
+      content: "A queued user message is available.",
+    });
+
+    const decision = await resumeClientToolResults(harness.input(body));
+
+    expect(decision).toMatchObject({ kind: "reentered" });
+    expect(harness.reenter).toHaveBeenCalledTimes(1);
+    const stored = await harness.storage.get({ ...scope(), toolBatchId: "batch-mixed" });
+    expect(stored?.slots.filter((entry) => entry.owner === "client"))
+      .toEqual(expect.arrayContaining([
+        expect.objectContaining({ callId: "c1", status: "succeeded" }),
+        expect.objectContaining({ callId: "c2", status: "succeeded" }),
+      ]));
+  });
+
   it("waits when Client results arrive before the running Native result", async () => {
     const harness = resumeHarness();
     const state = mixedState();
@@ -640,11 +690,6 @@ describe("resumeClientToolResults", () => {
       { role: "user", content: [{ type: "tool_result", tool_use_id: "old-native", content: "hidden" }] },
     ];
     state.upstreamSnapshot.logicalBaseMessages = [{ role: "user", content: "original question" }];
-    state.upstreamSnapshot.nativeLeakMarkers = [{
-      callId: "ancestor-native",
-      toolName: "tdai_memory_search",
-      input: { query: "ancestor-secret" },
-    }];
     const harness = resumeHarness();
     await harness.storage.create(state);
 
@@ -653,15 +698,8 @@ describe("resumeClientToolResults", () => {
     expect(decision).toMatchObject({
       kind: "reentered",
       logicalMessages: [{ role: "user", content: "original question" }],
-      nativeLeakMarkers: expect.arrayContaining([
-        expect.objectContaining({ callId: "ancestor-native", toolName: "tdai_memory_search" }),
-        expect.objectContaining({ callId: "p1", toolName: "tdai_memory_search" }),
-      ]),
       upstreamSnapshot: {
-        nativeLeakMarkers: expect.arrayContaining([
-          expect.objectContaining({ callId: "ancestor-native" }),
-          expect.objectContaining({ callId: "p1" }),
-        ]),
+        baseMessages: expect.any(Array),
       },
     });
     if (decision.kind !== "reentered") throw new Error("expected re-entry");
