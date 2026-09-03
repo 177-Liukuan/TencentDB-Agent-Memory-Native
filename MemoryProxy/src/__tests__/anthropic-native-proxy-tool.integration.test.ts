@@ -16,6 +16,7 @@ import {
   createNativeProxyToolRuntime,
   shutdownNativeProxyToolRuntime,
 } from "../native-proxy-tools/runtime.js";
+import { createHistoryAnchor } from "../native-proxy-tools/history-anchor.js";
 import { createApp } from "../server.js";
 import { __resetSessionStoreForTests, getSessionStore } from "../session/store.js";
 
@@ -230,6 +231,83 @@ afterEach(async () => {
 });
 
 describe("Anthropic Native Proxy Tool handler", () => {
+  it("does not create compression records from summary-like text in an ordinary Messages request", async () => {
+    const proxyConfig = config();
+    const historyStorage = new InMemoryNativeToolHistoryStorageAdapter();
+    const originalMessages = [{ role: "user", content: "What rules apply?" }];
+    await historyStorage.appendCompletedBatch({
+      historyId: "history-summary-text",
+      logicalTurnId: "turn-summary-text",
+      scope: {
+        spaceId: "space-1",
+        userId: "user-1",
+        agentSource: "claude-code",
+        sessionId: "session-1",
+      },
+      clientProtocol: "anthropic",
+      upstreamProtocol: "anthropic",
+      anchor: createHistoryAnchor(originalMessages),
+      round: 1,
+      fullSegment: [
+        { role: "assistant", content: [{ type: "tool_use", id: "native-summary-1", name: "tdai_memory_search", input: { query: "rules" } }] },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: "native-summary-1", content: "project rule" }] },
+      ],
+      clientProjection: [],
+      proxyCallIds: ["native-summary-1"],
+      clientCallIds: [],
+      createdAt: "2026-09-03T00:00:00.000Z",
+    });
+    const runtime = createNativeProxyToolRuntime(proxyConfig, {
+      createStorage: () => new InMemoryToolExecutionStorageAdapter(),
+      createHistoryStorage: () => historyStorage,
+    });
+    await runtime.ready();
+    __setNativeProxyToolRuntimeForTests(runtime);
+    await installInitializedSession();
+
+    vi.stubGlobal("fetch", vi.fn(async (url: string | URL | Request) => {
+      if (String(url) === "https://tdai.example/v3/meta/config/user/get") {
+        return new Response(JSON.stringify({ code: 0, data: { items: [] } }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      if (String(url) === "https://upstream.example/v1/messages") {
+        return singleConsumerSse(finalTextFixture("summary response")).response;
+      }
+      return new Response("not found", { status: 404 });
+    }));
+
+    const response = await createApp(proxyConfig).request("/claude-code/space-1/v1/messages", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-api-key": "client-key",
+        "x-user-id": "user-1",
+        "x-conversation-id": "session-1",
+      },
+      body: JSON.stringify({
+        model: "claude-test",
+        max_tokens: 1_024,
+        stream: true,
+        messages: [
+          ...originalMessages,
+          { role: "assistant", content: "previous answer" },
+          { role: "user", content: "Provide a detailed summary of our conversation so far." },
+        ],
+      }),
+    });
+
+    expect(response.status).toBe(200);
+    expect(await response.text()).toContain("summary response");
+    await expect(historyStorage.findPendingCompressionReceipts({
+      spaceId: "space-1",
+      userId: "user-1",
+      agentSource: "claude-code",
+      sessionId: "session-1",
+    })).resolves.toEqual([]);
+  });
+
   it("fails closed and exposes readiness when ClickHouse state storage is unavailable", async () => {
     const proxyConfig = config();
     const storage = new InMemoryToolExecutionStorageAdapter();

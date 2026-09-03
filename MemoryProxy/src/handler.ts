@@ -75,11 +75,7 @@ import {
   NativeToolHistoryConflictError,
 } from "./native-proxy-tools/native-tool-history-materializer.js";
 import {
-  beginNativeToolCompression,
   confirmPendingNativeToolCompressions,
-  looksLikeAnthropicCompressionRequest,
-  openAIChatResponseCompletedForCompression,
-  trackNativeToolCompressionResponse,
 } from "./native-proxy-tools/native-tool-compression-receipt.js";
 
 /**
@@ -1370,7 +1366,6 @@ export async function handleChatCompletions(
     agentName: agentFromPath,
   });
 
-  let nativeCompressionReceipt: Awaited<ReturnType<typeof beginNativeToolCompression>> = null;
   if (historyRuntime?.storage && historyRuntime.historyStorage && toolExecutionScope) {
     try {
       await historyRuntime.runOperation(async () => {
@@ -1394,16 +1389,6 @@ export async function handleChatCompletions(
         if (restored.historyIds.length > 0) {
           messages = restored.items;
           body = { ...body, messages: restored.items };
-        }
-        if (looksLikeAnthropicCompressionRequest(
-          (nativeLogicalBaseMessages ?? messages) as import("./native-proxy-tools/types.js").JsonValue[],
-        )) {
-          nativeCompressionReceipt = await beginNativeToolCompression({
-            scope: toolExecutionScope,
-            sourceItems: (nativeLogicalBaseMessages ?? messages) as import("./native-proxy-tools/types.js").JsonValue[],
-            historyIds: restored.historyIds,
-            storage: historyRuntime.historyStorage!,
-          });
         }
       });
     } catch (error) {
@@ -1725,14 +1710,7 @@ export async function handleChatCompletions(
         status: decision.status,
         headers: decision.headers,
       });
-      return nativeCompressionReceipt && historyRuntime?.historyStorage
-        ? trackNativeToolCompressionResponse({
-            response: clientResponse,
-            receipt: nativeCompressionReceipt,
-            storage: historyRuntime.historyStorage,
-            isComplete: openAIChatResponseCompletedForCompression,
-          })
-        : clientResponse;
+      return clientResponse;
     }
 
     pipe.streamStart();
@@ -1772,14 +1750,7 @@ export async function handleChatCompletions(
     const tappedStream = upstreamResp.body.pipeThrough(passthrough);
 
     const clientResponse = new Response(tappedStream, { status: upstreamResp.status, headers: respHeaders });
-    return nativeCompressionReceipt && historyRuntime?.historyStorage
-      ? trackNativeToolCompressionResponse({
-          response: clientResponse,
-          receipt: nativeCompressionReceipt,
-          storage: historyRuntime.historyStorage,
-          isComplete: openAIChatResponseCompletedForCompression,
-        })
-      : clientResponse;
+    return clientResponse;
   }
 
   // ── Non-streaming response ───────────────────────────────────────────────
@@ -2029,14 +2000,7 @@ export async function handleChatCompletions(
   }
 
   const clientResponse = new Response(respText, { status: upstreamResp.status, headers: respHeaders });
-  return nativeCompressionReceipt && historyRuntime?.historyStorage
-    ? trackNativeToolCompressionResponse({
-        response: clientResponse,
-        receipt: nativeCompressionReceipt,
-        storage: historyRuntime.historyStorage,
-        isComplete: openAIChatResponseCompletedForCompression,
-      })
-    : clientResponse;
+  return clientResponse;
 }
 
 

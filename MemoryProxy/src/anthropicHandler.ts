@@ -110,11 +110,7 @@ import {
   NativeToolHistoryConflictError,
 } from "./native-proxy-tools/native-tool-history-materializer.js";
 import {
-  anthropicResponseCompletedForCompression,
-  beginNativeToolCompression,
   confirmPendingNativeToolCompressions,
-  looksLikeAnthropicCompressionRequest,
-  trackNativeToolCompressionResponse,
 } from "./native-proxy-tools/native-tool-compression-receipt.js";
 
 const SKIP_REQUEST_HEADERS = new Set([
@@ -1892,7 +1888,6 @@ export async function handleAnthropicMessages(
     agentName: agentFromPath,
   });
 
-  let nativeCompressionReceipt: Awaited<ReturnType<typeof beginNativeToolCompression>> = null;
   if (historyRuntime?.storage && historyRuntime.historyStorage && toolExecutionScope) {
     try {
       await historyRuntime.runOperation(async () => {
@@ -1916,16 +1911,6 @@ export async function handleAnthropicMessages(
         if (restored.historyIds.length > 0) {
           messages = restored.items;
           body = { ...body, messages: restored.items };
-        }
-        if (looksLikeAnthropicCompressionRequest(
-          (nativeLogicalBaseMessages ?? messages) as import("./native-proxy-tools/types.js").JsonValue[],
-        )) {
-          nativeCompressionReceipt = await beginNativeToolCompression({
-            scope: toolExecutionScope,
-            sourceItems: (nativeLogicalBaseMessages ?? messages) as import("./native-proxy-tools/types.js").JsonValue[],
-            historyIds: restored.historyIds,
-            storage: historyRuntime.historyStorage!,
-          });
         }
       });
     } catch (error) {
@@ -2426,14 +2411,9 @@ export async function handleAnthropicMessages(
       const clientStream = isSse
         ? streamFromBytes(decision.bytes).pipeThrough(createSseThinkingFixStream(pipe))
         : streamFromBytes(decision.bytes);
-      return trackNativeToolCompressionResponse({
-        response: new Response(clientStream, {
+      return new Response(clientStream, {
         status: decision.status,
         headers: decisionHeaders,
-        }),
-        receipt: nativeCompressionReceipt,
-        storage: historyRuntime!.historyStorage!,
-        isComplete: anthropicResponseCompletedForCompression,
       });
     }
 
@@ -2479,15 +2459,7 @@ export async function handleAnthropicMessages(
 
     const clientStream = rawClientStream.pipeThrough(createSseThinkingFixStream(pipe));
 
-    const clientResponse = new Response(clientStream, { status: upstreamResp.status, headers: respHeaders });
-    return nativeCompressionReceipt && historyRuntime?.historyStorage
-      ? trackNativeToolCompressionResponse({
-          response: clientResponse,
-          receipt: nativeCompressionReceipt,
-          storage: historyRuntime.historyStorage,
-          isComplete: anthropicResponseCompletedForCompression,
-        })
-      : clientResponse;
+    return new Response(clientStream, { status: upstreamResp.status, headers: respHeaders });
   }
 
   // ── Non-streaming response ───────────────────────────────────────────────
@@ -2760,15 +2732,7 @@ export async function handleAnthropicMessages(
     );
   }
 
-  const clientResponse = new Response(respText, { status: upstreamResp.status, headers: respHeaders });
-  return nativeCompressionReceipt && historyRuntime?.historyStorage
-    ? trackNativeToolCompressionResponse({
-        response: clientResponse,
-        receipt: nativeCompressionReceipt,
-        storage: historyRuntime.historyStorage,
-        isComplete: anthropicResponseCompletedForCompression,
-      })
-    : clientResponse;
+  return new Response(respText, { status: upstreamResp.status, headers: respHeaders });
 }
 
 

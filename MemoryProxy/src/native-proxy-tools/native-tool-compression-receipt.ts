@@ -55,43 +55,6 @@ export function responseCompletedForCompression(body: string): boolean {
   }
 }
 
-export function looksLikeAnthropicCompressionRequest(items: readonly JsonValue[]): boolean {
-  const last = items.at(-1);
-  if (!last || typeof last !== "object" || Array.isArray(last)) return false;
-  const message = last as Record<string, JsonValue>;
-  if (message.role !== "user") return false;
-  const text = typeof message.content === "string"
-    ? message.content
-    : Array.isArray(message.content)
-      ? message.content.flatMap((block) => {
-        if (!block || typeof block !== "object" || Array.isArray(block)) return [];
-        const value = block as Record<string, JsonValue>;
-        return value.type === "text" && typeof value.text === "string" ? [value.text] : [];
-      }).join("\n")
-      : "";
-  return /(?:detailed\s+summary|summari[sz]e\s+(?:the|our)\s+(?:conversation|discussion)|context\s+compact|conversation\s+so\s+far)/i.test(text);
-}
-
-export function anthropicResponseCompletedForCompression(body: string): boolean {
-  if (body.includes("event: message_stop")) return true;
-  try {
-    const parsed = JSON.parse(body) as Record<string, unknown>;
-    return parsed.type === "message" && parsed.role === "assistant";
-  } catch {
-    return false;
-  }
-}
-
-export function openAIChatResponseCompletedForCompression(body: string): boolean {
-  if (body.includes("data: [DONE]")) return true;
-  try {
-    const parsed = JSON.parse(body) as Record<string, unknown>;
-    return Array.isArray(parsed.choices);
-  } catch {
-    return false;
-  }
-}
-
 export function trackNativeToolCompressionResponse(input: {
   response: Response;
   receipt: NativeToolCompressionReceipt | null;
