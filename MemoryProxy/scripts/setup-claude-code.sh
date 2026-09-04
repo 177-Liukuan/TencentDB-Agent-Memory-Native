@@ -158,8 +158,8 @@ if action == "install":
         )]
         groups.append({
             "matcher": "",
-            # Hook 与模型请求必须落到同一用户；该内部入口固定使用现有身份头。
-            "hooks": [{"type": "http", "url": hook_url, "headers": {"X-Tdai-User-Token": token}}],
+            # Hook 与模型请求必须使用同一个鉴权头，不能把用户密钥误当作 user_id。
+            "hooks": [{"type": "http", "url": hook_url, "headers": {header: token}}],
         })
     summary = (
         f"  ANTHROPIC_BASE_URL       = {endpoint}\n"
