@@ -104,7 +104,7 @@ describe("Anthropic Tool Ledger reconstruction", () => {
           { kind: "client_tool_ref", blockIndex: 3, callId: "client-b", toolName: "Read" },
           {
             kind: "native_tool", blockIndex: 4, callId: "native-c",
-            toolName: "tdai_skill_view", input: { skill_id: "s" },
+            toolName: "skill_view", input: { skill_id: "s" },
           },
         ],
         nativeResults: [
@@ -121,7 +121,7 @@ describe("Anthropic Tool Ledger reconstruction", () => {
         { type: "tool_use", id: "native-a", name: "tdai_memory_search", input: { query: "q" } },
         { type: "thinking", thinking: "需要读取文件" },
         { type: "tool_use", id: "client-b", name: "Read", input: { file_path: "a.ts" } },
-        { type: "tool_use", id: "native-c", name: "tdai_skill_view", input: { skill_id: "s" } },
+        { type: "tool_use", id: "native-c", name: "skill_view", input: { skill_id: "s" } },
       ],
     });
     expect(result[2]).toEqual({
@@ -155,7 +155,7 @@ describe("Anthropic Tool Ledger reconstruction", () => {
           ledgerId: "after", round: 2,
           blocks: [{
             kind: "native_tool", blockIndex: 0, callId: "native-c",
-            toolName: "tdai_skill_view", input: { skill_id: "s" },
+            toolName: "skill_view", input: { skill_id: "s" },
           }],
           nativeResults: [{ callId: "native-c", value: "skill", isError: false }],
         }),
@@ -169,7 +169,7 @@ describe("Anthropic Tool Ledger reconstruction", () => {
       { type: "tool_use", id: "client-b", name: "Read", input: {} },
     ]);
     expect((result[5] as Record<string, unknown>).content).toEqual([
-      { type: "tool_use", id: "native-c", name: "tdai_skill_view", input: { skill_id: "s" } },
+      { type: "tool_use", id: "native-c", name: "skill_view", input: { skill_id: "s" } },
     ]);
     expect(result.at(-1)).toEqual({ role: "assistant", content: [{ type: "text", text: "完成" }] });
   });

@@ -77,7 +77,7 @@ describe("NativeProxyToolDispatcher", () => {
     } as any);
 
     const result = await dispatcher.execute(
-      proxyCall("tdai_skill_view", { skill_id: "skl-1" }, "skill-call-1"),
+      proxyCall("skill_view", { skill_id: "skl-1" }, "skill-call-1"),
       trustedContext(),
     );
 
@@ -126,7 +126,7 @@ describe("NativeProxyToolDispatcher", () => {
     expect(retryable).toHaveBeenCalledTimes(2);
 
     expect(await conflictDispatcher.execute(
-      proxyCall("tdai_skill_update", { skill_id: "skl-1", content: "new" }),
+      proxyCall("skill_update", { skill_id: "skl-1", content: "new" }),
       trustedContext(),
     )).toEqual({
       isError: true,

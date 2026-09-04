@@ -23,7 +23,7 @@ import type { BindingRepo } from "../db/binding-repo.js";
 import { KvBindingRepo } from "../db/kv-binding-repo.js";
 import { RedisBindingRepo } from "../db/binding-repo.js";
 // getSkillExtractTrigger / KvExtractStore 已随老链路一起删除。
-// 详见 handler-glue.ts 顶部注释 —— tdai_skill_extract 触发路径当前不可用,
+// 详见 handler-glue.ts 顶部注释 —— skill_extract 触发路径当前不可用,
 // core 侧后续会出手动归档接口, 到时 agent 工具再重新指向那个接口。
 import { getRedisClient } from "../db/redis-client.js";
 import { VersionPinRepo } from "./version-pin-repo.js";
@@ -151,7 +151,7 @@ const ALLOWED_SUBPATHS = new Set<string>([
   "files/write",
   "files/remove",
   "listing",
-  // agent 侧 tool 名叫 tdai_skill_extract, bridge 转发到 core force-archive
+  // agent 侧 tool 名叫 skill_extract, bridge 转发到 core force-archive
   // (不依赖 messages, core 从 conversation buffer 拿)。见下方 sub === "extract" 分支。
   "extract",
 ]);
@@ -350,7 +350,7 @@ function extractSubpath(path: string): string | null {
  * Production implementation calls MetadataClient.listAccessibleAssets with
  * asset_type='skill' + action='read' + visibility='team'. Tests inject a stub.
  *
- * No caching: tdai_skill_search is low-frequency (0-3 times per session), meta call
+ * No caching: skill_search is low-frequency (0-3 times per session), meta call
  * is ~tens-of-ms next to a seconds-long LLM turn, and a cache would introduce
  * a stale window that contradicts the panel (a visibility flip on the panel
  * should be visible to the LLM's next search immediately).
@@ -674,7 +674,7 @@ export function createSkillBridgeHandler(
      */
     let upstreamSubpathOverride: string | null = null;
     if (sub === "extract") {
-      // agent 侧 tool 叫 tdai_skill_extract, 语义"立即归档当前对话触发一次 skill 抽取"。
+      // agent 侧 tool 叫 skill_extract, 语义"立即归档当前对话触发一次 skill 抽取"。
       // 转发到 core `/v3/skill/conversation/force-archive` —— 该接口不吃 messages,
       // 从 conversation buffer(proxy 主对话链路每轮推的 /v3/skill/conversation/add)
       // 拿累积的完整对话。见 core skill-schemas.ts forceArchiveRequestSchema。

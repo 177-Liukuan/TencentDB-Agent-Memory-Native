@@ -2,8 +2,8 @@
  * Skill Injector — emits the `<available_skills>` block containing skills
  * owned by the current agent (team_id + agent_id filtered via /v3/skill/listing).
  *
- * This phase exposes the listing only as neutral asset metadata. It does not
- * advertise a model-facing Skill tool family or a shell/curl fallback.
+ * When structured Skill tools are enabled, the listing tells the model how to
+ * load cloud Skill content without adding a shell-command fallback.
  *
  * The listing endpoint uses routing internally:
  *   - No query → list head (full listing when ≤ searchTopK, search when >)
@@ -15,7 +15,7 @@
  *   - Calls core directly via `CoreSkillClient.listListing`.
  *   - Failure / empty listing → 0 blocks (graceful degradation).
  *
- * The listing must not imply that the model can load or mutate a skill.
+ * Tool parameters and write permissions remain defined by the Tool Registry.
  */
 
 import type {
@@ -40,43 +40,55 @@ const TAG = "[skill-injector]";
 export interface SkillInjectorConfig {
   /** Core skill client config; passed to `getCoreSkillClient(config)`. */
   coreSkill: CoreSkillConfig;
+  /** Whether this deployment actually injects structured Skill tools. */
+  nativeSkillToolsEnabled: boolean;
 }
 
 /**
  * Prompt boilerplate wrapping the `<available_skills>` listing.
  *
- * Unlike the full Skill runtime prompt, this wording is deliberately
- * reference-only because no structured Skill Native Tool exists in this
- * project phase.
+ * 这里只说明本次请求真实具备的能力；具体参数和权限仍以结构化 Tool Schema
+ * 为准，避免重新引入 Fake Tool 时代的命令说明。
  */
-const SKILL_LISTING_HEADER =
-  "## Available Skill Assets (reference only)\n"
-  + "The entries below are metadata for assets associated with the current agent. "
-  + "This deployment does not expose a model-facing Skill execution, loading, or editing tool. "
-  + "Use names and descriptions only as background context, and do not claim that you loaded, "
-  + "executed, created, or modified any listed asset.\n";
+const NATIVE_SKILL_LISTING_HEADER =
+  "## Available Cloud Skills\n"
+  + "以下是当前 Agent 关联的云端 Skill。\n"
+  + "需要查找或读取 Skill 内容时，使用 `skill_search` 和 `skill_view`；"
+  + "读取 Skill 资源文件时，使用 `skill_files_read`。\n"
+  + "云端 Skill 不在本地文件系统中，不要使用本地 `Read` 或 `Bash` 访问。";
 
-const SKILL_LISTING_FOOTER =
-  "\nTreat this catalog as reference metadata only.";
+const REFERENCE_ONLY_SKILL_LISTING_HEADER =
+  "## Available Cloud Skills (reference only)\n"
+  + "以下是当前 Agent 关联的云端 Skill 元数据。"
+  + "当前请求未提供云端 Skill 工具，只能将名称和描述作为背景信息。";
+
+const NATIVE_SKILL_LISTING_FOOTER =
+  "只有在实际读取 Skill 内容后，才能声称已经使用该 Skill。";
+
+const REFERENCE_ONLY_SKILL_LISTING_FOOTER =
+  "未读取 Skill 正文时，不要声称已经加载或执行其内容。";
 
 /**
  * Wrap the pre-rendered `<available_skills>` listing from plugin into a
- * context block with explicit reference-only semantics.
+ * context block with capability wording matching the current deployment.
  *
  * Layout (top → bottom, single joined string):
- *   1. SKILL_LISTING_HEADER — neutral capability boundary.
+ *   1. Capability header.
  *   2. `<available_skills>` listing (verbatim from core).
- *   3. SKILL_LISTING_FOOTER — reinforces reference-only use.
+ *   3. Matching usage boundary.
  */
-export function wrapAvailableSkillsBlock(listing: string): string {
-  return [
-    SKILL_LISTING_HEADER,
-    "以下仅是当前 agent 关联的云端 skill 元数据。本阶段没有提供给模型的 Skill 调用、读取或修改工具；",
-    "只能把名称和描述作为背景信息，不能声称已经加载或执行其内容。",
-    "",
-    listing,
-    SKILL_LISTING_FOOTER,
-  ].join("\n");
+export function wrapAvailableSkillsBlock(
+  listing: string,
+  nativeSkillToolsEnabled: boolean,
+): string {
+  const header = nativeSkillToolsEnabled
+    ? NATIVE_SKILL_LISTING_HEADER
+    : REFERENCE_ONLY_SKILL_LISTING_HEADER;
+  const footer = nativeSkillToolsEnabled
+    ? NATIVE_SKILL_LISTING_FOOTER
+    : REFERENCE_ONLY_SKILL_LISTING_FOOTER;
+
+  return [header, "", listing, "", footer].join("\n");
 }
 
 /**
@@ -260,7 +272,10 @@ export class SkillInjector implements InjectionHook {
     const listing = result.listing;
     if (!listing || listing.includes("(none)")) return [];
 
-    const content = wrapAvailableSkillsBlock(listing);
+    const content = wrapAvailableSkillsBlock(
+      listing,
+      this.config.nativeSkillToolsEnabled,
+    );
     return [{
       type: "text",
       content,

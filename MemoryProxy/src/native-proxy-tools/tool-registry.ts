@@ -289,7 +289,7 @@ const TOOLS: readonly NativeProxyToolDefinition[] = Object.freeze([
     }),
   }),
   definition({
-    name: "tdai_skill_search",
+    name: "skill_search",
     description: "在当前用户有权访问的团队 Skill 中检索匹配项。",
     inputSchema: objectSchema({ query: stringProperty("Skill 关键词") }, ["query"]),
     backend: "skill", effect: "read", route: "search", exposure: "skill-read",
@@ -299,7 +299,7 @@ const TOOLS: readonly NativeProxyToolDefinition[] = Object.freeze([
     }),
   }),
   definition({
-    name: "tdai_skill_view",
+    name: "skill_view",
     description: "按稳定 skill_id 读取 SKILL.md 全文和资源目录。",
     inputSchema: objectSchema({ skill_id: stringProperty("Skill 标识") }, ["skill_id"]),
     backend: "skill", effect: "read", route: "get", exposure: "skill-read",
@@ -309,8 +309,8 @@ const TOOLS: readonly NativeProxyToolDefinition[] = Object.freeze([
     }),
   }),
   definition({
-    name: "tdai_skill_files_read",
-    description: "读取 tdai_skill_view 资源目录中已知路径的单个文件，内容受结果大小限制。",
+    name: "skill_files_read",
+    description: "读取 skill_view 资源目录中已知路径的单个文件，内容受结果大小限制。",
     inputSchema: objectSchema({ skill_id: stringProperty("Skill 标识"), path: stringProperty("资源相对路径", 1_024), encoding: { type: "string", enum: ["utf-8", "base64"], default: "utf-8" } }, ["skill_id", "path"]),
     backend: "skill", effect: "read", route: "files/read", exposure: "skill-read",
     validate: (input) => validate(input, ["skill_id", "path", "encoding"], (record) => {
@@ -321,7 +321,7 @@ const TOOLS: readonly NativeProxyToolDefinition[] = Object.freeze([
     }),
   }),
   definition({
-    name: "tdai_skill_extract",
+    name: "skill_extract",
     description: "归档当前会话并异步触发一次 Skill 抽取。仅在完整可复用流程已经形成时使用。",
     inputSchema: objectSchema({ reason: { type: "string", maxLength: 2_000 } }),
     backend: "skill", effect: "archive", route: "extract", exposure: "skill-read",
@@ -331,7 +331,7 @@ const TOOLS: readonly NativeProxyToolDefinition[] = Object.freeze([
     }),
   }),
   definition({
-    name: "tdai_skill_create",
+    name: "skill_create",
     description: "为当前 Agent 创建新的云端 Skill。",
     inputSchema: objectSchema({ name: stringProperty("Skill 名称", 64), content: stringProperty("完整 SKILL.md", 262_144), resources: { type: "array", maxItems: 64, items: resourceSchema } }, ["name", "content"]),
     backend: "skill", effect: "write", route: "create", exposure: "skill-write",
@@ -343,7 +343,7 @@ const TOOLS: readonly NativeProxyToolDefinition[] = Object.freeze([
     }),
   }),
   definition({
-    name: "tdai_skill_update",
+    name: "skill_update",
     description: "替换已有 Skill 的 SKILL.md；版本锁由 Proxy 自动补充。",
     inputSchema: objectSchema({ skill_id: stringProperty("Skill 标识"), content: stringProperty("新的完整 SKILL.md", 262_144) }, ["skill_id", "content"]),
     backend: "skill", effect: "write", route: "update", exposure: "skill-write",
@@ -354,7 +354,7 @@ const TOOLS: readonly NativeProxyToolDefinition[] = Object.freeze([
     }),
   }),
   definition({
-    name: "tdai_skill_patch",
+    name: "skill_patch",
     description: "对已有 Skill 的 SKILL.md 做受版本锁保护的字符串替换。",
     inputSchema: objectSchema({ skill_id: stringProperty("Skill 标识"), old_string: stringProperty("待替换文本", 262_144), new_string: { type: "string", maxLength: 262_144 }, replace_all: { type: "boolean", default: false } }, ["skill_id", "old_string", "new_string"]),
     backend: "skill", effect: "write", route: "patch", exposure: "skill-write",
@@ -367,13 +367,13 @@ const TOOLS: readonly NativeProxyToolDefinition[] = Object.freeze([
     }),
   }),
   definition({
-    name: "tdai_skill_delete",
+    name: "skill_delete",
     description: "软删除当前 Agent 拥有的 Skill；版本锁由 Proxy 自动补充。",
     inputSchema: objectSchema({ skill_id: stringProperty("Skill 标识") }, ["skill_id"]),
     backend: "skill", effect: "write", route: "delete", exposure: "skill-write", validate: idValidator,
   }),
   definition({
-    name: "tdai_skill_files_write",
+    name: "skill_files_write",
     description: "新增或修改 Skill 资源文件；版本锁由 Proxy 自动补充。",
     inputSchema: objectSchema({ skill_id: stringProperty("Skill 标识"), files: { type: "array", minItems: 1, maxItems: 64, items: resourceSchema } }, ["skill_id", "files"]),
     backend: "skill", effect: "write", route: "files/write", exposure: "skill-write",
@@ -384,7 +384,7 @@ const TOOLS: readonly NativeProxyToolDefinition[] = Object.freeze([
     }),
   }),
   definition({
-    name: "tdai_skill_files_remove",
+    name: "skill_files_remove",
     description: "删除 Skill 中的资源文件；版本锁由 Proxy 自动补充。",
     inputSchema: objectSchema({ skill_id: stringProperty("Skill 标识"), paths: { type: "array", minItems: 1, maxItems: 64, items: stringProperty("资源相对路径", 1_024) } }, ["skill_id", "paths"]),
     backend: "skill", effect: "write", route: "files/remove", exposure: "skill-write",

@@ -234,7 +234,13 @@ function buildPipelineBundle(config: ProxyConfig): PipelineBundle {
     // When coreSkill is unconfigured (no serviceToken), the searchSkills call
     // will fail and the injector silently degrades to no <cloud_skills> block.
     registry.register(
-      new SkillInjector({ coreSkill: config.coreSkill }),
+      new SkillInjector({
+        coreSkill: config.coreSkill,
+        // 只有真工具实际注册时，Skill 列表才提示模型调用这些工具。
+        nativeSkillToolsEnabled:
+          config.nativeProxyTools.enabled
+          && config.coreSkill.serviceToken.length > 0,
+      }),
     );
   }
 
