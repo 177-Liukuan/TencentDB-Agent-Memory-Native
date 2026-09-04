@@ -114,12 +114,12 @@ function waitForBridge(
 }
 
 function labels(definition: NativeProxyToolDefinition): {
-  prefix: "memory" | "skill";
+  prefix: "memory" | "skill" | "knowledge";
   operation: string;
 } {
-  return definition.backend === "memory"
-    ? { prefix: "memory", operation: "Memory search" }
-    : { prefix: "skill", operation: "Skill operation" };
+  if (definition.backend === "memory") return { prefix: "memory", operation: "Memory search" };
+  if (definition.backend === "skill") return { prefix: "skill", operation: "Skill operation" };
+  return { prefix: "knowledge", operation: "Knowledge operation" };
 }
 
 function responseIsRetryable(response: BridgeToolExecutionResult): boolean {
@@ -221,8 +221,13 @@ export class NativeProxyToolDispatcher {
     }
 
     if (envelope.code !== 0) {
+      const failureCode = definition.backend === "memory"
+        ? "memory_search_failed"
+        : definition.backend === "skill"
+          ? "skill_operation_failed"
+          : "knowledge_operation_failed";
       return errorResult(
-        definition.backend === "memory" ? "memory_search_failed" : "skill_operation_failed",
+        failureCode,
         `${label.operation} failed`,
         false,
         requestId,

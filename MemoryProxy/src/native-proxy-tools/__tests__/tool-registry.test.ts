@@ -19,6 +19,7 @@ import {
   describeNativeProxyToolInjectionFailure,
 } from "../native-proxy-tools-injector.js";
 import { createDefaultNativeProxyToolRegistry } from "../tool-registry.js";
+import { setCoreKnowledgeClient } from "../../knowledge/core-client.js";
 
 const metadata: AgentContextMetadata = {
   protocol: "anthropic",
@@ -48,6 +49,7 @@ const metadata: AgentContextMetadata = {
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  setCoreKnowledgeClient(null);
   __resetInjectionPipelineForTests();
 });
 
@@ -70,7 +72,7 @@ function initializedAnthropicContext(
 }
 
 describe("Native Proxy Tool Registry", () => {
-  it("registers all six Memory and ten Skill tools in stable order", () => {
+  it("registers all six Memory, ten Skill, and two Knowledge tools in stable order", () => {
     const registry = createDefaultNativeProxyToolRegistry();
 
     expect(registry.list().map((tool) => tool.name)).toEqual([
@@ -90,6 +92,8 @@ describe("Native Proxy Tool Registry", () => {
       "skill_delete",
       "skill_files_write",
       "skill_files_remove",
+      "tdai_knowledge_tools_list",
+      "tdai_knowledge_tool_call",
     ]);
     expect(registry.require("tdai_memory_search")).toMatchObject({
       owner: "proxy",
@@ -107,12 +111,17 @@ describe("Native Proxy Tool Registry", () => {
       effect: "write",
       route: "delete",
     });
+    expect(registry.require("tdai_knowledge_tool_call")).toMatchObject({
+      backend: "knowledge",
+      effect: "read",
+      route: "tools/call",
+    });
     expect(registry.owns("client_tool")).toBe(false);
     expect(registry.owns("skill_search")).toBe(true);
     expect(registry.owns("tdai_skill_search")).toBe(false);
   });
 
-  it("resolves Memory and Skill exposure independently", () => {
+  it("resolves Memory, Skill, and Knowledge exposure independently", () => {
     const registry = createDefaultNativeProxyToolRegistry();
     const names = (value: Parameters<typeof registry.visibleFor>[0]) =>
       registry.visibleFor(value).map((tool) => tool.name);
@@ -123,6 +132,9 @@ describe("Native Proxy Tool Registry", () => {
       skillEnabled: false,
       skillCapability: false,
       allowSkillWrite: false,
+      knowledgeEnabled: false,
+      knowledgeCapability: false,
+      knowledgeCatalogAvailable: false,
     })).toEqual([]);
     expect(names({
       memoryEnabled: true,
@@ -130,6 +142,9 @@ describe("Native Proxy Tool Registry", () => {
       skillEnabled: false,
       skillCapability: false,
       allowSkillWrite: false,
+      knowledgeEnabled: false,
+      knowledgeCapability: false,
+      knowledgeCatalogAvailable: false,
     })).toEqual(registry.list().slice(0, 6).map((tool) => tool.name));
     expect(names({
       memoryEnabled: false,
@@ -137,6 +152,9 @@ describe("Native Proxy Tool Registry", () => {
       skillEnabled: true,
       skillCapability: true,
       allowSkillWrite: false,
+      knowledgeEnabled: false,
+      knowledgeCapability: false,
+      knowledgeCatalogAvailable: false,
     })).toEqual(["skill_search", "skill_view", "skill_files_read", "skill_extract"]);
     expect(names({
       memoryEnabled: false,
@@ -144,7 +162,20 @@ describe("Native Proxy Tool Registry", () => {
       skillEnabled: true,
       skillCapability: true,
       allowSkillWrite: true,
-    })).toEqual(registry.list().slice(6).map((tool) => tool.name));
+      knowledgeEnabled: false,
+      knowledgeCapability: false,
+      knowledgeCatalogAvailable: false,
+    })).toEqual(registry.list().slice(6, 16).map((tool) => tool.name));
+    expect(names({
+      memoryEnabled: false,
+      chatMemory: false,
+      skillEnabled: false,
+      skillCapability: false,
+      allowSkillWrite: false,
+      knowledgeEnabled: true,
+      knowledgeCapability: true,
+      knowledgeCatalogAvailable: true,
+    })).toEqual(["tdai_knowledge_tools_list", "tdai_knowledge_tool_call"]);
   });
 
   it("publishes strict object schemas for every registered tool", () => {
@@ -154,6 +185,36 @@ describe("Native Proxy Tool Registry", () => {
         additionalProperties: false,
         properties: expect.any(Object),
       });
+    }
+  });
+
+  it("describes when to use related Native tools without transport instructions", () => {
+    const registry = createDefaultNativeProxyToolRegistry();
+    const expectedGuidance: Record<string, readonly string[]> = {
+      tdai_memory_search: ["L1", "tdai_conversation_search"],
+      tdai_atomic_query: ["不进行语义检索", "tdai_memory_search"],
+      tdai_conversation_search: ["L0", "tdai_memory_search"],
+      tdai_conversation_query: ["session_id", "tdai_conversation_search"],
+      tdai_scenario_ls: ["不读取完整正文", "tdai_read_scene"],
+      tdai_read_scene: ["tdai_scenario_ls", "全文"],
+      skill_search: ["skill_id", "skill_view"],
+      skill_view: ["SKILL.md", "skill_files_read"],
+      skill_files_read: ["skill_view", "路径"],
+      skill_extract: ["异步", "完整", "复用"],
+      skill_create: ["skill_update", "skill_patch"],
+      skill_update: ["整体", "skill_patch"],
+      skill_patch: ["局部", "skill_update"],
+      skill_delete: ["软删除"],
+      skill_files_write: ["资源文件", "skill_update"],
+      skill_files_remove: ["资源文件", "skill_update"],
+      tdai_knowledge_tools_list: ["Knowledge", "knowledge_id", "工具清单"],
+      tdai_knowledge_tool_call: ["tools_list", "tool_name", "params"],
+    };
+
+    for (const [name, phrases] of Object.entries(expectedGuidance)) {
+      const description = registry.require(name).description;
+      for (const phrase of phrases) expect(description).toContain(phrase);
+      expect(description).not.toMatch(/bash|curl|https?|authorization|鉴权|请求头/i);
     }
   });
 
@@ -173,6 +234,8 @@ describe("Native Proxy Tool Registry", () => {
     ["skill_delete", { skill_id: "skl-1" }],
     ["skill_files_write", { skill_id: "skl-1", files: [{ path: "a.txt", content: "a", encoding: "utf-8" }] }],
     ["skill_files_remove", { skill_id: "skl-1", paths: ["a.txt"] }],
+    ["tdai_knowledge_tools_list", { knowledge_id: "wiki-1" }],
+    ["tdai_knowledge_tool_call", { knowledge_id: "wiki-1", tool_name: "search", params: { query: "routing" } }],
   ])("validates and normalizes %s arguments", (name, input) => {
     expect(createDefaultNativeProxyToolRegistry().require(name).validate(input))
       .toMatchObject({ ok: true });
@@ -194,6 +257,9 @@ describe("Native Proxy Tool Registry", () => {
     ["skill_delete", { skill_id: "" }],
     ["skill_files_write", { skill_id: "skl-1", files: [] }],
     ["skill_files_remove", { skill_id: "skl-1", paths: [] }],
+    ["tdai_knowledge_tools_list", { knowledge_id: "" }],
+    ["tdai_knowledge_tool_call", { knowledge_id: "wiki-1", tool_name: "", params: {} }],
+    ["tdai_knowledge_tool_call", { knowledge_id: "wiki-1", tool_name: "search", params: [] }],
   ])("rejects invalid %s arguments", (name, input) => {
     expect(createDefaultNativeProxyToolRegistry().require(name).validate(input))
       .toMatchObject({ ok: false });
@@ -303,6 +369,23 @@ describe("Native Proxy Tool injection", () => {
     expect(readonlyInjector.execute(initializedAnthropicContext()).map((block) => block.metadata?.tool_name))
       .toEqual(["skill_search", "skill_view", "skill_files_read", "skill_extract"]);
     expect(writableInjector.execute(initializedAnthropicContext())).toHaveLength(10);
+  });
+
+  it("exposes Knowledge tools only when an authorized catalog was injected", () => {
+    const injector = new NativeProxyToolsInjector({
+      enabled: true,
+      memoryEnabled: false,
+      skillEnabled: false,
+      knowledgeEnabled: true,
+      registry: createDefaultNativeProxyToolRegistry(),
+    });
+    const withoutCatalog = initializedAnthropicContext();
+    const withCatalog = initializedAnthropicContext();
+    withCatalog.messages[0].blocks[0].content += "\n<knowledge_catalog>one</knowledge_catalog>";
+
+    expect(injector.execute(withoutCatalog)).toEqual([]);
+    expect(injector.execute(withCatalog).map((block) => block.metadata?.tool_name))
+      .toEqual(["tdai_knowledge_tools_list", "tdai_knowledge_tool_call"]);
   });
 
   it("reserves a hidden Skill write name when writes are disabled", () => {
@@ -461,6 +544,47 @@ describe("Native Proxy Tool injection", () => {
       expect.objectContaining({ name: "skill_search" }),
       expect.objectContaining({ name: "skill_extract" }),
     ]));
+  });
+
+  it("injects a concise Knowledge catalog and two native schemas without legacy injection", async () => {
+    const config = structuredClone(DEFAULT_CONFIG);
+    config.injection.enabled = false;
+    config.injection.injectors = [];
+    config.nativeProxyTools.enabled = true;
+    config.knowledge.enabled = true;
+    config.knowledge.serviceToken = "server-secret";
+    setCoreKnowledgeClient({
+      listAgentKnowledgeIds: vi.fn(async () => ["wiki-1"]),
+      listKnowledgeByIds: vi.fn(async () => [{
+        knowledge_id: "wiki-1",
+        type: "wiki",
+        service_url: "https://private.example/v3",
+        name: "Architecture",
+        summary: "Design decisions",
+        team_id: "team-1",
+        user_id: null,
+        created_at: "2026-01-01T00:00:00Z",
+        updated_at: "2026-01-01T00:00:00Z",
+      }]),
+    } as never);
+    const custom = structuredClone(metadata.custom!);
+    custom.userKey = "user-key-1";
+
+    const output = await getInjectionPipeline(config).process({
+      model: "claude-test",
+      stream: true,
+      system: "system",
+      messages: [{ role: "user", content: "explain the design" }],
+    }, { ...metadata, custom });
+    const serialized = JSON.stringify(output);
+
+    expect(output.tools).toEqual(expect.arrayContaining([
+      expect.objectContaining({ name: "tdai_knowledge_tools_list" }),
+      expect.objectContaining({ name: "tdai_knowledge_tool_call" }),
+    ]));
+    expect(serialized).toContain("<knowledge_catalog>");
+    expect(serialized).toContain('id=\\"wiki-1\\"');
+    expect(serialized).not.toMatch(/private\.example|curl|authorization|x-tdai/i);
   });
 
   it("never emits Fake Tool tags or curl recipes beside the Native tool", async () => {

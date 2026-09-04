@@ -571,8 +571,10 @@ export async function handleCodexEndpoint(
         !initResult.bypassed &&
         initResult.justRegistered &&
         initResult.sessionInfo &&
-        config.injection?.enabled &&
-        (config.injection.injectors?.length ?? 0) > 0
+        ((config.injection?.enabled && (config.injection.injectors?.length ?? 0) > 0)
+          || (config.nativeProxyTools.enabled
+            && config.knowledge.enabled
+            && config.knowledge.serviceToken.length > 0))
       ) {
         try {
           const mod = await import("./injection/index.js");
@@ -743,8 +745,9 @@ export async function handleCodexEndpoint(
   //
   // This reuses 100% of the existing pipeline infrastructure (hook cache,
   // prewarm, all injectors) without writing a third protocol adapter.
-  if (!injectionSkipped && sessionInfo && config.injection?.enabled && (
-    (config.injection.injectors?.length ?? 0) > 0 || config.nativeProxyTools.enabled
+  if (!injectionSkipped && sessionInfo && (
+    (config.injection?.enabled && (config.injection.injectors?.length ?? 0) > 0)
+    || config.nativeProxyTools.enabled
   )) {
     try {
       const { getInjectionPipeline } = await import("./injection/index.js");

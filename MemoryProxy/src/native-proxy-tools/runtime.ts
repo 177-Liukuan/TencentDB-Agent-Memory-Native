@@ -90,6 +90,7 @@ function runtimeKey(config: ProxyConfig): string {
     nativeProxyTools: config.nativeProxyTools,
     clickhouse: config.clickhouse,
     coreSkill: config.coreSkill,
+    knowledge: config.knowledge,
     tdai: config.tdai,
   };
   return createHash("sha256")

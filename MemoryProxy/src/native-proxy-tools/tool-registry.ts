@@ -1,6 +1,6 @@
 import type { JsonValue, NativeToolBackend, NativeToolEffect } from "./types.js";
 
-export type NativeToolExposure = "memory" | "skill-read" | "skill-write";
+export type NativeToolExposure = "memory" | "skill-read" | "skill-write" | "knowledge";
 
 export interface NativeToolExposureContext {
   memoryEnabled: boolean;
@@ -8,6 +8,9 @@ export interface NativeToolExposureContext {
   skillEnabled: boolean;
   skillCapability: boolean;
   allowSkillWrite: boolean;
+  knowledgeEnabled?: boolean;
+  knowledgeCapability?: boolean;
+  knowledgeCatalogAvailable?: boolean;
 }
 
 export type NativeToolValidationResult =
@@ -136,6 +139,17 @@ function success(entries: Array<[string, JsonValue | undefined]>): NativeToolVal
   };
 }
 
+function isJsonValue(value: unknown): value is JsonValue {
+  if (value === null || typeof value === "string" || typeof value === "boolean") return true;
+  if (typeof value === "number") return Number.isFinite(value);
+  if (Array.isArray(value)) return value.every(isJsonValue);
+  return isPlainRecord(value) && Object.values(value).every(isJsonValue);
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
 function queryValidator(input: unknown): NativeToolValidationResult {
   return validate(input, ["query", "limit"], (record) => {
     const query = stringValue(record, "query", { required: true });
@@ -217,16 +231,18 @@ const resourceSchema = objectSchema({
   is_executable: { type: "boolean" },
 }, ["path", "content"]);
 
+// 顶层 description 只说明工具用途、选择条件和前后调用关系。
+// 参数约束由 inputSchema 表达，传输与鉴权由 Proxy 处理，避免把 Baseline 的 curl 说明带入模型上下文。
 const TOOLS: readonly NativeProxyToolDefinition[] = Object.freeze([
   definition({
     name: "tdai_memory_search",
-    description: "搜索已提炼的长期记忆，用于偏好、身份、规则和历史结论；查原始消息应使用 tdai_conversation_search。",
+    description: "语义搜索 L1 已提炼的长期记忆，适合查询用户偏好、身份、规则和历史结论；需要具体消息原文、引用或时间线时使用 tdai_conversation_search。",
     inputSchema: objectSchema({ query: stringProperty("检索问题或关键词"), limit: integerProperty(1, 20, 5) }, ["query"]),
     backend: "memory", effect: "read", route: "atomic/search", exposure: "memory", validate: queryValidator,
   }),
   definition({
     name: "tdai_atomic_query",
-    description: "按已知类型、时间范围和分页条件读取 L1 原子记忆，不执行语义搜索。",
+    description: "按已知类型、时间范围和分页条件读取 L1 原子记忆，不进行语义检索；按含义查找时使用 tdai_memory_search。",
     inputSchema: objectSchema({
       type: { type: "string", enum: ["episodic", "persona", "instruction"] },
       limit: integerProperty(1, 100, 20), offset: integerProperty(0, 100_000, 0),
@@ -246,7 +262,7 @@ const TOOLS: readonly NativeProxyToolDefinition[] = Object.freeze([
   }),
   definition({
     name: "tdai_conversation_search",
-    description: "在 L0 原始对话中检索具体消息原文、上下文和时间线；稳定偏好或结论优先使用 tdai_memory_search。",
+    description: "语义搜索 L0 原始对话，适合查找具体消息原文、引用和时间线；稳定偏好、规则或结论优先使用 tdai_memory_search。",
     inputSchema: objectSchema({ query: stringProperty("检索问题或关键词"), limit: integerProperty(1, 20, 5), session_id: stringProperty("可选的历史会话标识") }, ["query"]),
     backend: "memory", effect: "read", route: "conversation/search", exposure: "memory",
     validate: (input) => validate(input, ["query", "limit", "session_id"], (record) => {
@@ -258,7 +274,7 @@ const TOOLS: readonly NativeProxyToolDefinition[] = Object.freeze([
   }),
   definition({
     name: "tdai_conversation_query",
-    description: "按已知 Session 顺序读取 L0 历史消息；跨会话语义查找应使用 tdai_conversation_search。",
+    description: "按已知 session_id 顺序读取 L0 历史消息，不进行语义检索；不知道会话标识或需要按含义查找时使用 tdai_conversation_search。",
     inputSchema: objectSchema({ session_id: stringProperty("需要读取的会话标识"), limit: integerProperty(1, 200, 50), offset: integerProperty(0, 100_000, 0) }, ["session_id"]),
     backend: "memory", effect: "read", route: "conversation/query", exposure: "memory",
     validate: (input) => validate(input, ["session_id", "limit", "offset"], (record) => {
@@ -270,7 +286,7 @@ const TOOLS: readonly NativeProxyToolDefinition[] = Object.freeze([
   }),
   definition({
     name: "tdai_scenario_ls",
-    description: "列出 L2 场景路径和摘要索引，不读取完整正文。",
+    description: "列出 L2 场景路径和摘要索引，不读取完整正文；确定目标路径后使用 tdai_read_scene 读取正文。",
     inputSchema: objectSchema({ path_prefix: { type: "string", maxLength: 1_024 } }),
     backend: "memory", effect: "read", route: "scenario/ls", exposure: "memory",
     validate: (input) => validate(input, ["path_prefix"], (record) => {
@@ -280,7 +296,7 @@ const TOOLS: readonly NativeProxyToolDefinition[] = Object.freeze([
   }),
   definition({
     name: "tdai_read_scene",
-    description: "读取一个已从场景索引或 tdai_scenario_ls 得到的 L2 场景路径全文。",
+    description: "读取从已注入的场景索引或 tdai_scenario_ls 结果中取得的 L2 场景路径全文；不要凭空构造 path。",
     inputSchema: objectSchema({ path: stringProperty("场景路径", 1_024) }, ["path"]),
     backend: "memory", effect: "read", route: "scenario/read", exposure: "memory",
     validate: (input) => validate(input, ["path"], (record) => {
@@ -290,7 +306,7 @@ const TOOLS: readonly NativeProxyToolDefinition[] = Object.freeze([
   }),
   definition({
     name: "skill_search",
-    description: "在当前用户有权访问的团队 Skill 中检索匹配项。",
+    description: "按关键词查找当前用户有权访问的团队云端 Skill，返回候选项及 skill_id；找到目标后使用 skill_view 读取正文。",
     inputSchema: objectSchema({ query: stringProperty("Skill 关键词") }, ["query"]),
     backend: "skill", effect: "read", route: "search", exposure: "skill-read",
     validate: (input) => validate(input, ["query"], (record) => {
@@ -300,7 +316,7 @@ const TOOLS: readonly NativeProxyToolDefinition[] = Object.freeze([
   }),
   definition({
     name: "skill_view",
-    description: "按稳定 skill_id 读取 SKILL.md 全文和资源目录。",
+    description: "按 skill_id 读取完整 SKILL.md 和资源目录；准备采用某个 Skill 前先读取其正文，需要资源文件时再使用 skill_files_read。",
     inputSchema: objectSchema({ skill_id: stringProperty("Skill 标识") }, ["skill_id"]),
     backend: "skill", effect: "read", route: "get", exposure: "skill-read",
     validate: (input) => validate(input, ["skill_id"], (record) => {
@@ -310,7 +326,7 @@ const TOOLS: readonly NativeProxyToolDefinition[] = Object.freeze([
   }),
   definition({
     name: "skill_files_read",
-    description: "读取 skill_view 资源目录中已知路径的单个文件，内容受结果大小限制。",
+    description: "读取 skill_view 资源目录中的单个文件；skill_id 和路径必须来自已经查看的 Skill，内容受结果大小限制。",
     inputSchema: objectSchema({ skill_id: stringProperty("Skill 标识"), path: stringProperty("资源相对路径", 1_024), encoding: { type: "string", enum: ["utf-8", "base64"], default: "utf-8" } }, ["skill_id", "path"]),
     backend: "skill", effect: "read", route: "files/read", exposure: "skill-read",
     validate: (input) => validate(input, ["skill_id", "path", "encoding"], (record) => {
@@ -322,7 +338,7 @@ const TOOLS: readonly NativeProxyToolDefinition[] = Object.freeze([
   }),
   definition({
     name: "skill_extract",
-    description: "归档当前会话并异步触发一次 Skill 抽取。仅在完整可复用流程已经形成时使用。",
+    description: "归档当前会话并异步触发一次 Skill 抽取；仅在已经形成完整且值得复用的流程时使用。",
     inputSchema: objectSchema({ reason: { type: "string", maxLength: 2_000 } }),
     backend: "skill", effect: "archive", route: "extract", exposure: "skill-read",
     validate: (input) => validate(input, ["reason"], (record) => {
@@ -332,7 +348,7 @@ const TOOLS: readonly NativeProxyToolDefinition[] = Object.freeze([
   }),
   definition({
     name: "skill_create",
-    description: "为当前 Agent 创建新的云端 Skill。",
+    description: "为当前 Agent 创建新的云端 Skill；修改已有 Skill 应使用 skill_update 或 skill_patch。",
     inputSchema: objectSchema({ name: stringProperty("Skill 名称", 64), content: stringProperty("完整 SKILL.md", 262_144), resources: { type: "array", maxItems: 64, items: resourceSchema } }, ["name", "content"]),
     backend: "skill", effect: "write", route: "create", exposure: "skill-write",
     validate: (input) => validate(input, ["name", "content", "resources"], (record) => {
@@ -344,7 +360,7 @@ const TOOLS: readonly NativeProxyToolDefinition[] = Object.freeze([
   }),
   definition({
     name: "skill_update",
-    description: "替换已有 Skill 的 SKILL.md；版本锁由 Proxy 自动补充。",
+    description: "用完整内容替换已有 Skill 的 SKILL.md，适合整体改写；小范围修改优先使用 skill_patch，版本锁由 Proxy 自动补充。",
     inputSchema: objectSchema({ skill_id: stringProperty("Skill 标识"), content: stringProperty("新的完整 SKILL.md", 262_144) }, ["skill_id", "content"]),
     backend: "skill", effect: "write", route: "update", exposure: "skill-write",
     validate: (input) => validate(input, ["skill_id", "content"], (record) => {
@@ -355,7 +371,7 @@ const TOOLS: readonly NativeProxyToolDefinition[] = Object.freeze([
   }),
   definition({
     name: "skill_patch",
-    description: "对已有 Skill 的 SKILL.md 做受版本锁保护的字符串替换。",
+    description: "通过字符串替换局部修改已有 Skill 的 SKILL.md；整体改写应使用 skill_update，版本锁由 Proxy 自动补充。",
     inputSchema: objectSchema({ skill_id: stringProperty("Skill 标识"), old_string: stringProperty("待替换文本", 262_144), new_string: { type: "string", maxLength: 262_144 }, replace_all: { type: "boolean", default: false } }, ["skill_id", "old_string", "new_string"]),
     backend: "skill", effect: "write", route: "patch", exposure: "skill-write",
     validate: (input) => validate(input, ["skill_id", "old_string", "new_string", "replace_all"], (record) => {
@@ -374,7 +390,7 @@ const TOOLS: readonly NativeProxyToolDefinition[] = Object.freeze([
   }),
   definition({
     name: "skill_files_write",
-    description: "新增或修改 Skill 资源文件；版本锁由 Proxy 自动补充。",
+    description: "新增或修改 Skill 资源文件；修改 SKILL.md 正文应使用 skill_update 或 skill_patch，版本锁由 Proxy 自动补充。",
     inputSchema: objectSchema({ skill_id: stringProperty("Skill 标识"), files: { type: "array", minItems: 1, maxItems: 64, items: resourceSchema } }, ["skill_id", "files"]),
     backend: "skill", effect: "write", route: "files/write", exposure: "skill-write",
     validate: (input) => validate(input, ["skill_id", "files"], (record) => {
@@ -385,13 +401,62 @@ const TOOLS: readonly NativeProxyToolDefinition[] = Object.freeze([
   }),
   definition({
     name: "skill_files_remove",
-    description: "删除 Skill 中的资源文件；版本锁由 Proxy 自动补充。",
+    description: "删除 Skill 资源文件；修改 SKILL.md 正文应使用 skill_update 或 skill_patch，版本锁由 Proxy 自动补充。",
     inputSchema: objectSchema({ skill_id: stringProperty("Skill 标识"), paths: { type: "array", minItems: 1, maxItems: 64, items: stringProperty("资源相对路径", 1_024) } }, ["skill_id", "paths"]),
     backend: "skill", effect: "write", route: "files/remove", exposure: "skill-write",
     validate: (input) => validate(input, ["skill_id", "paths"], (record) => {
       const id = stringValue(record, "skill_id", { required: true }); if (!id.ok) return id;
       const paths = pathArray(record); if (!paths.ok) return paths;
       return success([["skill_id", id.value], ["paths", paths.value]]);
+    }),
+  }),
+  definition({
+    name: "tdai_knowledge_tools_list",
+    description: "获取指定已授权 Knowledge 资源当前提供的工具清单、用途和参数说明；首次使用目录中的 knowledge_id 时先调用本工具。",
+    inputSchema: objectSchema({
+      knowledge_id: stringProperty("Knowledge 资源目录中的资源标识", 256),
+    }, ["knowledge_id"]),
+    backend: "knowledge",
+    effect: "read",
+    route: "tools/list",
+    exposure: "knowledge",
+    validate: (input) => validate(input, ["knowledge_id"], (record) => {
+      const id = stringValue(record, "knowledge_id", { required: true, max: 256 });
+      return id.ok ? success([["knowledge_id", id.value]]) : id;
+    }),
+  }),
+  definition({
+    name: "tdai_knowledge_tool_call",
+    description: "执行 tdai_knowledge_tools_list 返回的 Knowledge 查询工具；tool_name 和 params 必须严格采用该资源最新工具清单中的定义。",
+    inputSchema: objectSchema({
+      knowledge_id: stringProperty("Knowledge 资源目录中的资源标识", 256),
+      tool_name: stringProperty("工具清单返回的工具名称", 128),
+      params: {
+        type: "object",
+        description: "按工具清单中的参数说明填写；无参数工具传空对象",
+        additionalProperties: true,
+      },
+    }, ["knowledge_id", "tool_name", "params"]),
+    backend: "knowledge",
+    effect: "read",
+    route: "tools/call",
+    exposure: "knowledge",
+    validate: (input) => validate(input, ["knowledge_id", "tool_name", "params"], (record) => {
+      const id = stringValue(record, "knowledge_id", { required: true, max: 256 });
+      if (!id.ok) return id;
+      const toolName = stringValue(record, "tool_name", { required: true, max: 128 });
+      if (!toolName.ok) return toolName;
+      if (!isPlainRecord(record.params) || !isJsonValue(record.params)) {
+        return { ok: false, message: "params must be a JSON object" };
+      }
+      if (Object.keys(record.params).length > 64 || Buffer.byteLength(JSON.stringify(record.params), "utf8") > 65_536) {
+        return { ok: false, message: "params exceed the allowed size" };
+      }
+      return success([
+        ["knowledge_id", id.value],
+        ["tool_name", toolName.value],
+        ["params", record.params],
+      ]);
     }),
   }),
 ]);
@@ -404,6 +469,11 @@ class DefaultNativeProxyToolRegistry implements NativeProxyToolRegistry {
   visibleFor(context: NativeToolExposureContext): readonly NativeProxyToolDefinition[] {
     return TOOLS.filter((tool) => {
       if (tool.exposure === "memory") return context.memoryEnabled && context.chatMemory;
+      if (tool.exposure === "knowledge") {
+        return context.knowledgeEnabled === true
+          && context.knowledgeCapability === true
+          && context.knowledgeCatalogAvailable === true;
+      }
       if (!context.skillEnabled || !context.skillCapability) return false;
       return tool.exposure === "skill-read" || context.allowSkillWrite;
     });

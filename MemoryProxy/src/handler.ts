@@ -961,8 +961,10 @@ export async function handleChatCompletions(
         !initResult.bypassed &&
         initResult.justRegistered &&
         initResult.sessionInfo &&
-        config.injection?.enabled &&
-        (config.injection.injectors?.length ?? 0) > 0
+        ((config.injection?.enabled && (config.injection.injectors?.length ?? 0) > 0)
+          || (config.nativeProxyTools.enabled
+            && config.knowledge.enabled
+            && config.knowledge.serviceToken.length > 0))
       ) {
         try {
           const mod = await import("./injection/index.js");

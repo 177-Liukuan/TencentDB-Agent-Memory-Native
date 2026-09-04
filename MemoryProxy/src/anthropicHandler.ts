@@ -1247,8 +1247,10 @@ export async function handleAnthropicMessages(
         !initResult.bypassed &&
         initResult.justRegistered &&
         initResult.sessionInfo &&
-        config.injection?.enabled &&
-        (config.injection.injectors?.length ?? 0) > 0
+        ((config.injection?.enabled && (config.injection.injectors?.length ?? 0) > 0)
+          || (config.nativeProxyTools.enabled
+            && config.knowledge.enabled
+            && config.knowledge.serviceToken.length > 0))
       ) {
         try {
           const mod = await import("./injection/index.js");
@@ -1818,9 +1820,7 @@ export async function handleAnthropicMessages(
     && config.injection.injectors.length > 0;
   const nativeToolInjectionEnabled = config.nativeProxyTools.enabled
     && isStream
-    && requestKind === "main"
-    && config.tdai.enabled
-    && config.tdai.memory.enabled;
+    && requestKind === "main";
   if (!injectedSkipped && !skipInjection && (legacyInjectionEnabled || nativeToolInjectionEnabled)) {
     try {
       console.log(`[injection-debug] entering injection pipeline session=${sessionKey} turnSeq=${countHumanTurns(messages, "anthropic")} injectors=${config.injection.injectors} kind=${requestKind}`);

@@ -4,6 +4,7 @@ import type {
   InjectionHook,
 } from "../injection/types.js";
 import { CriticalInjectionHookError } from "../injection/pipeline.js";
+import { KNOWLEDGE_CATALOG_OPEN_TAG } from "../injection/injectors/knowledge-catalog-injector.js";
 import type { NativeProxyToolRegistry } from "./tool-registry.js";
 
 export class NativeProxyToolNameCollisionError extends Error {
@@ -54,6 +55,7 @@ export interface NativeProxyToolsInjectorOptions {
   memoryEnabled?: boolean;
   skillEnabled?: boolean;
   allowSkillWrite?: boolean;
+  knowledgeEnabled?: boolean;
 }
 
 export class NativeProxyToolsInjector implements InjectionHook {
@@ -79,12 +81,24 @@ export class NativeProxyToolsInjector implements InjectionHook {
 
     const custom = ctx.metadata.custom as Record<string, unknown> | undefined;
     const capabilities = custom?.assetCapabilities as Record<string, unknown> | undefined;
+    // Catalog hook 先落到 system，真工具只在至少有一个授权资源时出现。
+    // 缓存命中时 hook.execute 不会运行，因此这里直接检查已注入的目录标签。
+    const knowledgeCatalogAvailable = ctx.messages.some((message) => (
+      message.role === "system"
+      && message.blocks.some((block) => (
+        block.type === "text" && block.content.includes(KNOWLEDGE_CATALOG_OPEN_TAG)
+      ))
+    ));
     const visible = this.options.registry.visibleFor({
       memoryEnabled: this.options.memoryEnabled ?? true,
       chatMemory: capabilities?.chat_memory !== false,
       skillEnabled: this.options.skillEnabled ?? false,
       skillCapability: capabilities?.skill !== false,
       allowSkillWrite: this.options.allowSkillWrite ?? false,
+      knowledgeEnabled: this.options.knowledgeEnabled ?? false,
+      knowledgeCapability:
+        capabilities?.llm_wiki !== false || capabilities?.code_graph !== false,
+      knowledgeCatalogAvailable,
     });
 
     return visible.map((tool) => ({

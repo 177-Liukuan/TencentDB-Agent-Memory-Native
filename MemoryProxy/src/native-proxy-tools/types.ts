@@ -5,7 +5,7 @@ export type JsonValue =
   | JsonValue[]
   | { [key: string]: JsonValue };
 
-export type NativeToolBackend = "memory" | "skill";
+export type NativeToolBackend = "memory" | "skill" | "knowledge";
 
 export type NativeToolEffect = "read" | "write" | "archive";
 

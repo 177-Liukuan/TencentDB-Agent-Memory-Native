@@ -26,7 +26,7 @@ MemoryProxy 是一个**透明的 LLM 请求代理**：把编码 Agent（Claude C
 
 - **会话初始化**：首次对话时拦截请求，通过交互式表单引导用户选择 team → agent → task，完成后把 agent/task 上下文注入 system prompt。支持从请求头（`x-team-id` / `x-agent-id` / `x-task-id`）自动预选。
 - **上下文注入**：按需注入只读参考性质的 Skill 元数据与 Memory L2/L3 上下文，不伪造文本/curl 工具。
-- **Anthropic Native Proxy Tool**：仅对流式 Messages 请求注入唯一结构化只读工具 `tdai_memory_search`；在 `content_block_stop` 执行，通过 ClickHouse 持久化混合工具状态，并复用原目标 Internal Re-entry，Native 帧不会泄漏给客户端。
+- **Native Proxy Tool**：把 Memory、Skill 和 Knowledge 能力作为结构化工具交给模型。Knowledge 保留“先取动态工具清单、再执行查询”的两步语义；Proxy 负责鉴权、执行、结果汇合和模型续写，内部调用不会发送给客户端。
 - **对话回流（提取）**：每轮真人对话结束时，把对话切片同步发到 MemoryCore `/v3/skill/conversation/add`（Skill 归档）并写入 L0 短期记忆，供 core 侧后台抽取。
 - **鉴权与身份**：调用 MemoryCore `POST /v3/meta/auth/verify` 校验 `x-tdai-user-key`，解析出 `user_id` 作为全链路用户标识；`spaceId`（memory 实例 id）从 `/proxy/<spaceId>/...` 路径自动提取。
 - **系统用户短路透传**：内部服务账号（如 memory / wiki 内部调用）命中后跳过 session init 和注入，只做透明转发 + 计费。
@@ -67,8 +67,8 @@ MemoryProxy 对齐 MemoryCore 的四层记忆结构，按“注入 + 工具化�
 
 其它 prompt 上下文严格保持为参考信息：
 
-- `<available_skills>` —— 相关 Skill 的元数据摘要，不声称存在模型侧 Skill 调用/加载工具
-- 本 Native 阶段关闭 Knowledge 模型工具提示注入
+- `<available_skills>` —— 相关 Skill 的元数据摘要；具体内容可通过 Skill Native Tool 读取
+- `<knowledge_catalog>` —— 当前 Agent 已授权的 Wiki / Code Graph 目录；服务地址和调用协议不进入提示词
 - `<session_context>` —— session init 完成后每轮追加的 agent/task 信息
 
 `nativeProxyTools.enabled=false` 时不注入 Native 定义，也不会回退到 Fake Tool、shell 或 curl 文本。开启后，状态能力对 ClickHouse fail-closed，绝不替换成内存或 Redis；短期执行状态默认保留 1800 秒，已完成的隐藏工具历史默认保留 30 天，并在后续请求中按原位置恢复。
@@ -224,7 +224,7 @@ Anthropic Messages 客户端：
 | `sessionInit` | 会话初始化表单流程、header 自动预选策略 |
 | `tdai` | MemoryCore 连接与 L0/L1/L2/L3 开关 |
 | `skill` | MemoryCore 数据面配置（Skill RAG、Skill 归档、Meta） |
-| `knowledge` | 独立 knowledge gateway 配置；本阶段不做模型工具注入 |
+| `knowledge` | Knowledge 资源目录、授权查询和 Native Tool 数据面配置 |
 | `skillRuntime` | 独立 `/skill-bridge` API 的写权限策略 |
 | `rateLimit` | Memory 实例 × 实际模型的 Input TPM / QPM 限流 |
 | `clickhouse` | 按 turn 的用量上报（计费数据源） |

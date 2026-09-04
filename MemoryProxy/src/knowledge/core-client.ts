@@ -2,8 +2,9 @@
  * CoreKnowledgeClient — minimal HTTP client for the kernel knowledge entity API.
  *
  * Calls POST /v3/knowledge/list with {team_id} to fetch all knowledge
- * resources (wiki + code-graph) for a team. Retained for non-model host
- * integrations; this Native phase does not inject a knowledge tool prompt.
+ * resources (wiki + code-graph) for a team. The Native Knowledge catalog and
+ * executor use the per-Agent methods below; team-wide listing is retained only
+ * for non-model host integrations.
  *
  * Auth: reuses the same `serviceToken` + `x-tdai-service-id` as CoreSkillClient
  * (same kernel endpoint, 8420).

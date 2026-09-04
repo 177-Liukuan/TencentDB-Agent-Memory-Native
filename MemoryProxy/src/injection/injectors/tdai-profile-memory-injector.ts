@@ -10,8 +10,7 @@ import { resolveFixedAssetCtxs, type FixedAssetCtx } from "./tdai-fixed-asset.js
 /**
  * L2/L3 注入（按 openclaw / hermes 官方做法重构）：
  *   - L3 (persona) → 注入完整内容（稳定且通常较短，作为长期画像）
- *   - L2 (scenarios) → 只注入路径与已有 summary，作为只读参考索引；本阶段
- *     不声明不存在的场景读取工具。
+ *   - L2 (scenarios) → 只注入路径与已有 summary，正文由 tdai_read_scene 按需读取。
  *
  * 这样可以：
  *   1. 大幅降低首轮 token 消耗（L2 全文经常上千 chars × N 个）
@@ -85,7 +84,9 @@ export class TdaiProfileMemoryInjector implements InjectionHook {
 
     const lines: string[] = [
       "<tdai_profile_memory>",
-      "以下是 TDAI 为当前 agent 维护的长期工作记忆（自有 + 借入分段；L2 路径与摘要仅作参考）：",
+      "以下是 TDAI 长期记忆，它与 Claude Code 本地 MEMORY.md 是不同的数据源，但具有同等优先级。",
+      "L3 内容可直接参考；L2 只列路径和摘要，需要正文时使用 `tdai_read_scene` 读取所列路径。",
+      "涉及用户身份、偏好、过往经历或项目约定时，不要只依赖本地记忆，可以调用 TDAI 相关工具查询云端记忆；当前上下文没有可靠答案时，应使用 TDAI Memory 工具查询。",
     ];
 
     let l2TotalCount = 0;
@@ -104,8 +105,7 @@ export class TdaiProfileMemoryInjector implements InjectionHook {
         lines.push("<l2_scene_index>");
         for (const e of g.l2Entries) {
           l2TotalCount++;
-          // Reference-only index: do not imply that an unavailable model-facing
-          // scene reader exists.
+          // L2 这里只提供路径和摘要，正文由模型按需通过 tdai_read_scene 读取。
           if (e.summary) {
             lines.push(`- \`${e.path}\` — ${truncate(e.summary, 200)}`);
           } else {

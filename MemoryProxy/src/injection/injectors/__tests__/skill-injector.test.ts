@@ -13,7 +13,8 @@ describe("Skill capability prompt", () => {
     expect(output).toContain("skill_search");
     expect(output).toContain("skill_view");
     expect(output).toContain("skill_files_read");
-    expect(output).toContain("云端 Skill 不在本地文件系统中");
+    expect(output).toContain("云端 Skill 内容通过上述 Skill 工具读取，不在本地文件系统中。");
+    expect(output).not.toContain("不要使用本地 `Read` 或 `Bash` 访问");
     expect(output).not.toMatch(/does not expose|没有提供给模型/i);
     expect(output).not.toMatch(/curl/i);
   });

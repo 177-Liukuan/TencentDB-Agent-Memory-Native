@@ -19,6 +19,7 @@ import {
 import { createApp } from "../server.js";
 import { createClaudeTurnMarker } from "../native-proxy-tools/turn-marker.js";
 import { __resetSessionStoreForTests, getSessionStore } from "../session/store.js";
+import { setCoreKnowledgeClient } from "../knowledge/core-client.js";
 
 const encoder = new TextEncoder();
 
@@ -63,6 +64,26 @@ function nativeCallFixture(): string {
       type: "content_block_delta",
       index: 0,
       delta: { type: "input_json_delta", partial_json: "{\"query\":\"project rules\"}" },
+    })
+    + frame("content_block_stop", { type: "content_block_stop", index: 0 })
+    + messageStop("tool_use");
+}
+
+function knowledgeCallFixture(
+  id: string,
+  name: "tdai_knowledge_tools_list" | "tdai_knowledge_tool_call",
+  input: Record<string, unknown>,
+): string {
+  return messageStart(`msg-${id}`)
+    + frame("content_block_start", {
+      type: "content_block_start",
+      index: 0,
+      content_block: { type: "tool_use", id, name, input: {} },
+    })
+    + frame("content_block_delta", {
+      type: "content_block_delta",
+      index: 0,
+      delta: { type: "input_json_delta", partial_json: JSON.stringify(input) },
     })
     + frame("content_block_stop", { type: "content_block_stop", index: 0 })
     + messageStop("tool_use");
@@ -224,6 +245,7 @@ beforeEach(() => {
 
 afterEach(async () => {
   vi.unstubAllGlobals();
+  setCoreKnowledgeClient(null);
   await shutdownNativeProxyToolRuntime();
   __resetInjectionPipelineForTests();
   __resetSessionStoreForTests();
@@ -231,6 +253,131 @@ afterEach(async () => {
 });
 
 describe("Anthropic Native Proxy Tool handler", () => {
+  it("executes the two-step Knowledge Native Tool flow and hides both internal rounds", async () => {
+    const proxyConfig = config();
+    // 验证 Knowledge 可以独立开启，不依赖 Memory 工具开关碰巧把注入链路带起来。
+    proxyConfig.tdai.memory.enabled = false;
+    proxyConfig.knowledge.enabled = true;
+    proxyConfig.knowledge.serviceToken = "knowledge-secret";
+    const knowledgeResource = {
+      knowledge_id: "wiki-1",
+      type: "wiki" as const,
+      service_url: "https://knowledge.example/v3",
+      name: "Architecture",
+      summary: "Design decisions",
+      team_id: "team-1",
+      user_id: null,
+      created_at: "2026-01-01T00:00:00Z",
+      updated_at: "2026-01-01T00:00:00Z",
+    };
+    setCoreKnowledgeClient({
+      listAgentKnowledgeIds: vi.fn(async () => ["wiki-1"]),
+      listKnowledgeByIds: vi.fn(async () => [knowledgeResource]),
+    } as never);
+    const runtime = createNativeProxyToolRuntime(proxyConfig, {
+      createStorage: () => new InMemoryToolExecutionStorageAdapter(),
+      createLedgerStorage: () => new InMemoryNativeToolLedgerStorageAdapter(),
+    });
+    await runtime.ready();
+    __setNativeProxyToolRuntimeForTests(runtime);
+    await getSessionStore().set("claude-code:session-1", {
+      status: "initialized",
+      keyId: "claude-code:session-1",
+      startedAt: Date.now(),
+      attemptCount: 0,
+      userId: "user-1",
+      sessionInfo: {
+        session_id: "session-1",
+        team_id: "team-1",
+        agent_id: "agent-1",
+        user_id: "user-1",
+        user_key: "client-key",
+        space_id: "space-1",
+      },
+    });
+
+    const upstreamBodies: Record<string, unknown>[] = [];
+    const providerBodies: Record<string, unknown>[] = [];
+    const modelResponses = [
+      knowledgeCallFixture("knowledge-list-1", "tdai_knowledge_tools_list", { knowledge_id: "wiki-1" }),
+      knowledgeCallFixture("knowledge-call-1", "tdai_knowledge_tool_call", {
+        knowledge_id: "wiki-1",
+        tool_name: "search",
+        params: { query: "routing" },
+      }),
+      finalTextFixture("Knowledge says routing is centralized"),
+    ];
+    vi.stubGlobal("fetch", vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      const href = String(url);
+      if (href === "https://tdai.example/v3/meta/config/user/get") {
+        return new Response(JSON.stringify({ code: 0, data: { items: [] } }), { status: 200 });
+      }
+      if (href === "https://upstream.example/v1/messages") {
+        upstreamBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+        return singleConsumerSse(modelResponses[upstreamBodies.length - 1]).response;
+      }
+      if (href === "https://knowledge.example/v3/tools/list") {
+        providerBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+        return new Response(JSON.stringify({
+          code: 0,
+          data: {
+            knowledge_id: "wiki-1",
+            tools: [{
+              name: "search",
+              description: "search wiki",
+              params: { query: { type: "string", required: true } },
+            }],
+          },
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      if (href === "https://knowledge.example/v3/tools/call") {
+        providerBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+        expect(new Headers(init?.headers).get("authorization")).toBe("Bearer knowledge-secret");
+        expect(new Headers(init?.headers).get("x-tdai-service-id")).toBe("space-1");
+        return new Response(JSON.stringify({
+          code: 0,
+          data: { results: [{ title: "Routing", text: "Routing is centralized" }] },
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      return new Response("not found", { status: 404 });
+    }));
+
+    const response = await createApp(proxyConfig).request("/claude-code/space-1/v1/messages", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-api-key": "client-key",
+        "x-user-id": "user-1",
+        "x-conversation-id": "session-1",
+      },
+      body: JSON.stringify({
+        model: "claude-test",
+        max_tokens: 1_024,
+        stream: true,
+        system: "You are Claude Code",
+        messages: [{ role: "user", content: "Why is routing designed this way?" }],
+      }),
+    });
+    const visible = await response.text();
+
+    expect(response.status).toBe(200);
+    expect(visible).toContain("Knowledge says routing is centralized");
+    expect(visible).not.toMatch(/tdai_knowledge|knowledge-list-1|knowledge-call-1/);
+    expect(upstreamBodies).toHaveLength(3);
+    expect(upstreamBodies[0].tools).toEqual(expect.arrayContaining([
+      expect.objectContaining({ name: "tdai_knowledge_tools_list" }),
+      expect.objectContaining({ name: "tdai_knowledge_tool_call" }),
+    ]));
+    expect(JSON.stringify(upstreamBodies[1].messages)).toContain("knowledge-list-1");
+    expect(JSON.stringify(upstreamBodies[2].messages)).toContain("knowledge-call-1");
+    expect(JSON.stringify(upstreamBodies[2].messages)).toContain("Routing is centralized");
+    expect(providerBodies).toEqual([
+      { knowledge_id: "wiki-1" },
+      { knowledge_id: "wiki-1" },
+      { knowledge_id: "wiki-1", tool_name: "search", params: { query: "routing" } },
+    ]);
+  });
+
   it("forwards Claude Code internal WebSearch without requiring a turn marker", async () => {
     const proxyConfig = config();
     proxyConfig.ccRequestRouting.enabled = false;

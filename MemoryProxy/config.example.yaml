@@ -590,19 +590,21 @@ skill:
   timeoutMs: 1500                     # 单次调用超时（毫秒）。RAG 在 session_init 热路径上，不宜太大
 
 
-# ── Knowledge gateway 配置（本 Native 阶段不做模型侧工具注入） ─────────────
-# 该配置保留给其它宿主能力；MemoryProxy 不再渲染 Knowledge Fake Tool 提示块。
+# ── Knowledge gateway 配置 ────────────────────────────────────────────────
+# Native Proxy Tool 开启后，本段同时开启精简资源目录和两个结构化工具：
+# tdai_knowledge_tools_list / tdai_knowledge_tool_call。服务地址、鉴权与 HTTP
+# 细节只在 Proxy 内部使用，不会以 Fake Tool 或 curl 指南进入模型提示词。
 #
 # 与 skill 段独立：endpoint 可以不同（例如 skill 走内核直连 IP，
 # knowledge 走 API Gateway 域名）。
 #
-# 关闭方式：enabled=false（默认），injector 不注册，无注入。
+# 关闭方式：enabled=false（默认），不注入目录或 Knowledge Tool Schema。
 knowledge:
-  enabled: false                        # 默认关闭，跟 tdai.enabled 行为一致
+  enabled: false                        # 需同时开启 nativeProxyTools.enabled
   endpoint: "http://127.0.0.1:8420"     # 内核 gateway 地址
   serviceToken: "local"               # Authorization: Bearer
   serviceId: "context-proxy"          # x-tdai-service-id（被请求路径 spaceId 覆盖）
-  timeoutMs: 1500                     # 单次调用超时（毫秒）
+  timeoutMs: 1500                     # 查询 Agent 授权资源目录的超时（毫秒）
 
 
 # ── Skill 运行时 ──────────────────────────────────────────────────────────

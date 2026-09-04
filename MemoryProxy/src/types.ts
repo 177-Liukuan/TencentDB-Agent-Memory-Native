@@ -315,7 +315,7 @@ export interface CoreSkillConfig {
  * Pick<endpoint | serviceToken | serviceId | timeoutMs>.
  */
 export interface KnowledgeConfig {
-  /** Master switch for non-model host integrations. */
+  /** Enable the authorized Knowledge catalog and two Knowledge Native Proxy Tools. */
   enabled: boolean;
   endpoint: string;
   serviceToken: string;

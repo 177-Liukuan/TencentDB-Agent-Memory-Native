@@ -55,7 +55,7 @@ const NATIVE_SKILL_LISTING_HEADER =
   + "以下是当前 Agent 关联的云端 Skill。\n"
   + "需要查找或读取 Skill 内容时，使用 `skill_search` 和 `skill_view`；"
   + "读取 Skill 资源文件时，使用 `skill_files_read`。\n"
-  + "云端 Skill 不在本地文件系统中，不要使用本地 `Read` 或 `Bash` 访问。";
+  + "云端 Skill 内容通过上述 Skill 工具读取，不在本地文件系统中。";
 
 const REFERENCE_ONLY_SKILL_LISTING_HEADER =
   "## Available Cloud Skills (reference only)\n"

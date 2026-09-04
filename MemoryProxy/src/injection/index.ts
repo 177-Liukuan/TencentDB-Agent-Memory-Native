@@ -77,6 +77,7 @@ export { SkillInjector } from "./injectors/skill-injector.js";
 export { TdaiL1RecallInjector } from "./injectors/tdai-l1-recall-injector.js";
 export { TdaiProfileMemoryInjector } from "./injectors/tdai-profile-memory-injector.js";
 export { AssetReflectionInjector, renderAssetReflectionBlock } from "./injectors/asset-reflection-injector.js";
+export { KnowledgeCatalogInjector, renderKnowledgeCatalog } from "./injectors/knowledge-catalog-injector.js";
 
 // CodeBuddy
 export { isCodeBuddyPrompt, parseCodeBuddySystemPrompt } from "./agents/codebuddy/parser.js";
@@ -108,6 +109,7 @@ import { ResponsesAdapter } from "./adapters/responses.js";
 import { SkillInjector } from "./injectors/skill-injector.js";
 import { TdaiProfileMemoryInjector } from "./injectors/tdai-profile-memory-injector.js";
 import { AssetReflectionInjector } from "./injectors/asset-reflection-injector.js";
+import { KnowledgeCatalogInjector } from "./injectors/knowledge-catalog-injector.js";
 import { NativeProxyToolsInjector } from "../native-proxy-tools/native-proxy-tools-injector.js";
 import { getNativeProxyToolRuntime } from "../native-proxy-tools/runtime.js";
 import type { ProtocolAdapter } from "./adapters/interface.js";
@@ -216,6 +218,15 @@ function buildPipelineBundle(config: ProxyConfig): PipelineBundle {
   // (`coreSkill`, `tdai`, ...); there is no shared external endpoint anymore.
   const injectors = config.injection?.injectors ?? [];
 
+  const nativeKnowledgeEnabled = config.nativeProxyTools.enabled
+    && config.knowledge.enabled
+    && config.knowledge.serviceToken.length > 0;
+
+  if (nativeKnowledgeEnabled) {
+    // 目录仍属于动态上下文：只列当前 Agent 已授权资源，不包含 URL 或调用协议。
+    registry.register(new KnowledgeCatalogInjector({ knowledge: config.knowledge }));
+  }
+
   if (config.nativeProxyTools.enabled) {
     registry.register(new NativeProxyToolsInjector({
       enabled: true,
@@ -226,6 +237,7 @@ function buildPipelineBundle(config: ProxyConfig): PipelineBundle {
       // is configured.
       skillEnabled: config.coreSkill.serviceToken.length > 0,
       allowSkillWrite: config.skillRuntime?.allowLlmWrite ?? false,
+      knowledgeEnabled: nativeKnowledgeEnabled,
     }));
   }
 
@@ -243,10 +255,6 @@ function buildPipelineBundle(config: ProxyConfig): PipelineBundle {
       }),
     );
   }
-
-  // The Phase 2/3 Native project deliberately has no model-facing Knowledge
-  // tool family. Keep the config for other host integrations, but do not emit
-  // a half-functional prompt block or curl recipe here.
 
   if (injectors.includes("tdai-memory") && config.tdai.enabled && config.tdai.memory.enabled && config.tdai.memory.inject) {
     // Base TdaiClient config. `TdaiProfileMemoryInjector` rebuilds a per-request

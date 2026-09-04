@@ -64,6 +64,39 @@ function dispatcherWithBridge(
 }
 
 describe("NativeProxyToolDispatcher", () => {
+  it("dispatches Knowledge tools through the Knowledge executor", async () => {
+    const knowledge = vi.fn(async () => bridgeResult({
+      code: 0,
+      data: { results: [{ title: "Architecture" }] },
+    }));
+    const dispatcher = new NativeProxyToolDispatcher({
+      config: config(),
+      registry: createDefaultNativeProxyToolRegistry(),
+      executors: { memory: vi.fn(), skill: vi.fn(), knowledge },
+    });
+
+    const result = await dispatcher.execute(proxyCall(
+      "tdai_knowledge_tool_call",
+      { knowledge_id: "wiki-1", tool_name: "search", params: { query: "routing" } },
+      "knowledge-call-1",
+    ), trustedContext());
+
+    expect(knowledge).toHaveBeenCalledWith(expect.objectContaining({
+      callId: "knowledge-call-1",
+      definition: expect.objectContaining({ backend: "knowledge", route: "tools/call" }),
+      body: {
+        knowledge_id: "wiki-1",
+        tool_name: "search",
+        params: { query: "routing" },
+      },
+      scope: trustedContext(),
+    }));
+    expect(result).toEqual({
+      isError: false,
+      value: { results: [{ title: "Architecture" }] },
+    });
+  });
+
   it("dispatches Skill tools to the Skill executor with normalized arguments and call identity", async () => {
     const memory = vi.fn();
     const skill = vi.fn(async () => bridgeResult({

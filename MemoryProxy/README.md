@@ -26,7 +26,7 @@ Coding agent (Claude Code / CodeBuddy / ...)
 
 - **Session initialization**: intercepts the first request and guides the user through an interactive form to pick team → agent → task, then injects the agent/task context into the system prompt. Supports auto pre-selection from request headers (`x-team-id` / `x-agent-id` / `x-task-id`).
 - **Context injection**: injects reference-only Skill metadata and Memory L2/L3 context on demand; it does not fabricate text/curl tools.
-- **Claude Code Native Proxy Tools**: injects configured Memory and Skill tools as structured Anthropic tools, executes Proxy-owned calls inside MemoryProxy, joins them with Claude Code tool results in model order, and performs internal continuation without exposing Proxy-owned calls to Claude Code.
+- **Native Proxy Tools**: injects configured Memory, Skill, and Knowledge capabilities as structured tools. Knowledge keeps its two-step discovery/call behavior while URLs, credentials, execution, result joining, and model continuation remain inside MemoryProxy.
 - **Transparent Claude history**: Claude Code Hooks mark real user turns and context compression boundaries. Completed hidden Native calls and results are kept in ClickHouse and restored before every later Claude model request, including the request that produces a compact summary.
 - **Conversation write-back (extraction)**: at the end of each human turn, sends the conversation slice to MemoryCore `/v3/skill/conversation/add` (Skill archival) and writes L0 short-term memory for background extraction on the core side.
 - **Auth & identity**: calls MemoryCore `POST /v3/meta/auth/verify` to validate `x-tdai-user-key` and resolve `user_id` as the end-to-end user identity; `spaceId` (memory instance id) is auto-extracted from the `/proxy/<spaceId>/...` path.
@@ -68,8 +68,8 @@ MemoryProxy mirrors MemoryCore's four-layer memory structure, plugging into the 
 
 Other prompt context is deliberately reference-only:
 
-- `<available_skills>` — metadata summaries of relevant Skills; no model-facing Skill execution/loading tool is claimed
-- Knowledge tool prompt injection is disabled in this Native phase
+- `<available_skills>` — metadata summaries of relevant Skills; Skill Native Tools load the selected content
+- `<knowledge_catalog>` — Wiki / Code Graph resources authorized for the current Agent; service URLs and transport instructions remain server-side
 - `<session_context>` — agent/task info appended every turn after session init completes
 
 `nativeProxyTools.enabled=false` means no Native definition is injected. There is intentionally no Fake Tool, shell, or curl fallback. When enabled, Native state is fail-closed on ClickHouse capability/readiness. Unfinished execution state defaults to a 1800-second TTL; completed hidden Tool calls/results and Claude context events are stored separately without that short TTL.
@@ -256,7 +256,7 @@ Config sections at a glance:
 | `sessionInit` | session init form flow and header auto pre-select policy |
 | `tdai` | MemoryCore connection and L0/L1/L2/L3 switches |
 | `skill` | MemoryCore data-plane config (Skill RAG, Skill archival, Meta) |
-| `knowledge` | standalone knowledge gateway config; no model-side tool injection in this phase |
+| `knowledge` | Knowledge catalog, authorization lookup, and Native Tool data-plane config |
 | `skillRuntime` | write policy for the independent `/skill-bridge` API |
 | `rateLimit` | Input TPM / QPM limiting per memory instance × actual model |
 | `clickhouse` | per-turn usage reporting (billing data source) |

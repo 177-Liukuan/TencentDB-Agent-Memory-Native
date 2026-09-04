@@ -1,5 +1,9 @@
 import { executeMemoryBridge, type MemoryBridgeDeps } from "../memory/memory-bridge.js";
 import { executeSkillBridge, type SkillBridgeDeps } from "../skill/skill-bridge.js";
+import {
+  executeKnowledgeTool,
+  type KnowledgeToolExecutorDeps,
+} from "../knowledge/knowledge-tool-executor.js";
 import type { ProxyConfig } from "../types.js";
 import type { NativeProxyToolDefinition } from "./tool-registry.js";
 import type { JsonValue, NativeToolBackend, ToolExecutionScope } from "./types.js";
@@ -27,6 +31,7 @@ export type BridgeToolExecutors = Record<NativeToolBackend, BridgeToolExecutor>;
 export interface BridgeToolExecutorDependencies {
   memory?: MemoryBridgeDeps;
   skill?: SkillBridgeDeps;
+  knowledge?: KnowledgeToolExecutorDeps;
 }
 
 export function createBridgeToolExecutors(
@@ -50,5 +55,15 @@ export function createBridgeToolExecutors(
       spaceId: scope.spaceId,
       signal,
     }, dependencies.skill ?? {}),
+    knowledge: async ({ definition, body, scope, signal }) => executeKnowledgeTool({
+      config,
+      route: definition.route,
+      body,
+      sessionId: scope.sessionId,
+      spaceId: scope.spaceId,
+      agentSource: scope.agentSource,
+      userId: scope.userId,
+      signal,
+    }, dependencies.knowledge ?? {}),
   };
 }
