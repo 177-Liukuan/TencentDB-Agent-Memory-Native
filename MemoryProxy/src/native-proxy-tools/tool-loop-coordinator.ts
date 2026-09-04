@@ -329,6 +329,8 @@ export class AnthropicToolLoopCoordinator {
                   input.totalCalls + nativeCalls.length,
                 );
               }
+              // 只读调用可在参数完整后与剩余 SSE 并行；有副作用的调用必须等 message_stop，
+              // 否则上游中断时可能出现“模型本轮失败，但数据已经修改”。
               if (this.options.registry.require(event.call.toolName).effect === "read") {
                 scheduleExecution(event.call);
               }
@@ -432,6 +434,7 @@ export class AnthropicToolLoopCoordinator {
       const totalCalls = input.totalCalls + nativeCalls.length;
       if (clientCalls.length > 0) await this.options.beforeClientDispatch?.();
       await this.persistSnapshot(stateKey, snapshot, "completed", totalCalls);
+      // 到轮末才启动尚未执行的写/archive 调用；客户端工具也只有此时才可统一下发。
       for (const call of nativeCalls) scheduleExecution(call);
 
       if (clientCalls.length > 0) {
@@ -490,6 +493,7 @@ export class AnthropicToolLoopCoordinator {
         asAssistantMessage(completedState.assistantSkeleton),
         asToolResultMessage(completedState.slots),
       ];
+      // 先保存模型实际看过的隐藏历史，再固定首次请求的上游目标续写；保存失败时不得带缺口继续。
       await this.core.persistCompletedHistory(stateKey);
       const nextRoundNumber = input.round + 1;
       await this.options.beforeReenter?.();

@@ -120,6 +120,7 @@ function locateMixedRound(
 }
 
 function fillMixedRound(messages: JsonValue[], position: MixedRoundPosition, round: NativeToolLedgerRound): void {
+  // Claude Code 已保存 Client Tool；这里只按原 blockIndex 补回隐藏块，避免复制一份客户端已有调用。
   const visibleBlocks = blocksAt(messages, position.assistantIndex);
   const existingIds = new Set(visibleBlocks.map(toolUse).filter((value): value is { id: string; name: string } => !!value)
     .map((value) => value.id));
@@ -198,6 +199,7 @@ export function reconstructAnthropicToolLedger(input: {
   const messages = structuredClone([...input.messages]);
   const turns = [...input.turns].sort((left, right) => left.insertAfterItem - right.insertAfterItem);
 
+  // 从后往前处理，避免前一轮插入消息后改变后一轮已经确定的位置。
   for (let turnPosition = turns.length - 1; turnPosition >= 0; turnPosition -= 1) {
     const turn = turns[turnPosition]!;
     const start = turn.insertAfterItem;
@@ -280,6 +282,7 @@ export async function materializeClaudeToolLedgerHistory(input: {
     throw new NativeToolLedgerConflictError("The latest UserPromptSubmit marker is missing");
   }
 
+  // PostCompact 只推进 Epoch；查询当前 Epoch 即可让已进入摘要的旧记录停止参与后续恢复。
   const rounds = await input.storage.findRounds(input.scope, context.currentEpoch);
   for (const round of rounds) {
     if (!seenTurns.has(round.turnSeq)) {

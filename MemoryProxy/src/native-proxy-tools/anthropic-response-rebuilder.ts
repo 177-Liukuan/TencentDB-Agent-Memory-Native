@@ -135,9 +135,8 @@ export function replayAnthropicBytes(snapshot: AnthropicStreamSnapshot): Uint8Ar
 }
 
 /**
- * Remove Proxy-owned block lifecycles by parsed index and compact every
- * remaining block index. No name/text matching is used, so identical tool
- * names and opaque Provider frames cannot be misclassified.
+ * 按解析出的 block index 删除 Native Tool 的完整事件，不按名称或文本替换。
+ * 这样既能重新编号剩余 block，也不会误删同名 Client Tool 或不透明的 Provider 事件。
  */
 export function buildClientVisibleAnthropicSse(
   snapshot: AnthropicStreamSnapshot,

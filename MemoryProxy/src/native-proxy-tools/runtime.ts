@@ -132,6 +132,8 @@ export function createNativeProxyToolRuntime(
     };
   }
 
+  // 短期 storage 管理执行中的状态和租约；ledgerStorage 保存完成后仍需补给模型的隐藏历史。
+  // 生产环境两者都使用 ClickHouse，任一探测失败都会关闭 Native Tool 能力，不能降级到进程内状态。
   const storage = dependencies.createStorage?.(config)
     ?? new ClickHouseToolExecutionStorageAdapter(config);
   const ledgerStorage = dependencies.createLedgerStorage?.(config)

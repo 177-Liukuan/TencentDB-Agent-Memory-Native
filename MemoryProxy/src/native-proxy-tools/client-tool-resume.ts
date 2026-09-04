@@ -474,6 +474,7 @@ export async function resumeClientToolResults(
   const maxStorageAttempts = input.maxStorageAttempts ?? 8;
 
   try {
+    // 一次客户端续轮必须完整对应同一组已下发调用；未知、缺失或跨组结果都不能猜测归属。
     const located = await Promise.all(results.map((result) => (
       input.storage.findByCallId(input.scope, result.callId, {
         includeExpired: true,
@@ -606,6 +607,7 @@ export async function resumeClientToolResults(
       await saveClientResult(input, key, result, maxStorageAttempts);
     }
 
+    // Native 结果可能仍在后台执行；若原进程退出，则在执行权到期后由当前实例接手。
     context = await waitForAllToolResults({
       ...input,
       now,
@@ -632,6 +634,7 @@ export async function resumeClientToolResults(
     ];
     if (input.ledgerStorage) {
       try {
+        // 重入前先落长期记录，确保下一次普通请求不会因短期状态过期而丢失这一轮隐藏历史。
         await input.ledgerStorage.appendRound(buildNativeToolLedgerRound(context));
       } catch {
         throw new ClientToolResumeFailure(

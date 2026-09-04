@@ -37,6 +37,10 @@ export interface NativeToolSessionScope {
   sessionId: string;
 }
 
+/**
+ * 长期记录以 Claude Code 看不到、但后续上游请求必须补回的内容为主体，
+ * 仅额外保存定位所需的 Client Tool 引用；执行租约、重入状态和响应快照属于短期运行状态。
+ */
 export type NativeToolLedgerBlock =
   | {
       kind: "native_tool";
@@ -156,7 +160,7 @@ export interface PersistedForwardTarget {
   authSource: "client" | "global" | "agent" | "extension";
 }
 
-/** Native protocol identifiers and inputs that must never reach the client. */
+/** 用于响应发送前检查；这些 Native 调用标识和参数绝不能到达客户端。 */
 export interface NativeToolLeakMarker {
   callId: string;
   toolName: string;
@@ -245,7 +249,10 @@ export interface PersistedReentryOutcome extends PersistedResponseSnapshot {
   childStateKey?: ToolExecutionStateKey;
 }
 
-/** Persisted state for one assistant tool-call batch. */
+/**
+ * 一次 Assistant 工具调用组的短期运行状态。
+ * 它负责跨请求续接、并发认领和故障恢复，过期后仍需保留的隐藏历史由 Tool Ledger 负责。
+ */
 export interface ToolExecutionContext {
   key: ToolExecutionStateKey;
   turnSeq: number;

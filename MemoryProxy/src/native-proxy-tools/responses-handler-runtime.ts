@@ -139,6 +139,7 @@ export async function resumeResponsesNativeToolLoop(input: {
     timeoutMs: input.config.server.forwardTimeoutMs ?? 600_000,
   });
   let selected = restart;
+  // Responses 客户端当前只使用短期运行状态续接混合调用；Claude Hook 驱动的长期历史恢复仅接在 Anthropic 入口。
   const resume = await runtime.runOperation(() => resumeClientToolResults({
     body: input.body,
     scope: input.request!.scope,

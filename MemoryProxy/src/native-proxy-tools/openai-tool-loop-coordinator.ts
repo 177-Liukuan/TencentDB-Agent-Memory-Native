@@ -155,6 +155,8 @@ export class OpenAIToolLoopCoordinator {
             if (streamingStateKey) await this.core.markAborted(streamingStateKey);
             return this.error("upstream_stream_invalid", "OpenAI upstream returned an invalid event stream", 502, [parser.snapshot()]);
           }
+          // Responses 有单次函数参数完成事件，可提前执行只读调用；Chat Completions
+          // 没有同等可靠的边界，只在整轮结束后统一确认并执行。
           if (this.codec.protocol === "responses") {
             for (const event of events) {
               if (event.type !== "tool_call_completed") continue;
@@ -219,6 +221,7 @@ export class OpenAIToolLoopCoordinator {
       for (const call of nativeCalls) {
         if (!executionTasks.has(call.callId)) {
           streamingStateKey = stateKey;
+          // 这里同时补启动写/archive 调用，以及 Chat Completions 到轮末才确认的全部调用。
           scheduleExecution(call);
         }
       }

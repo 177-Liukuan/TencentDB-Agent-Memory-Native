@@ -414,7 +414,7 @@ export function createResponsesToAnthropicSseTransform(
   });
 }
 
-/** Buffered conversion used by the durable Tool Loop before client replay. */
+/** Tool Loop 在持久化或返回客户端前使用缓冲转换，确保保存的正是 Claude Code 实际收到的字节。 */
 export function convertResponsesSseBytesToAnthropic(
   chunks: readonly Uint8Array[],
   options: ResponsesAnthropicBridgeOptions = {},

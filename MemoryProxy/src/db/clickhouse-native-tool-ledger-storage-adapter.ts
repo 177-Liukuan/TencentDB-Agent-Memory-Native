@@ -56,6 +56,8 @@ function parseJson<T>(value: string): T {
 }
 function same(left: unknown, right: unknown): boolean { return JSON.stringify(left) === JSON.stringify(right); }
 
+// 长期记录不沿用短期执行状态的 stateTtlSeconds。当前表没有 TTL，
+// 因而已完成的隐藏工具历史不会在运行状态过期后一起被删除。
 export function createNativeToolLedgerTableDdl(table: string): string {
   assertIdentifier(table);
   return [
@@ -152,6 +154,7 @@ export class ClickHouseNativeToolLedgerStorageAdapter implements NativeToolLedge
 
   async appendRound(round: NativeToolLedgerRound): Promise<void> {
     this.assertReady();
+    // ledgerId 来自短期状态主键；先查再写并回读验证，使同一轮重试不会生成两份不同内容。
     const existing = await this.findRound(round.ledgerId);
     if (existing) {
       if (same(existing, round)) return;
@@ -173,6 +176,7 @@ export class ClickHouseNativeToolLedgerStorageAdapter implements NativeToolLedge
 
   async recordUserPrompt(scope: NativeToolSessionScope): Promise<NativeToolUserTurn> {
     this.assertReady();
+    // Turn 只由 UserPromptSubmit 推进，不能从 role=user 消息猜测，以免把 Tool Result 或 reminder 当成新问题。
     const context = await this.getSessionContext(scope);
     const value = { turnSeq: context.currentTurnSeq + 1, turnToken: randomUUID(), createdAt: new Date().toISOString() };
     await this.appendEvent({ eventId: randomUUID(), scope, type: "user_prompt", ...value });
@@ -195,6 +199,7 @@ export class ClickHouseNativeToolLedgerStorageAdapter implements NativeToolLedge
       `SELECT * FROM ${this.eventTable}`, this.scopeWhere(), "ORDER BY created_at, event_id",
     ].join("\n"), { ...scope });
     const events = rows.map(decodeNativeToolContextEventRow);
+    // 当前状态由追加事件推导，不覆盖旧行；任何 compact_error 都会让历史恢复停止，避免猜测压缩边界。
     const currentTurnSeq = events.reduce((max, event) => event.type === "user_prompt" ? Math.max(max, event.turnSeq ?? 0) : max, 0);
     const currentEpoch = events.reduce((max, event) => event.type === "compact_completed" ? Math.max(max, event.targetEpoch ?? 0) : max, 0);
     const pending = events.filter((event) => event.type === "compact_pending" && (event.targetEpoch ?? 0) > currentEpoch).map((event) => event.targetEpoch!);
@@ -212,6 +217,7 @@ export class ClickHouseNativeToolLedgerStorageAdapter implements NativeToolLedge
   async completeCompact(scope: NativeToolSessionScope, trigger: "manual" | "auto"): Promise<{ changed: boolean; currentEpoch: number; error?: "post_without_pending" }> {
     const context = await this.getSessionContext(scope);
     if (context.pendingCompactEpoch === null) {
+      // Hook 没有可用于配对 Pre/Post 的 compact_id；缺少 Pre 时宁可报错，也不自行推进 Epoch。
       await this.appendEvent({ eventId: randomUUID(), scope, type: "compact_error", trigger, createdAt: new Date().toISOString() });
       return { changed: false, currentEpoch: context.currentEpoch, error: "post_without_pending" };
     }

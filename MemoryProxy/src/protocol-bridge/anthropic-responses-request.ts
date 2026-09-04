@@ -196,7 +196,10 @@ function convertThinking(value: unknown): unknown {
   throw new AnthropicResponsesConversionError(`Anthropic thinking type '${value.type}' is unsupported`);
 }
 
-/** Convert a fully prepared Anthropic Messages request to OpenAI Responses. */
+/**
+ * 将已经完成注入和历史恢复的 Anthropic 请求转换为 Responses。
+ * 无法等价表达的字段直接报错，不能为了转发成功而静默丢失语义。
+ */
 export function convertAnthropicRequestToResponses(body: Raw): Raw {
   for (const field of ["stop_sequences", "top_k"] as const) {
     if (body[field] !== undefined) {

@@ -5,6 +5,10 @@ import type {
   NativeToolUserTurn,
 } from "../native-proxy-tools/types.js";
 
+/**
+ * 已完成 Native Tool 历史及 Claude Hook 事件的长期存储接口。
+ * 这里不管理工具是否正在执行；该职责属于 ToolExecutionStorageAdapter。
+ */
 export interface NativeToolLedgerStorageAdapter {
   initializeAndProbe(): Promise<void>;
   appendRound(round: NativeToolLedgerRound): Promise<void>;
