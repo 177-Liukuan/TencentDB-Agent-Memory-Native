@@ -10,6 +10,8 @@
  *     marker 到 n-2 位置以避免误算 cache write cost
  *   - SIDEQUERY 独立请求（TITLE/verify_api_key/...）：无 marker + tools=[] +
  *     thinking.disabled；源码 sessionTitle.ts:434 + queryHaiku 强制关 caching
+ *   - WebSearch 执行请求：单条 user 消息 + Anthropic web_search
+ *     Provider Tool。它由 Claude Code 在客户端工具内部另行发起，不属于主对话。
  *
  * 3P provider 关缓存的兜底：body 全无 marker 时，用 tools=[] && thinking.disabled
  * 两条硬约束联合判 sidequery；否则保底 main —— 退化到原有一刀切逻辑，不会更糟。
@@ -40,6 +42,10 @@ export function classifyCcRequest(body: Record<string, unknown>): CcRequestKind 
     return "main";
   }
 
+  // Claude Code 的 WebSearch 客户端工具会再发一条 Anthropic Provider Tool
+  // 请求。它沿用会话请求头，却没有 UserPromptSubmit 标记，不能参与历史恢复。
+  if (isClaudeCodeWebSearchSidequery(body)) return "sidequery";
+
   // 无 marker：可能是 SIDEQUERY，也可能是 3P provider 关 caching 的 MAIN
   // 兜底信号：SIDEQUERY 硬约束是 tools=[] AND thinking.disabled 同时命中
   //          用 && 而非 || 避免误伤"用户单独禁 tools 或单独禁 thinking"的主对话
@@ -49,6 +55,31 @@ export function classifyCcRequest(body: Record<string, unknown>): CcRequestKind 
   if (toolsEmpty && thinkingOff) return "sidequery";
 
   return "main";
+}
+
+export function isClaudeCodeWebSearchSidequery(
+  body: Record<string, unknown>,
+): boolean {
+  const messages = Array.isArray(body.messages) ? body.messages : [];
+  if (messages.length !== 1) return false;
+  const message = messages[0] as { role?: unknown } | undefined;
+  if (message?.role !== "user") return false;
+
+  const tools = Array.isArray(body.tools) ? body.tools : [];
+  if (tools.length !== 1) return false;
+  const tool = tools[0] as Record<string, unknown> | undefined;
+  if (
+    tool?.name !== "web_search"
+    || typeof tool.type !== "string"
+    || !/^web_search_\d{8}$/.test(tool.type)
+    || Object.hasOwn(tool, "input_schema")
+  ) {
+    return false;
+  }
+
+  const toolChoice = body.tool_choice as Record<string, unknown> | undefined;
+  return toolChoice?.type === "auto"
+    || (toolChoice?.type === "tool" && toolChoice.name === "web_search");
 }
 
 /**

@@ -231,6 +231,70 @@ afterEach(async () => {
 });
 
 describe("Anthropic Native Proxy Tool handler", () => {
+  it("forwards Claude Code internal WebSearch without requiring a turn marker", async () => {
+    const proxyConfig = config();
+    proxyConfig.ccRequestRouting.enabled = false;
+    const ledgerStorage = new InMemoryNativeToolLedgerStorageAdapter();
+    const scope = {
+      spaceId: "space-1",
+      userId: "user-1",
+      agentSource: "claude-code",
+      sessionId: "session-1",
+    };
+    await ledgerStorage.recordUserPrompt(scope);
+    const runtime = createNativeProxyToolRuntime(proxyConfig, {
+      createStorage: () => new InMemoryToolExecutionStorageAdapter(),
+      createLedgerStorage: () => ledgerStorage,
+    });
+    await runtime.ready();
+    __setNativeProxyToolRuntimeForTests(runtime);
+    await installInitializedSession();
+
+    const upstreamBodies: Record<string, unknown>[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      if (String(url) === "https://tdai.example/v3/meta/config/user/get") {
+        return new Response(JSON.stringify({ code: 0, data: { items: [] } }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      if (String(url) === "https://upstream.example/v1/messages") {
+        upstreamBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+        return singleConsumerSse(finalTextFixture("search complete")).response;
+      }
+      return new Response("not found", { status: 404 });
+    }));
+
+    const webSearchTool = {
+      type: "web_search_20250305",
+      name: "web_search",
+      max_uses: 8,
+    };
+    const response = await createApp(proxyConfig).request("/claude-code/space-1/v1/messages", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-user-id": "user-1",
+        "x-claude-code-session-id": "session-1",
+      },
+      body: JSON.stringify({
+        model: "claude-test",
+        max_tokens: 1_024,
+        stream: true,
+        system: "You are an assistant for performing a web search tool use",
+        messages: [{ role: "user", content: "Perform a web search for the query: Shenzhen weather" }],
+        tools: [webSearchTool],
+        tool_choice: { type: "auto" },
+      }),
+    });
+
+    expect(response.status).toBe(200);
+    expect(await response.text()).toContain("search complete");
+    expect(upstreamBodies).toHaveLength(1);
+    expect(upstreamBodies[0]?.tools).toEqual([webSearchTool]);
+    expect(JSON.stringify(upstreamBodies[0])).not.toContain("tdai_memory_search");
+  });
+
   it("does not create compression records from summary-like text in an ordinary Messages request", async () => {
     const proxyConfig = config();
     const ledgerStorage = new InMemoryNativeToolLedgerStorageAdapter();

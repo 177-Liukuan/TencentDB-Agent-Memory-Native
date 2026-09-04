@@ -49,7 +49,10 @@ import type { TdaiIdentity, TdaiMessage } from "./tdai/types.js";
 import { triggerSkillExtractIfReady } from "./skill/handler-glue.js";
 import { emitModelIntentTelemetry } from "./session/model-intent-telemetry.js";
 import { isExtractionAllowed, logExtractionSkipped } from "./extraction-gate.js";
-import type { CcRequestKind } from "./common/cc-request-classifier.js";
+import {
+  isClaudeCodeWebSearchSidequery,
+  type CcRequestKind,
+} from "./common/cc-request-classifier.js";
 import { buildRequestDebugMetadata } from "./common/langfuse-debug.js";
 import { resolveAgentAdapter } from "./agent-adapters/index.js";
 import { stripSessionInitArtifacts } from "./session/claude-code/form.js";
@@ -918,7 +921,13 @@ export async function handleAnthropicMessages(
     ? _pathPartsEarly[0] : undefined;
   const agentAdapter = resolveAgentAdapter(_agentFromPathEarly ?? "claude-code");
   const ccRoutingEnabled = config.ccRequestRouting?.enabled === true;
-  const classifiedRequestKind = ccRoutingEnabled ? agentAdapter.classifyRequest(body) : "main";
+  // WebSearch 的 Provider Tool 请求由 Claude Code 在客户端工具内部另发，
+  // 即使整套 CC 请求分流未启用，它也不能被当成真实用户 Turn 处理。
+  const isWebSearchSidequery = agentAdapter.agentKind === "claude-code"
+    && isClaudeCodeWebSearchSidequery(body);
+  const classifiedRequestKind = isWebSearchSidequery
+    ? "sidequery"
+    : ccRoutingEnabled ? agentAdapter.classifyRequest(body) : "main";
   const requestKind: CcRequestKind = classifiedRequestKind === "auxiliary"
     ? "sidequery"
     : classifiedRequestKind;
@@ -1901,7 +1910,9 @@ export async function handleAnthropicMessages(
     agentName: agentFromPath,
   });
 
-  if (historyRuntime?.ledgerStorage && toolExecutionScope) {
+  // Claude Code 执行 WebSearch 时会另发 Provider Tool 辅助请求；它不是当前
+  // 对话的一轮，也不会携带 UserPromptSubmit 标记，因此不参与 Native 历史恢复。
+  if (requestKind !== "sidequery" && historyRuntime?.ledgerStorage && toolExecutionScope) {
     try {
       const restored = await historyRuntime.runOperation(() => materializeClaudeToolLedgerHistory({
         messages: messages as import("./native-proxy-tools/types.js").JsonValue[],
