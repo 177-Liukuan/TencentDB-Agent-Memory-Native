@@ -624,13 +624,15 @@ describe("Anthropic Native Proxy Tool handler", () => {
     }));
     const app = createApp(proxyConfig);
     const headers = { "content-type": "application/json", "x-user-id": "user-1", "x-conversation-id": "session-1" };
+    // 按 Claude Code 2.1.260 的真实格式模拟 Hook additionalContext。
+    const wrapHookContext = (marker: string): string => `UserPromptSubmit hook additional context: ${marker}`;
     const hook = async (payload: Record<string, unknown>): Promise<Response> => app.request(
       "/claude-code/space-1/hooks/claude-code/context",
       { method: "POST", headers, body: JSON.stringify({ session_id: "session-1", ...payload }) },
     );
     const turnOneBody = await (await hook({ hook_event_name: "UserPromptSubmit", prompt: "question" })).json() as Record<string, any>;
     const markerOne = turnOneBody.hookSpecificOutput.additionalContext as string;
-    const firstMessages = [{ role: "user", content: [{ type: "text", text: "question" }, { type: "text", text: markerOne }] }];
+    const firstMessages = [{ role: "user", content: [{ type: "text", text: "question" }, { type: "text", text: wrapHookContext(markerOne) }] }];
     const first = await app.request("/claude-code/space-1/v1/messages", {
       method: "POST", headers,
       body: JSON.stringify({ model: "claude-test", max_tokens: 1_024, stream: true, messages: firstMessages }),
@@ -656,7 +658,7 @@ describe("Anthropic Native Proxy Tool handler", () => {
       method: "POST", headers,
       body: JSON.stringify({ model: "claude-test", max_tokens: 1_024, stream: true, messages: [
         { role: "user", content: "compacted summary" },
-        { role: "user", content: [{ type: "text", text: "continue" }, { type: "text", text: markerTwo }] },
+        { role: "user", content: [{ type: "text", text: "continue" }, { type: "text", text: wrapHookContext(markerTwo) }] },
       ] }),
     });
     expect(await after.text()).toContain("after compact");

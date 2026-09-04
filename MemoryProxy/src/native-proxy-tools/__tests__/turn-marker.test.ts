@@ -54,6 +54,39 @@ describe("Claude Code turn marker", () => {
     ]);
   });
 
+  it("recognizes the wrapper emitted by Claude Code 2.1.260", () => {
+    const marker = createClaudeTurnMarker("018f0b9e-7d31-7a62-8ad8-a2676d86e203");
+    const result = extractClaudeTurnMarkers([
+      { role: "user", content: "第一轮" },
+      { role: "system", content: `UserPromptSubmit hook additional context: ${marker}` },
+    ]);
+
+    expect(result.messages).toEqual([{ role: "user", content: "第一轮" }]);
+    expect(result.markers).toEqual([
+      { token: "018f0b9e-7d31-7a62-8ad8-a2676d86e203", insertAfterItem: 1 },
+    ]);
+  });
+
+  it("keeps ambient Claude context sharing a message with the wrapped marker", () => {
+    const marker = createClaudeTurnMarker("018f0b9e-7d31-7a62-8ad8-a2676d86e204");
+    const ambient = "The following agent types are no longer available:\n- helper";
+    const result = extractClaudeTurnMarkers([
+      { role: "user", content: "第一轮" },
+      {
+        role: "system",
+        content: `${ambient}\n\nUserPromptSubmit hook additional context: ${marker}`,
+      },
+    ]);
+
+    expect(result.messages).toEqual([
+      { role: "user", content: "第一轮" },
+      { role: "system", content: ambient },
+    ]);
+    expect(result.markers).toEqual([
+      { token: "018f0b9e-7d31-7a62-8ad8-a2676d86e204", insertAfterItem: 2 },
+    ]);
+  });
+
   it("does not treat user-authored lookalike text as a marker", () => {
     const input = [{ role: "user", content: "示例：<tdai-native-turn token=\"not-a-token\"/>" }];
 
