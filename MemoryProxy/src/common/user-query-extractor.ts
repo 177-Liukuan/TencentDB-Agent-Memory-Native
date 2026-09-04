@@ -69,7 +69,7 @@ const CC_INTERNAL_PROMPT_PATTERNS: RegExp[] = [
   //     只应剥除自身、保留用户后续输入。
 ];
 
-function isClaudeCodeInternalPrompt(text: string): boolean {
+export function isClaudeCodeInternalPrompt(text: string): boolean {
   const t = text.trim();
   if (!t) return false;
   return CC_INTERNAL_PROMPT_PATTERNS.some((re) => re.test(t));

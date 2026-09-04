@@ -595,6 +595,11 @@ describe("Anthropic Native Proxy Tool handler", () => {
       "x-user-id": "user-1",
       "x-conversation-id": "session-1",
     };
+    // 模拟 Claude Code 2.1.260 的真实消息形态：Hook 标记可能附在一条临时
+    // system 消息后面，而 Anthropic Adapter 随后会把该消息移出 messages。
+    const hookContext = (marker: string): string => (
+      `Available agents and skills\n\nUserPromptSubmit hook additional context: ${marker}`
+    );
 
     const first = await app.request("/claude-code/space-1/v1/messages", {
       method: "POST",
@@ -603,10 +608,11 @@ describe("Anthropic Native Proxy Tool handler", () => {
         model: "claude-test",
         max_tokens: 1_024,
         stream: true,
-        messages: [{ role: "user", content: [
-          { type: "text", text: "What rules apply?" },
-          { type: "text", text: createClaudeTurnMarker(firstTurn.turnToken) },
-        ] }],
+        system: "You are Claude Code",
+        messages: [
+          { role: "user", content: "What rules apply?" },
+          { role: "system", content: hookContext(createClaudeTurnMarker(firstTurn.turnToken)) },
+        ],
       }),
     });
     expect(await first.text()).toContain("first answer");
@@ -634,16 +640,13 @@ describe("Anthropic Native Proxy Tool handler", () => {
         model: "claude-test",
         max_tokens: 1_024,
         stream: true,
+        system: "You are Claude Code",
         messages: [
-          { role: "user", content: [
-            { type: "text", text: "What rules apply?" },
-            { type: "text", text: createClaudeTurnMarker(firstTurn.turnToken) },
-          ] },
+          { role: "user", content: "What rules apply?" },
+          { role: "system", content: hookContext(createClaudeTurnMarker(firstTurn.turnToken)) },
           { role: "assistant", content: "first answer" },
-          { role: "user", content: [
-            { type: "text", text: "What about now?" },
-            { type: "text", text: createClaudeTurnMarker(secondTurn.turnToken) },
-          ] },
+          { role: "user", content: "What about now?" },
+          { role: "system", content: `UserPromptSubmit hook additional context: ${createClaudeTurnMarker(secondTurn.turnToken)}` },
         ],
       }),
     });
@@ -654,6 +657,21 @@ describe("Anthropic Native Proxy Tool handler", () => {
     expect(restoredMessages.map((message) => message.role)).toEqual([
       "user", "assistant", "user", "assistant", "user",
     ]);
+    expect(restoredMessages[0]).toMatchObject({ role: "user" });
+    expect(JSON.stringify(restoredMessages[0].content)).toContain("What rules apply?");
+    expect(restoredMessages[1]).toMatchObject({
+      role: "assistant",
+      content: [expect.objectContaining({ type: "tool_use", id: "native-call-1" })],
+    });
+    expect(restoredMessages[2]).toMatchObject({
+      role: "user",
+      content: [expect.objectContaining({ type: "tool_result", tool_use_id: "native-call-1" })],
+    });
+    expect(restoredMessages[3]).toMatchObject({ role: "assistant" });
+    expect(JSON.stringify(restoredMessages[3].content)).toContain("first answer");
+    expect(restoredMessages[4]).toMatchObject({ role: "user" });
+    expect(JSON.stringify(restoredMessages[4].content)).toContain("What about now?");
+    expect(restoredMessages.some((message) => message.role === "system")).toBe(false);
     const serialized = JSON.stringify(restoredMessages);
     expect(serialized.match(/native-call-1/g)).toHaveLength(2);
     expect(serialized.match(/tdai_memory_search/g)).toHaveLength(1);

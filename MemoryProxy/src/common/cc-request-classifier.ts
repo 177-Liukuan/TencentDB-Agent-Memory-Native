@@ -4,7 +4,8 @@
  * 三分成 main / fork / sidequery。
  *
  * 判定依据（源码硬约束 + 抓包实证）：
- *   - MAIN 主对话：cache_control marker 在 messages[n-1]（含 msgs=1 边界）
+ *   - MAIN 主对话：cache_control marker 在 messages[n-1]（含 msgs=1 边界），
+ *     但明确标记为 SUGGESTION/RECAP/COMPACT 等内部请求的内容除外
  *   - FORK 复用缓存（SUGGESTION/RECAP/COMPACT/...）：marker 在 messages[n-2]
  *     源码 forkedAgent.ts + claude.ts:3242-3243 强制 skipCacheWrite=true 挪
  *     marker 到 n-2 位置以避免误算 cache write cost
@@ -19,6 +20,8 @@
  * 详细设计与抓包实证见:
  *   docs/design/2026-07-30-cc-request-routing-plan.md
  */
+
+import { isClaudeCodeInternalPrompt } from "./user-query-extractor.js";
 
 export type CcRequestKind = "main" | "fork" | "sidequery";
 
@@ -36,6 +39,9 @@ export function classifyCcRequest(body: Record<string, unknown>): CcRequestKind 
 
   // 主判定：cache_control marker 位置
   if (markerIdx >= 0) {
+    // Suggestion/Recap/Compact 等请求会复用主对话缓存，但不是用户新提交
+    // 的问题。它们需要读取完整历史，却不能注入或执行新的 Native Tool。
+    if (isClaudeCodeInternalRequest(msgs)) return "fork";
     // messages[n-2] → FORK（skipCacheWrite=true 强制）
     if (markerIdx === n - 2) return "fork";
     // 其它位置（含 last=n-1）→ MAIN
@@ -55,6 +61,27 @@ export function classifyCcRequest(body: Record<string, unknown>): CcRequestKind 
   if (toolsEmpty && thinkingOff) return "sidequery";
 
   return "main";
+}
+
+function isClaudeCodeInternalRequest(messages: unknown[]): boolean {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index] as { role?: unknown; content?: unknown } | undefined;
+    if (message?.role !== "user") continue;
+    const text = typeof message.content === "string"
+      ? message.content
+      : Array.isArray(message.content)
+        ? message.content
+          .map((block) => {
+            if (!block || typeof block !== "object") return "";
+            const value = block as { type?: unknown; text?: unknown };
+            return value.type === "text" && typeof value.text === "string" ? value.text : "";
+          })
+          .filter(Boolean)
+          .join("\n")
+        : "";
+    return isClaudeCodeInternalPrompt(text);
+  }
+  return false;
 }
 
 export function isClaudeCodeWebSearchSidequery(

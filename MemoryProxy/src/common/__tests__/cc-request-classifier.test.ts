@@ -28,4 +28,19 @@ describe("Claude Code request classifier", () => {
       thinking: { type: "adaptive" },
     })).toBe("main");
   });
+
+  it("treats Claude Code's cached suggestion request as a fork", () => {
+    expect(classifyCcRequest({
+      messages: [{
+        role: "user",
+        content: [{
+          type: "text",
+          text: "[SUGGESTION MODE: Suggest what the user might naturally type next.]",
+          cache_control: { type: "ephemeral" },
+        }],
+      }],
+      tools: [{ name: "Read", input_schema: { type: "object" } }],
+      thinking: { type: "adaptive" },
+    })).toBe("fork");
+  });
 });

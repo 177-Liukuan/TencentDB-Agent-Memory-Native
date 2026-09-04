@@ -88,9 +88,14 @@ fi
   die 'invalid --session-id: expected UUID'
 [[ -x "$CLAUDE_NATIVE_LAUNCHER" ]] || die "Claude launcher is not executable: $CLAUDE_NATIVE_LAUNCHER"
 
-export ANTHROPIC_CUSTOM_HEADERS=$'x-team-id: '"$team_id"$'\nx-agent-id: '"$agent_id"$'\nx-task-id: '"$task_id"
+# Claude Code 的 settings.json 可以覆盖父进程环境变量，因此把本次评测身份
+# 作为 CLI settings 传入，确保真实请求使用调用者明确指定的 Team/Agent/Task。
+printf -v native_settings \
+  '{"env":{"ANTHROPIC_CUSTOM_HEADERS":"x-team-id: %s\\nx-agent-id: %s\\nx-task-id: %s"}}' \
+  "$team_id" "$agent_id" "$task_id"
 
 exec "$CLAUDE_NATIVE_LAUNCHER" \
+  --settings "$native_settings" \
   --session-id "$session_id" \
   -p \
   --output-format json \

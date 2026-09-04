@@ -17,14 +17,12 @@ assert_eq() {
 }
 
 FAKE_LAUNCHER="$TEST_TMP/claude-native"
-CAPTURE_HEADERS="$TEST_TMP/headers"
 CAPTURE_ARGS="$TEST_TMP/args"
-export CAPTURE_HEADERS CAPTURE_ARGS
+export CAPTURE_ARGS
 
 cat >"$FAKE_LAUNCHER" <<'FAKE'
 #!/usr/bin/env bash
 set -euo pipefail
-printf '%s' "${ANTHROPIC_CUSTOM_HEADERS-}" >"$CAPTURE_HEADERS"
 printf '%s\0' "$@" >"$CAPTURE_ARGS"
 FAKE
 chmod +x "$FAKE_LAUNCHER"
@@ -37,22 +35,22 @@ CLAUDE_NATIVE_LAUNCHER="$FAKE_LAUNCHER" \
   --session-id 11111111-1111-4111-8111-111111111111 \
   'retrieve memory'
 
-expected_headers=$'x-team-id: team-123\nx-agent-id: agt-456\nx-task-id: task-789'
-assert_eq "$expected_headers" "$(<"$CAPTURE_HEADERS")" 'identity headers'
-
 mapfile -d '' -t args <"$CAPTURE_ARGS"
-assert_eq '7' "${#args[@]}" 'argument count'
-assert_eq '--session-id' "${args[0]}" 'session flag'
-assert_eq '11111111-1111-4111-8111-111111111111' "${args[1]}" 'session value'
-assert_eq '-p' "${args[2]}" 'print flag'
-assert_eq '--output-format' "${args[3]}" 'output flag'
-assert_eq 'json' "${args[4]}" 'default output format'
-assert_eq '--' "${args[5]}" 'argument separator'
-assert_eq 'retrieve memory' "${args[6]}" 'prompt'
+expected_settings='{"env":{"ANTHROPIC_CUSTOM_HEADERS":"x-team-id: team-123\nx-agent-id: agt-456\nx-task-id: task-789"}}'
+assert_eq '9' "${#args[@]}" 'argument count'
+assert_eq '--settings' "${args[0]}" 'settings flag'
+assert_eq "$expected_settings" "${args[1]}" 'identity settings'
+assert_eq '--session-id' "${args[2]}" 'session flag'
+assert_eq '11111111-1111-4111-8111-111111111111' "${args[3]}" 'session value'
+assert_eq '-p' "${args[4]}" 'print flag'
+assert_eq '--output-format' "${args[5]}" 'output flag'
+assert_eq 'json' "${args[6]}" 'default output format'
+assert_eq '--' "${args[7]}" 'argument separator'
+assert_eq 'retrieve memory' "${args[8]}" 'prompt'
 
 printf 'PASS: forwards validated identity in non-interactive JSON mode\n'
 
-rm -f -- "$CAPTURE_HEADERS" "$CAPTURE_ARGS"
+rm -f -- "$CAPTURE_ARGS"
 set +e
 missing_output="$(
   CLAUDE_NATIVE_LAUNCHER="$FAKE_LAUNCHER" \
@@ -92,6 +90,6 @@ CLAUDE_NATIVE_LAUNCHER="$FAKE_LAUNCHER" \
   'retrieve memory'
 
 mapfile -d '' -t generated_args <"$CAPTURE_ARGS"
-[[ "${generated_args[1]}" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] || \
-  fail "generated session is not a UUID: '${generated_args[1]}'"
+[[ "${generated_args[3]}" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] || \
+  fail "generated session is not a UUID: '${generated_args[3]}'"
 printf 'PASS: generates an isolated session by default\n'

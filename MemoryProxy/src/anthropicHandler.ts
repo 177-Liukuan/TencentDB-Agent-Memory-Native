@@ -82,6 +82,7 @@ import {
 import type {
   PersistedForwardTarget,
   PersistedToolObservationIntent,
+  JsonValue,
   ToolExecutionContext,
   ToolExecutionScope,
   ToolExecutionStateKey,
@@ -902,7 +903,7 @@ export async function handleAnthropicMessages(
 
   // Hook 标记只用于定位真实用户 Turn。业务链路和上游模型都不应看到它。
   const nativeMarkerMessages = config.nativeProxyTools.enabled && Array.isArray(body.messages)
-    ? structuredClone(body.messages) as import("./native-proxy-tools/types.js").JsonValue[]
+    ? structuredClone(body.messages) as JsonValue[]
     : undefined;
   if (nativeMarkerMessages) {
     body = { ...body, messages: extractClaudeTurnMarkers(nativeMarkerMessages).messages };
@@ -1915,15 +1916,23 @@ export async function handleAnthropicMessages(
   if (requestKind !== "sidequery" && historyRuntime?.ledgerStorage && toolExecutionScope) {
     try {
       const restored = await historyRuntime.runOperation(() => materializeClaudeToolLedgerHistory({
-        messages: messages as import("./native-proxy-tools/types.js").JsonValue[],
-        markerMessages: nativeMarkerMessages,
+        messages: nativeMarkerMessages
+          ?? (messages as JsonValue[]),
         scope: toolExecutionScope,
         storage: historyRuntime.ledgerStorage!,
       }));
       hookTurnSeq = restored.turnSeq;
       toolExecutionScope.contextVersion = `epoch:${restored.currentEpoch}`;
-      messages = restored.messages;
-      body = { ...body, messages: restored.messages };
+      // 先在 Claude Code 原始消息上恢复工具历史，再执行 Anthropic 原有的
+      // 边界规则：system 只允许放在顶层，不能留在 messages 中。
+      const restoredMessages = restored.messages.filter((message) => (
+        !message
+        || typeof message !== "object"
+        || Array.isArray(message)
+        || (message as Record<string, JsonValue>).role !== "system"
+      ));
+      messages = restoredMessages;
+      body = { ...body, messages: restoredMessages };
     } catch (error) {
       return nativeToolErrorResponse(
         error instanceof NativeToolLedgerConflictError ? 409 : 503,

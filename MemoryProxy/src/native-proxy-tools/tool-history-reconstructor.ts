@@ -246,7 +246,6 @@ export function reconstructAnthropicToolLedger(input: {
 /** 从 Hook 记录取得真实 Turn，再恢复当前 Epoch 的 Claude Code 历史。 */
 export async function materializeClaudeToolLedgerHistory(input: {
   messages: readonly JsonValue[];
-  markerMessages?: readonly JsonValue[];
   scope: import("./types.js").NativeToolSessionScope;
   storage: NativeToolLedgerStorageAdapter;
 }): Promise<{
@@ -255,7 +254,8 @@ export async function materializeClaudeToolLedgerHistory(input: {
   currentEpoch: number;
   ledgerIds: string[];
 }> {
-  const markerSource = extractClaudeTurnMarkers(input.markerMessages ?? input.messages);
+  // 标记位置和历史插入必须基于同一份消息，否则 Claude Code 临时加入的
+  // system 消息被协议适配器删掉后，旧工具记录会错插到下一轮用户问题之后。
   const extracted = extractClaudeTurnMarkers(input.messages);
   const context = await input.storage.getSessionContext(input.scope);
   if (context.compactStateError) {
@@ -264,7 +264,7 @@ export async function materializeClaudeToolLedgerHistory(input: {
 
   const turns: TurnPosition[] = [];
   const seenTurns = new Set<number>();
-  for (const marker of markerSource.markers) {
+  for (const marker of extracted.markers) {
     const turn = await input.storage.findTurnByToken(input.scope, marker.token);
     // 新 Session 可能携带父 Session 的标记；删除标记，但绝不读取父 Session 历史。
     if (!turn) continue;
