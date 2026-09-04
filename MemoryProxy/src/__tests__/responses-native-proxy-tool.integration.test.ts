@@ -154,10 +154,8 @@ describe.each([
     });
     expect(await followUp.text()).toContain("final from Responses");
     expect(upstreamBodies).toHaveLength(3);
-    const restored = JSON.stringify(upstreamBodies[2].input);
-    expect(restored.match(/call_native/g)).toHaveLength(2);
-    expect(restored.match(/tdai_memory_search/g)).toHaveLength(1);
-    expect(restored).toContain("use formatter");
+    // 第一版 Hook 历史恢复只支持 Claude Code；Responses 客户端不继承隐藏轨迹。
+    expect(JSON.stringify(upstreamBodies[2].input)).not.toContain("call_native");
 
     const compact = await createApp(config).request(`${route}/compact`, {
       method: "POST",
@@ -171,7 +169,7 @@ describe.each([
       }),
     });
     expect(await compact.text()).toContain("response.completed");
-    expect(JSON.stringify(upstreamBodies[3].input).match(/call_native/g)).toHaveLength(2);
+    expect(JSON.stringify(upstreamBodies[3].input)).not.toContain("call_native");
 
     const afterCompact = await createApp(config).request(route, {
       method: "POST",
@@ -186,9 +184,6 @@ describe.each([
     });
     await afterCompact.text();
     expect(JSON.stringify(upstreamBodies[4].input)).not.toContain("call_native");
-    expect(await runtime.historyStorage!.findPendingCompressionReceipts({
-      spaceId: "space-1", userId: "anonymous", agentSource: _client === "Codex" ? "codex" : "workbuddy", sessionId: "session-responses",
-    })).toEqual([]);
   });
 
   it("keeps auxiliary Responses endpoints as single-call pass-through", async () => {

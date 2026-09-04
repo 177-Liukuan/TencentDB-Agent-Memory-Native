@@ -68,15 +68,6 @@ import {
 } from "./native-proxy-tools/client-tool-resume.js";
 import { describeNativeProxyToolInjectionFailure } from "./native-proxy-tools/native-proxy-tools-injector.js";
 import type { PersistedForwardTarget, ToolExecutionScope } from "./native-proxy-tools/types.js";
-import { createHistoryAnchor, createLogicalTurnId } from "./native-proxy-tools/history-anchor.js";
-import {
-  backfillActiveCompletedNativeToolHistory,
-  materializeNativeToolHistory,
-  NativeToolHistoryConflictError,
-} from "./native-proxy-tools/native-tool-history-materializer.js";
-import {
-  confirmPendingNativeToolCompressions,
-} from "./native-proxy-tools/native-tool-compression-receipt.js";
 
 /**
  * Build a per-request TdaiClient. `spaceId` (extracted from the request path
@@ -1177,7 +1168,6 @@ export async function handleChatCompletions(
       body,
       scope: toolExecutionScope,
       storage: nativeStorage,
-      historyStorage: nativeToolRuntime.historyStorage ?? undefined,
       dispatcher: nativeDispatcher,
       limits: config.nativeProxyTools,
       reentryLeaseMs: (config.server.forwardTimeoutMs ?? 600_000)
@@ -1214,7 +1204,6 @@ export async function handleChatCompletions(
       const coordinator = new OpenAIToolLoopCoordinator({
         registry: nativeToolRuntime.registry,
         storage: nativeStorage,
-        historyStorage: nativeToolRuntime.historyStorage ?? undefined,
         dispatcher: nativeDispatcher,
         limits: config.nativeProxyTools,
         reenter: exactReentry,
@@ -1365,42 +1354,6 @@ export async function handleChatCompletions(
     useGuard: config.costGuard.markerOptIn ? hasCostGuardMarker(c.req.path) : true,
     agentName: agentFromPath,
   });
-
-  if (historyRuntime?.storage && historyRuntime.historyStorage && toolExecutionScope) {
-    try {
-      await historyRuntime.runOperation(async () => {
-        await confirmPendingNativeToolCompressions({
-          scope: toolExecutionScope,
-          currentItems: (nativeLogicalBaseMessages ?? messages) as import("./native-proxy-tools/types.js").JsonValue[],
-          storage: historyRuntime.historyStorage!,
-        });
-        await backfillActiveCompletedNativeToolHistory({
-          scope: toolExecutionScope,
-          stateStorage: historyRuntime.storage!,
-          historyStorage: historyRuntime.historyStorage!,
-        });
-        const restored = await materializeNativeToolHistory({
-          protocol: "openai",
-          items: messages as import("./native-proxy-tools/types.js").JsonValue[],
-          anchorItems: (nativeLogicalBaseMessages ?? messages) as import("./native-proxy-tools/types.js").JsonValue[],
-          scope: toolExecutionScope,
-          storage: historyRuntime.historyStorage!,
-        });
-        if (restored.historyIds.length > 0) {
-          messages = restored.items;
-          body = { ...body, messages: restored.items };
-        }
-      });
-    } catch (error) {
-      return nativeToolErrorResponse(
-        error instanceof NativeToolHistoryConflictError ? 409 : 503,
-        error instanceof NativeToolHistoryConflictError ? "native_tool_history_conflict" : "native_tool_history_unavailable",
-        error instanceof NativeToolHistoryConflictError
-          ? error.message
-          : "Native Proxy Tool history could not be restored",
-      );
-    }
-  }
 
   // ── Create pipeline logger ──────────────────────────────────────────────
   const pipe = createPipeline(config, traceId, target.model);
@@ -1643,7 +1596,6 @@ export async function handleChatCompletions(
       let upstreamSnapshot;
       try {
         const logicalMessages = nativeLogicalBaseMessages ?? messages;
-        const historyAnchor = createHistoryAnchor(logicalMessages);
         upstreamSnapshot = buildUpstreamRequestSnapshot({
           protocol: "openai",
           clientProtocol: "openai",
@@ -1658,13 +1610,6 @@ export async function handleChatCompletions(
           }),
           ...(nativeLogicalRequestFingerprint ? { requestFingerprint: nativeLogicalRequestFingerprint } : {}),
           logicalBaseMessages: logicalMessages,
-          historyAnchor,
-          logicalTurnId: createLogicalTurnId({
-            scope: toolExecutionScope,
-            clientProtocol: "openai",
-            anchor: historyAnchor,
-            requestFingerprint: nativeLogicalRequestFingerprint ?? historyAnchor.prefixDigest,
-          }),
         });
       } catch {
         pipe.streamDone(null);
@@ -1686,7 +1631,6 @@ export async function handleChatCompletions(
       const coordinator = new OpenAIToolLoopCoordinator({
         registry: nativeToolRuntime.registry,
         storage: nativeToolRuntime.storage,
-        historyStorage: nativeToolRuntime.historyStorage ?? undefined,
         dispatcher: nativeToolRuntime.dispatcher,
         limits: config.nativeProxyTools,
         reenter,

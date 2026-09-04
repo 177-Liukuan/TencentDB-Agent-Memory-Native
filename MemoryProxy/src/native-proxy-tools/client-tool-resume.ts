@@ -7,12 +7,12 @@ import {
   serializeToolExecutionStateKey,
   type ToolExecutionStorageAdapter,
 } from "../db/tool-execution-storage-adapter.js";
-import type { NativeToolHistoryStorageAdapter } from "../db/native-tool-history-storage-adapter.js";
+import type { NativeToolLedgerStorageAdapter } from "../db/native-tool-ledger-storage-adapter.js";
 import type { UnifiedToolCall } from "../injection/adapters/interface.js";
 import { buildToolResultMessage } from "./anthropic-response-rebuilder.js";
 import { NativeToolTargetUnavailableError } from "./exact-target-transport.js";
 import { openAIAssistantMessageFromSkeleton } from "./openai-response-rebuilder.js";
-import { buildNativeToolHistoryRecord } from "./native-tool-history-record.js";
+import { buildNativeToolLedgerRound } from "./tool-ledger-round.js";
 import type { NativeProxyToolDispatcher } from "./native-proxy-tool-dispatcher.js";
 import type {
   NativeReentryRequest,
@@ -41,7 +41,7 @@ export interface ClientToolResumeInput {
   body: Record<string, unknown>;
   scope: ToolExecutionScope;
   storage: ToolExecutionStorageAdapter;
-  historyStorage?: NativeToolHistoryStorageAdapter;
+  ledgerStorage?: NativeToolLedgerStorageAdapter;
   dispatcher: Pick<NativeProxyToolDispatcher, "execute">;
   limits: NativeProxyToolsConfig;
   reenter(request: NativeReentryRequest, stateKey: ToolExecutionStateKey): Promise<UpstreamRound>;
@@ -630,9 +630,9 @@ export async function resumeClientToolResults(
       ...asAssistantMessages(context),
       ...asToolResultMessages(context),
     ];
-    if (input.historyStorage) {
+    if (input.ledgerStorage) {
       try {
-        await input.historyStorage.appendCompletedBatch(buildNativeToolHistoryRecord(context));
+        await input.ledgerStorage.appendRound(buildNativeToolLedgerRound(context));
       } catch {
         throw new ClientToolResumeFailure(
           "native_tool_history_unavailable",

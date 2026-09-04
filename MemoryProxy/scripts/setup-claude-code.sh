@@ -73,7 +73,7 @@ done
 
 # Resolve settings file by scope
 case "$SCOPE" in
-  user)    SETTINGS="$HOME/.claude/settings.json" ;;
+  user)    SETTINGS="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json" ;;
   project) SETTINGS="./.claude/settings.json" ;;
   *) echo "✗ Invalid scope: $SCOPE (must be 'user' or 'project')" >&2; exit 1 ;;
 esac
@@ -140,6 +140,27 @@ env = data.setdefault("env", {})
 if action == "install":
     env["ANTHROPIC_BASE_URL"] = endpoint
     env["ANTHROPIC_CUSTOM_HEADERS"] = f"{header}: {token}"
+    hook_url = endpoint.rstrip("/") + "/hooks/claude-code/context"
+    hooks = data.setdefault("hooks", {})
+    for event in ("UserPromptSubmit", "PreCompact", "PostCompact"):
+        groups = hooks.setdefault(event, [])
+        # 重装时只替换 TDAI 自己的 HTTP Hook，用户已有 Hook 原样保留。
+        for group in groups:
+            if not isinstance(group, dict) or not isinstance(group.get("hooks"), list):
+                continue
+            group["hooks"] = [h for h in group["hooks"] if not (
+                isinstance(h, dict)
+                and h.get("type") == "http"
+                and str(h.get("url", "")).rstrip("/").endswith("/hooks/claude-code/context")
+            )]
+        groups[:] = [group for group in groups if not (
+            isinstance(group, dict) and isinstance(group.get("hooks"), list) and len(group["hooks"]) == 0
+        )]
+        groups.append({
+            "matcher": "",
+            # Hook 与模型请求必须落到同一用户；该内部入口固定使用现有身份头。
+            "hooks": [{"type": "http", "url": hook_url, "headers": {"X-Tdai-User-Token": token}}],
+        })
     summary = (
         f"  ANTHROPIC_BASE_URL       = {endpoint}\n"
         f"  ANTHROPIC_CUSTOM_HEADERS = {header}: "
@@ -154,6 +175,23 @@ elif action == "uninstall":
             env.pop(key, None)
     if not env:
         data.pop("env", None)
+    hooks = data.get("hooks", {})
+    for event in ("UserPromptSubmit", "PreCompact", "PostCompact"):
+        groups = hooks.get(event, [])
+        for group in groups:
+            if isinstance(group, dict) and isinstance(group.get("hooks"), list):
+                group["hooks"] = [h for h in group["hooks"] if not (
+                    isinstance(h, dict)
+                    and h.get("type") == "http"
+                    and str(h.get("url", "")).rstrip("/").endswith("/hooks/claude-code/context")
+                )]
+        hooks[event] = [group for group in groups if not (
+            isinstance(group, dict) and isinstance(group.get("hooks"), list) and len(group["hooks"]) == 0
+        )]
+        if not hooks[event]:
+            hooks.pop(event, None)
+    if not hooks:
+        data.pop("hooks", None)
     summary = "  Removed: " + (", ".join(removed) if removed else "(nothing to remove)")
     msg = f"✓ Uninstalled tdai proxy config from {path}"
 else:

@@ -42,11 +42,10 @@ export const DEFAULT_CONFIG: ProxyConfig = {
       backend: "clickhouse",
       table: "native_proxy_tool_execution_state",
     },
-    historyStorage: {
+    ledgerStorage: {
       backend: "clickhouse",
-      table: "native_proxy_tool_history",
-      checkpointTable: "native_proxy_tool_context_checkpoint",
-      ttlDays: 30,
+      table: "native_proxy_tool_ledger",
+      eventTable: "native_proxy_tool_context_event",
     },
   },
   redis: {
@@ -323,21 +322,18 @@ function parseNativeProxyTools(yaml: RawYamlConfig): ProxyConfig["nativeProxyToo
     throw new Error("nativeProxyTools.stateStorage.table must be a safe ClickHouse identifier");
   }
 
-  const historyBackend = raw?.historyStorage?.backend ?? defaults.historyStorage.backend;
+  const historyBackend = raw?.ledgerStorage?.backend ?? defaults.ledgerStorage.backend;
   if (historyBackend !== "clickhouse") {
-    throw new Error("nativeProxyTools.historyStorage.backend must be clickhouse");
+    throw new Error("nativeProxyTools.ledgerStorage.backend must be clickhouse");
   }
-  const historyTable = raw?.historyStorage?.table ?? defaults.historyStorage.table;
+  const historyTable = raw?.ledgerStorage?.table ?? defaults.ledgerStorage.table;
   if (typeof historyTable !== "string" || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(historyTable)) {
-    throw new Error("nativeProxyTools.historyStorage.table must be a safe ClickHouse identifier");
+    throw new Error("nativeProxyTools.ledgerStorage.table must be a safe ClickHouse identifier");
   }
-  const checkpointTable = raw?.historyStorage?.checkpointTable ?? defaults.historyStorage.checkpointTable;
-  if (typeof checkpointTable !== "string" || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(checkpointTable)) {
-    throw new Error("nativeProxyTools.historyStorage.checkpointTable must be a safe ClickHouse identifier");
+  const eventTable = raw?.ledgerStorage?.eventTable ?? defaults.ledgerStorage.eventTable;
+  if (typeof eventTable !== "string" || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(eventTable)) {
+    throw new Error("nativeProxyTools.ledgerStorage.eventTable must be a safe ClickHouse identifier");
   }
-  const inheritedHistoryTtl = yaml.clickhouse?.ttlDays === undefined
-    ? defaults.historyStorage.ttlDays
-    : yaml.clickhouse.ttlDays;
 
   return {
     enabled: typeof raw?.enabled === "boolean" ? raw.enabled : defaults.enabled,
@@ -372,17 +368,10 @@ function parseNativeProxyTools(yaml: RawYamlConfig): ProxyConfig["nativeProxyToo
       86_400,
     ),
     stateStorage: { backend, table },
-    historyStorage: {
+    ledgerStorage: {
       backend: historyBackend,
       table: historyTable,
-      checkpointTable,
-      ttlDays: boundedInt(
-        "nativeProxyTools.historyStorage.ttlDays",
-        raw?.historyStorage?.ttlDays,
-        inheritedHistoryTtl,
-        0,
-        3_650,
-      ),
+      eventTable,
     },
   };
 }

@@ -5,9 +5,9 @@ import {
   isReplaySafeResponseHeader,
   type ToolExecutionStorageAdapter,
 } from "../db/tool-execution-storage-adapter.js";
-import type { NativeToolHistoryStorageAdapter } from "../db/native-tool-history-storage-adapter.js";
+import type { NativeToolLedgerStorageAdapter } from "../db/native-tool-ledger-storage-adapter.js";
 import type { UnifiedToolCall } from "../injection/adapters/interface.js";
-import { buildNativeToolHistoryRecord } from "./native-tool-history-record.js";
+import { buildNativeToolLedgerRound } from "./tool-ledger-round.js";
 import type { NativeProxyToolDispatcher } from "./native-proxy-tool-dispatcher.js";
 import { nativeToolLeaseDurationMs } from "./types.js";
 import type {
@@ -35,7 +35,7 @@ export class ToolLoopCoreFailure extends Error {
 
 export interface ToolLoopExecutionCoreOptions {
   storage: ToolExecutionStorageAdapter;
-  historyStorage?: NativeToolHistoryStorageAdapter;
+  ledgerStorage?: NativeToolLedgerStorageAdapter;
   dispatcher: Pick<NativeProxyToolDispatcher, "execute">;
   limits: NativeProxyToolsConfig;
   now?: () => Date;
@@ -265,7 +265,7 @@ export class ToolLoopExecutionCore {
   }
 
   async persistCompletedHistory(key: ToolExecutionStateKey): Promise<void> {
-    if (!this.options.historyStorage) return;
+    if (!this.options.ledgerStorage) return;
     const context = await this.options.storage.get(key);
     if (!context) {
       throw new ToolLoopCoreFailure(
@@ -275,7 +275,7 @@ export class ToolLoopExecutionCore {
       );
     }
     try {
-      await this.options.historyStorage.appendCompletedBatch(buildNativeToolHistoryRecord(context));
+      await this.options.ledgerStorage.appendRound(buildNativeToolLedgerRound(context));
     } catch {
       throw new ToolLoopCoreFailure(
         "native_tool_history_unavailable",

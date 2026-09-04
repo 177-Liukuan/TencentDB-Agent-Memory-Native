@@ -4,8 +4,8 @@ import {
   createInMemoryToolExecutionBackend,
   InMemoryToolExecutionStorageAdapter,
 } from "../../db/in-memory-tool-execution-storage-adapter.js";
-import { InMemoryNativeToolHistoryStorageAdapter } from "../../db/in-memory-native-tool-history-storage-adapter.js";
-import type { NativeToolHistoryStorageAdapter } from "../../db/native-tool-history-storage-adapter.js";
+import { InMemoryNativeToolLedgerStorageAdapter } from "../../db/in-memory-native-tool-ledger-storage-adapter.js";
+import type { NativeToolLedgerStorageAdapter } from "../../db/native-tool-ledger-storage-adapter.js";
 import type { UnifiedToolCall } from "../../injection/adapters/interface.js";
 import {
   completeClientToolReentry,
@@ -34,7 +34,7 @@ function scope(overrides: Partial<ToolExecutionScope> = {}): ToolExecutionScope 
     userId: "user-1",
     agentSource: "claude-code",
     sessionId: "session-1",
-    contextVersion: "v1",
+    contextVersion: "epoch:0",
     ...overrides,
   };
 }
@@ -173,7 +173,7 @@ function resumeHarness(options: {
   execute?: (call: UnifiedToolCall, context: ToolExecutionScope) => Promise<NativeToolResult>;
   reenter?: (request: NativeReentryRequest) => Promise<UpstreamRound>;
   now?: () => Date;
-  historyStorage?: NativeToolHistoryStorageAdapter;
+  ledgerStorage?: NativeToolLedgerStorageAdapter;
 } = {}) {
   const storage = options.storage ?? new InMemoryToolExecutionStorageAdapter({ now: () => fixedNow });
   const execute = vi.fn(options.execute ?? (async () => ({
@@ -186,7 +186,7 @@ function resumeHarness(options: {
     body,
     scope: inputScope,
     storage,
-    historyStorage: options.historyStorage ?? new InMemoryNativeToolHistoryStorageAdapter(),
+    ledgerStorage: options.ledgerStorage ?? new InMemoryNativeToolLedgerStorageAdapter(),
     dispatcher: { execute },
     limits: {
       enabled: true,
@@ -197,11 +197,10 @@ function resumeHarness(options: {
       maxResultBytes: 65_536,
       stateTtlSeconds: 1_800,
       stateStorage: { backend: "clickhouse", table: "native_proxy_tool_execution_state" },
-      historyStorage: {
+      ledgerStorage: {
         backend: "clickhouse",
-        table: "native_proxy_tool_history",
-        checkpointTable: "native_proxy_tool_context_checkpoint",
-        ttlDays: 30,
+        table: "native_proxy_tool_ledger",
+        eventTable: "native_proxy_tool_context_event",
       },
     },
     reenter,
@@ -372,9 +371,9 @@ describe("resumeClientToolResults", () => {
   });
 
   it("does not re-enter a mixed call when its long-term history cannot be saved", async () => {
-    const historyStorage = new InMemoryNativeToolHistoryStorageAdapter();
-    vi.spyOn(historyStorage, "appendCompletedBatch").mockRejectedValue(new Error("database unavailable"));
-    const harness = resumeHarness({ historyStorage });
+    const ledgerStorage = new InMemoryNativeToolLedgerStorageAdapter();
+    vi.spyOn(ledgerStorage, "appendRound").mockRejectedValue(new Error("database unavailable"));
+    const harness = resumeHarness({ ledgerStorage });
     const state = mixedState({
       p1: {
         status: "succeeded",

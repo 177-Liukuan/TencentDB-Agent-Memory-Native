@@ -26,7 +26,8 @@ Coding agent (Claude Code / CodeBuddy / ...)
 
 - **Session initialization**: intercepts the first request and guides the user through an interactive form to pick team → agent → task, then injects the agent/task context into the system prompt. Supports auto pre-selection from request headers (`x-team-id` / `x-agent-id` / `x-task-id`).
 - **Context injection**: injects reference-only Skill metadata and Memory L2/L3 context on demand; it does not fabricate text/curl tools.
-- **Anthropic Native Proxy Tool**: on streaming Messages requests, injects the single structured read-only `tdai_memory_search` tool, executes it at `content_block_stop`, persists the mixed-tool state in ClickHouse, and performs exact-target internal re-entry without exposing Native frames to the client.
+- **Claude Code Native Proxy Tools**: injects configured Memory and Skill tools as structured Anthropic tools, executes Proxy-owned calls inside MemoryProxy, joins them with Claude Code tool results in model order, and performs internal continuation without exposing Proxy-owned calls to Claude Code.
+- **Transparent Claude history**: Claude Code Hooks mark real user turns and context compression boundaries. Completed hidden Native calls and results are kept in ClickHouse and restored before every later Claude model request, including the request that produces a compact summary.
 - **Conversation write-back (extraction)**: at the end of each human turn, sends the conversation slice to MemoryCore `/v3/skill/conversation/add` (Skill archival) and writes L0 short-term memory for background extraction on the core side.
 - **Auth & identity**: calls MemoryCore `POST /v3/meta/auth/verify` to validate `x-tdai-user-key` and resolve `user_id` as the end-to-end user identity; `spaceId` (memory instance id) is auto-extracted from the `/proxy/<spaceId>/...` path.
 - **System-user passthrough**: internal service accounts (e.g. memory / wiki internal calls) short-circuit session init and injection on match, doing pure passthrough + billing only.
@@ -71,9 +72,9 @@ Other prompt context is deliberately reference-only:
 - Knowledge tool prompt injection is disabled in this Native phase
 - `<session_context>` — agent/task info appended every turn after session init completes
 
-`nativeProxyTools.enabled=false` means no Native definition is injected. There is intentionally no Fake Tool, shell, or curl fallback. When enabled, Native state is fail-closed on ClickHouse capability/readiness: short-lived execution state defaults to 1800 seconds, while completed hidden Tool history defaults to 30 days and is restored at its original position on later requests.
+`nativeProxyTools.enabled=false` means no Native definition is injected. There is intentionally no Fake Tool, shell, or curl fallback. When enabled, Native state is fail-closed on ClickHouse capability/readiness. Unfinished execution state defaults to a 1800-second TTL; completed hidden Tool calls/results and Claude context events are stored separately without that short TTL.
 
-On upgrade, completed short-lived records that still exist are backfilled on the session's next request. Records already deleted by the old 1800-second TTL cannot be recovered.
+Cross-request hidden-history restoration currently applies to Claude Code sessions configured by `scripts/setup-claude-code.sh`. Codex and WorkBuddy keep their Native Tool loop behavior but do not yet restore hidden calls from earlier user turns. Claude branch/fork sessions are isolated by their new session ID and do not inherit the parent session's hidden Native history.
 
 ## Requirements
 

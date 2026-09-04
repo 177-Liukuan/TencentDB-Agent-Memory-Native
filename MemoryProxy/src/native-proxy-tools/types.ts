@@ -21,54 +21,89 @@ export interface NativeProxyToolsConfig {
     backend: "clickhouse";
     table: string;
   };
-  historyStorage: {
+  ledgerStorage: {
     backend: "clickhouse";
     table: string;
-    checkpointTable: string;
-    ttlDays: number;
+    eventTable: string;
   };
 }
 
 export type NativeToolProtocol = "anthropic" | "openai" | "responses";
 
-export interface HistoryAnchor {
-  version: 1;
-  prefixDigest: string;
-  itemCount: number;
-}
-
-export interface NativeToolHistoryScope {
+export interface NativeToolSessionScope {
   spaceId: string;
   userId: string;
   agentSource: string;
   sessionId: string;
 }
 
-export interface NativeToolHistoryRecord {
-  historyId: string;
-  logicalTurnId: string;
-  scope: NativeToolHistoryScope;
-  clientProtocol: NativeToolProtocol;
-  upstreamProtocol: NativeToolProtocol;
-  anchor: HistoryAnchor;
-  round: number;
-  fullSegment: JsonValue[];
-  clientProjection: JsonValue[];
-  proxyCallIds: string[];
-  clientCallIds: string[];
-  createdAt: string;
-  expiresAt?: string;
+export type NativeToolLedgerBlock =
+  | {
+      kind: "native_tool";
+      blockIndex: number;
+      callId: string;
+      toolName: string;
+      input: JsonValue;
+    }
+  | {
+      kind: "client_tool_ref";
+      blockIndex: number;
+      callId: string;
+      toolName: string;
+    }
+  | {
+      kind: "hidden_content";
+      blockIndex: number;
+      value: JsonValue;
+    };
+
+export interface NativeToolLedgerResult {
+  callId: string;
+  value: JsonValue;
+  isError: boolean;
 }
 
-export interface NativeToolCompressionReceipt {
-  receiptId: string;
-  scope: NativeToolHistoryScope;
-  sourceRootDigest: string;
-  historyIds: string[];
-  summaryDigest?: string;
-  nextContextRoot?: string;
+/** 一次模型输出中，与 Native Tool 历史恢复有关的最少长期记录。 */
+export interface NativeToolLedgerRound {
+  ledgerId: string;
+  scope: NativeToolSessionScope;
+  contextEpoch: number;
+  turnSeq: number;
+  round: number;
+  clientProtocol: NativeToolProtocol;
+  blocks: NativeToolLedgerBlock[];
+  nativeResults: NativeToolLedgerResult[];
   createdAt: string;
-  confirmedAt?: string;
+}
+
+export interface NativeToolUserTurn {
+  turnSeq: number;
+  turnToken: string;
+  createdAt: string;
+}
+
+export interface NativeToolSessionContext {
+  currentTurnSeq: number;
+  currentEpoch: number;
+  pendingCompactEpoch: number | null;
+  compactStateError: boolean;
+}
+
+export type NativeToolContextEventType =
+  | "user_prompt"
+  | "compact_pending"
+  | "compact_completed"
+  | "compact_error";
+
+export interface NativeToolContextEvent {
+  eventId: string;
+  scope: NativeToolSessionScope;
+  type: NativeToolContextEventType;
+  turnSeq?: number;
+  turnToken?: string;
+  targetEpoch?: number;
+  trigger?: "manual" | "auto";
+  createdAt: string;
 }
 
 export interface ToolLoopLimits {
@@ -172,16 +207,10 @@ export interface UpstreamRequestSnapshot {
   logicalBaseMessages?: JsonValue[];
   /** Cumulative hidden Native calls from earlier rounds in this logical turn. */
   nativeLeakMarkers?: PersistedNativeToolLeakMarker[];
-  /** Stable digest of the client-visible logical request before Native injection. */
+  /** Stable digest used only to replay an interrupted current request. */
   requestFingerprint?: string;
-  /** Stable insertion point in the original client-visible history. */
-  historyAnchor?: HistoryAnchor;
-  /** Stable identity shared by every internal model round for one client request. */
-  logicalTurnId?: string;
   /** Original, allowlisted identity and enabled effects for durable writeback. */
   observationIntent?: PersistedToolObservationIntent;
-  /** Successful Context Compression checkpoint that covers this hidden batch. */
-  compressionCheckpoint?: { id: string; coveredAt: string };
   system?: JsonValue;
   /** OpenAI Responses top-level instructions, kept distinct from Anthropic system. */
   instructions?: JsonValue;

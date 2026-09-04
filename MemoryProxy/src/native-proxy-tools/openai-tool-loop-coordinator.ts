@@ -1,5 +1,5 @@
 import type { ToolExecutionStorageAdapter } from "../db/tool-execution-storage-adapter.js";
-import type { NativeToolHistoryStorageAdapter } from "../db/native-tool-history-storage-adapter.js";
+import type { NativeToolLedgerStorageAdapter } from "../db/native-tool-ledger-storage-adapter.js";
 import { OpenAIStreamParser } from "../injection/adapters/openai-stream.js";
 import type { ProtocolStreamEvent, UnifiedToolCall } from "../injection/adapters/interface.js";
 import type { NativeProxyToolDispatcher } from "./native-proxy-tool-dispatcher.js";
@@ -65,7 +65,7 @@ export type OpenAIToolLoopDecision =
 export interface OpenAIToolLoopCoordinatorOptions {
   registry: NativeProxyToolRegistry;
   storage: ToolExecutionStorageAdapter;
-  historyStorage?: NativeToolHistoryStorageAdapter;
+  ledgerStorage?: NativeToolLedgerStorageAdapter;
   dispatcher: Pick<NativeProxyToolDispatcher, "execute">;
   limits: NativeProxyToolsConfig;
   reenter(request: NativeReentryRequest): Promise<UpstreamRound>;

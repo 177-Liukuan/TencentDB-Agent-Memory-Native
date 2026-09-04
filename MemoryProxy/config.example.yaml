@@ -334,11 +334,10 @@ nativeProxyTools:
   stateStorage:
     backend: clickhouse
     table: native_proxy_tool_execution_state
-  historyStorage:
+  ledgerStorage:
     backend: clickhouse
-    table: native_proxy_tool_history
-    checkpointTable: native_proxy_tool_context_checkpoint
-    ttlDays: 30            # 0 = 不自动删除；未填写时继承 clickhouse.ttlDays
+    table: native_proxy_tool_ledger
+    eventTable: native_proxy_tool_context_event
 
 
 # ── Auth 鉴权（user_key 校验 → user_id 解析） ─────────────────────────────────

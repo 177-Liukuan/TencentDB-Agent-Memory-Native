@@ -6,9 +6,9 @@ import {
   InMemoryToolExecutionStorageAdapter,
 } from "../db/in-memory-tool-execution-storage-adapter.js";
 import {
-  createInMemoryNativeToolHistoryBackend,
-  InMemoryNativeToolHistoryStorageAdapter,
-} from "../db/in-memory-native-tool-history-storage-adapter.js";
+  createInMemoryNativeToolLedgerBackend,
+  InMemoryNativeToolLedgerStorageAdapter,
+} from "../db/in-memory-native-tool-ledger-storage-adapter.js";
 import { __resetInjectionPipelineForTests } from "../injection/index.js";
 import {
   __resetNativeProxyToolRuntimeForTests,
@@ -16,8 +16,8 @@ import {
   createNativeProxyToolRuntime,
   shutdownNativeProxyToolRuntime,
 } from "../native-proxy-tools/runtime.js";
-import { createHistoryAnchor } from "../native-proxy-tools/history-anchor.js";
 import { createApp } from "../server.js";
+import { createClaudeTurnMarker } from "../native-proxy-tools/turn-marker.js";
 import { __resetSessionStoreForTests, getSessionStore } from "../session/store.js";
 
 const encoder = new TextEncoder();
@@ -233,33 +233,11 @@ afterEach(async () => {
 describe("Anthropic Native Proxy Tool handler", () => {
   it("does not create compression records from summary-like text in an ordinary Messages request", async () => {
     const proxyConfig = config();
-    const historyStorage = new InMemoryNativeToolHistoryStorageAdapter();
+    const ledgerStorage = new InMemoryNativeToolLedgerStorageAdapter();
     const originalMessages = [{ role: "user", content: "What rules apply?" }];
-    await historyStorage.appendCompletedBatch({
-      historyId: "history-summary-text",
-      logicalTurnId: "turn-summary-text",
-      scope: {
-        spaceId: "space-1",
-        userId: "user-1",
-        agentSource: "claude-code",
-        sessionId: "session-1",
-      },
-      clientProtocol: "anthropic",
-      upstreamProtocol: "anthropic",
-      anchor: createHistoryAnchor(originalMessages),
-      round: 1,
-      fullSegment: [
-        { role: "assistant", content: [{ type: "tool_use", id: "native-summary-1", name: "tdai_memory_search", input: { query: "rules" } }] },
-        { role: "user", content: [{ type: "tool_result", tool_use_id: "native-summary-1", content: "project rule" }] },
-      ],
-      clientProjection: [],
-      proxyCallIds: ["native-summary-1"],
-      clientCallIds: [],
-      createdAt: "2026-09-03T00:00:00.000Z",
-    });
     const runtime = createNativeProxyToolRuntime(proxyConfig, {
       createStorage: () => new InMemoryToolExecutionStorageAdapter(),
-      createHistoryStorage: () => historyStorage,
+      createLedgerStorage: () => ledgerStorage,
     });
     await runtime.ready();
     __setNativeProxyToolRuntimeForTests(runtime);
@@ -300,12 +278,12 @@ describe("Anthropic Native Proxy Tool handler", () => {
 
     expect(response.status).toBe(200);
     expect(await response.text()).toContain("summary response");
-    await expect(historyStorage.findPendingCompressionReceipts({
+    await expect(ledgerStorage.getSessionContext({
       spaceId: "space-1",
       userId: "user-1",
       agentSource: "claude-code",
       sessionId: "session-1",
-    })).resolves.toEqual([]);
+    })).resolves.toMatchObject({ currentEpoch: 0, pendingCompactEpoch: null });
   });
 
   it("fails closed and exposes readiness when ClickHouse state storage is unavailable", async () => {
@@ -357,11 +335,11 @@ describe("Anthropic Native Proxy Tool handler", () => {
 
   it("fails closed instead of forwarding when long-term history cannot be queried", async () => {
     const proxyConfig = config();
-    const historyStorage = new InMemoryNativeToolHistoryStorageAdapter();
-    vi.spyOn(historyStorage, "findByAnchors").mockRejectedValue(new Error("secret database detail"));
+    const ledgerStorage = new InMemoryNativeToolLedgerStorageAdapter();
+    vi.spyOn(ledgerStorage, "findRounds").mockRejectedValue(new Error("secret database detail"));
     const runtime = createNativeProxyToolRuntime(proxyConfig, {
       createStorage: () => new InMemoryToolExecutionStorageAdapter(),
-      createHistoryStorage: () => historyStorage,
+      createLedgerStorage: () => ledgerStorage,
     });
     await runtime.ready();
     __setNativeProxyToolRuntimeForTests(runtime);
@@ -469,7 +447,7 @@ describe("Anthropic Native Proxy Tool handler", () => {
       userId: "user-1",
       agentSource: "claude-code",
       sessionId: "session-1",
-      contextVersion: "v1",
+      contextVersion: "epoch:0",
     })).resolves.toEqual([
       expect.objectContaining({
         observationStatus: "completed",
@@ -499,7 +477,7 @@ describe("Anthropic Native Proxy Tool handler", () => {
       userId: "user-1",
       agentSource: "claude-code",
       sessionId: "session-1",
-      contextVersion: "v1",
+      contextVersion: "epoch:0",
     })).resolves.toEqual([
       expect.objectContaining({
         observationStatus: "completed",
@@ -511,10 +489,13 @@ describe("Anthropic Native Proxy Tool handler", () => {
   it("restores a completed hidden Native call in the next Claude Code request exactly once", async () => {
     const proxyConfig = config();
     const stateBackend = createInMemoryToolExecutionBackend();
-    const historyBackend = createInMemoryNativeToolHistoryBackend();
+    const ledgerBackend = createInMemoryNativeToolLedgerBackend();
+    const ledgerStorage = new InMemoryNativeToolLedgerStorageAdapter({ backend: ledgerBackend });
+    const ledgerScope = { spaceId: "space-1", userId: "user-1", agentSource: "claude-code", sessionId: "session-1" };
+    const firstTurn = await ledgerStorage.recordUserPrompt(ledgerScope);
     let runtime = createNativeProxyToolRuntime(proxyConfig, {
       createStorage: () => new InMemoryToolExecutionStorageAdapter({ backend: stateBackend }),
-      createHistoryStorage: () => new InMemoryNativeToolHistoryStorageAdapter({ backend: historyBackend }),
+      createLedgerStorage: () => new InMemoryNativeToolLedgerStorageAdapter({ backend: ledgerBackend }),
       createDispatcher: () => ({
         execute: async () => ({ isError: false, value: { items: [{ memory: "project rule" }] } }),
       }),
@@ -558,7 +539,10 @@ describe("Anthropic Native Proxy Tool handler", () => {
         model: "claude-test",
         max_tokens: 1_024,
         stream: true,
-        messages: [{ role: "user", content: "What rules apply?" }],
+        messages: [{ role: "user", content: [
+          { type: "text", text: "What rules apply?" },
+          { type: "text", text: createClaudeTurnMarker(firstTurn.turnToken) },
+        ] }],
       }),
     });
     expect(await first.text()).toContain("first answer");
@@ -570,13 +554,14 @@ describe("Anthropic Native Proxy Tool handler", () => {
     }
     runtime = createNativeProxyToolRuntime(proxyConfig, {
       createStorage: () => new InMemoryToolExecutionStorageAdapter({ backend: stateBackend }),
-      createHistoryStorage: () => new InMemoryNativeToolHistoryStorageAdapter({ backend: historyBackend }),
+      createLedgerStorage: () => new InMemoryNativeToolLedgerStorageAdapter({ backend: ledgerBackend }),
       createDispatcher: () => ({
         execute: async () => ({ isError: false, value: { items: [{ memory: "should not execute" }] } }),
       }),
     });
     await runtime.ready();
     __setNativeProxyToolRuntimeForTests(runtime);
+    const secondTurn = await ledgerStorage.recordUserPrompt(ledgerScope);
 
     const second = await app.request("/claude-code/space-1/v1/messages", {
       method: "POST",
@@ -586,9 +571,15 @@ describe("Anthropic Native Proxy Tool handler", () => {
         max_tokens: 1_024,
         stream: true,
         messages: [
-          { role: "user", content: "What rules apply?" },
+          { role: "user", content: [
+            { type: "text", text: "What rules apply?" },
+            { type: "text", text: createClaudeTurnMarker(firstTurn.turnToken) },
+          ] },
           { role: "assistant", content: "first answer" },
-          { role: "user", content: "What about now?" },
+          { role: "user", content: [
+            { type: "text", text: "What about now?" },
+            { type: "text", text: createClaudeTurnMarker(secondTurn.turnToken) },
+          ] },
         ],
       }),
     });
@@ -603,6 +594,73 @@ describe("Anthropic Native Proxy Tool handler", () => {
     expect(serialized.match(/native-call-1/g)).toHaveLength(2);
     expect(serialized.match(/tdai_memory_search/g)).toHaveLength(1);
     expect(serialized).toContain("project rule");
+  });
+
+  it("simulates Claude Hook compaction: includes old Native history in compact input and excludes it afterwards", async () => {
+    const proxyConfig = config();
+    const runtime = createNativeProxyToolRuntime(proxyConfig, {
+      createStorage: () => new InMemoryToolExecutionStorageAdapter(),
+      createDispatcher: () => ({ execute: async () => ({ isError: false, value: { memory: "hidden rule" } }) }),
+    });
+    await runtime.ready();
+    __setNativeProxyToolRuntimeForTests(runtime);
+    await installInitializedSession();
+    const upstreamBodies: Record<string, unknown>[] = [];
+    const responses = [
+      singleConsumerSse(nativeCallFixture()).response,
+      singleConsumerSse(finalTextFixture("first answer")).response,
+      singleConsumerSse(finalTextFixture("compacted summary")).response,
+      singleConsumerSse(finalTextFixture("after compact")).response,
+    ];
+    vi.stubGlobal("fetch", vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      if (String(url) === "https://tdai.example/v3/meta/config/user/get") {
+        return new Response(JSON.stringify({ code: 0, data: { items: [] } }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      if (String(url) === "https://upstream.example/v1/messages") {
+        upstreamBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+        return responses[upstreamBodies.length - 1];
+      }
+      return new Response("not found", { status: 404 });
+    }));
+    const app = createApp(proxyConfig);
+    const headers = { "content-type": "application/json", "x-user-id": "user-1", "x-conversation-id": "session-1" };
+    const hook = async (payload: Record<string, unknown>): Promise<Response> => app.request(
+      "/claude-code/space-1/hooks/claude-code/context",
+      { method: "POST", headers, body: JSON.stringify({ session_id: "session-1", ...payload }) },
+    );
+    const turnOneBody = await (await hook({ hook_event_name: "UserPromptSubmit", prompt: "question" })).json() as Record<string, any>;
+    const markerOne = turnOneBody.hookSpecificOutput.additionalContext as string;
+    const firstMessages = [{ role: "user", content: [{ type: "text", text: "question" }, { type: "text", text: markerOne }] }];
+    const first = await app.request("/claude-code/space-1/v1/messages", {
+      method: "POST", headers,
+      body: JSON.stringify({ model: "claude-test", max_tokens: 1_024, stream: true, messages: firstMessages }),
+    });
+    expect(await first.text()).toContain("first answer");
+
+    expect((await hook({ hook_event_name: "PreCompact", trigger: "manual" })).status).toBe(204);
+    const compact = await app.request("/claude-code/space-1/v1/messages", {
+      method: "POST", headers,
+      body: JSON.stringify({ model: "claude-test", max_tokens: 1_024, stream: true, messages: [
+        ...firstMessages,
+        { role: "assistant", content: "first answer" },
+        { role: "user", content: "make concise notes" },
+      ] }),
+    });
+    expect(await compact.text()).toContain("compacted summary");
+    expect(JSON.stringify(upstreamBodies[2].messages).match(/native-call-1/g)).toHaveLength(2);
+    expect((await hook({ hook_event_name: "PostCompact", trigger: "manual" })).status).toBe(204);
+
+    const turnTwoBody = await (await hook({ hook_event_name: "UserPromptSubmit", prompt: "continue" })).json() as Record<string, any>;
+    const markerTwo = turnTwoBody.hookSpecificOutput.additionalContext as string;
+    const after = await app.request("/claude-code/space-1/v1/messages", {
+      method: "POST", headers,
+      body: JSON.stringify({ model: "claude-test", max_tokens: 1_024, stream: true, messages: [
+        { role: "user", content: "compacted summary" },
+        { role: "user", content: [{ type: "text", text: "continue" }, { type: "text", text: markerTwo }] },
+      ] }),
+    });
+    expect(await after.text()).toContain("after compact");
+    expect(JSON.stringify(upstreamBodies[3].messages)).not.toContain("native-call-1");
   });
 
   it("keeps a durable final pending when its original observation intent is missing", async () => {
@@ -677,7 +735,7 @@ describe("Anthropic Native Proxy Tool handler", () => {
       userId: "user-1",
       agentSource: "claude-code",
       sessionId: "session-1",
-      contextVersion: "v1",
+      contextVersion: "epoch:0",
     });
     expect(pendingStates).toEqual([
       expect.objectContaining({
@@ -743,7 +801,7 @@ describe("Anthropic Native Proxy Tool handler", () => {
       userId: "user-1",
       agentSource: "claude-code",
       sessionId: "session-1",
-      contextVersion: "v1",
+      contextVersion: "epoch:0",
     })).toEqual([]);
   });
 
@@ -1259,7 +1317,7 @@ describe("Anthropic Native Proxy Tool handler", () => {
       userId: "user-1",
       agentSource: "claude-code",
       sessionId: "session-1",
-      contextVersion: "v1",
+      contextVersion: "epoch:0",
     })).find((state) => state.slots.some((slot) => slot.callId === "client-call-1"));
     expect(completedParent).toMatchObject({
       clientDispatchStatus: "completed",

@@ -103,15 +103,11 @@ import {
   createResponsesToAnthropicSseTransform,
 } from "./protocol-bridge/responses-anthropic-response.js";
 import { buildClientVisibleResponsesSse } from "./native-proxy-tools/responses-response-rebuilder.js";
-import { createHistoryAnchor, createLogicalTurnId } from "./native-proxy-tools/history-anchor.js";
 import {
-  backfillActiveCompletedNativeToolHistory,
-  materializeNativeToolHistory,
-  NativeToolHistoryConflictError,
-} from "./native-proxy-tools/native-tool-history-materializer.js";
-import {
-  confirmPendingNativeToolCompressions,
-} from "./native-proxy-tools/native-tool-compression-receipt.js";
+  materializeClaudeToolLedgerHistory,
+  NativeToolLedgerConflictError,
+} from "./native-proxy-tools/tool-history-reconstructor.js";
+import { extractClaudeTurnMarkers } from "./native-proxy-tools/turn-marker.js";
 
 const SKIP_REQUEST_HEADERS = new Set([
   "host",
@@ -901,6 +897,14 @@ export async function handleAnthropicMessages(
     return c.json({ error: "Invalid JSON body" }, 400);
   }
 
+  // Hook 标记只用于定位真实用户 Turn。业务链路和上游模型都不应看到它。
+  const nativeMarkerMessages = config.nativeProxyTools.enabled && Array.isArray(body.messages)
+    ? structuredClone(body.messages) as import("./native-proxy-tools/types.js").JsonValue[]
+    : undefined;
+  if (nativeMarkerMessages) {
+    body = { ...body, messages: extractClaudeTurnMarkers(nativeMarkerMessages).messages };
+  }
+
   // ── CC request classification (feature-gated, per-agent) ─────────────────
   // 通过 agentAdapter 分类请求 —— 每个客户端有自己的规则：
   //   - claude-code: 按 cache_control marker + tools/thinking 三分
@@ -1298,6 +1302,15 @@ export async function handleAnthropicMessages(
         config,
       })
     : null;
+  let hookTurnSeq: number | undefined;
+  if (toolExecutionScope && historyRuntime?.ledgerStorage) {
+    try {
+      const sessionContext = await historyRuntime.ledgerStorage.getSessionContext(toolExecutionScope);
+      toolExecutionScope.contextVersion = `epoch:${sessionContext.currentEpoch}`;
+    } catch {
+      return nativeToolErrorResponse(503, "native_tool_history_unavailable", "Native Proxy Tool history could not be read");
+    }
+  }
 
   // Client Tool Results for a persisted mixed batch resume before mem-command,
   // injection, request preparation, or routing. A known batch must re-enter
@@ -1363,7 +1376,7 @@ export async function handleAnthropicMessages(
       body,
       scope: toolExecutionScope,
       storage: nativeStorage,
-      historyStorage: nativeToolRuntime.historyStorage ?? undefined,
+      ledgerStorage: nativeToolRuntime.ledgerStorage ?? undefined,
       dispatcher: nativeDispatcher,
       limits: config.nativeProxyTools,
       reentryLeaseMs,
@@ -1419,7 +1432,7 @@ export async function handleAnthropicMessages(
       const coordinatorOptions = {
         registry: nativeToolRuntime.registry,
         storage: nativeStorage,
-        historyStorage: nativeToolRuntime.historyStorage ?? undefined,
+        ledgerStorage: nativeToolRuntime.ledgerStorage ?? undefined,
         dispatcher: nativeDispatcher,
         limits: config.nativeProxyTools,
         reenter: exactReentry,
@@ -1888,36 +1901,23 @@ export async function handleAnthropicMessages(
     agentName: agentFromPath,
   });
 
-  if (historyRuntime?.storage && historyRuntime.historyStorage && toolExecutionScope) {
+  if (historyRuntime?.ledgerStorage && toolExecutionScope) {
     try {
-      await historyRuntime.runOperation(async () => {
-        await confirmPendingNativeToolCompressions({
-          scope: toolExecutionScope,
-          currentItems: (nativeLogicalBaseMessages ?? messages) as import("./native-proxy-tools/types.js").JsonValue[],
-          storage: historyRuntime.historyStorage!,
-        });
-        await backfillActiveCompletedNativeToolHistory({
-          scope: toolExecutionScope,
-          stateStorage: historyRuntime.storage!,
-          historyStorage: historyRuntime.historyStorage!,
-        });
-        const restored = await materializeNativeToolHistory({
-          protocol: "anthropic",
-          items: messages as import("./native-proxy-tools/types.js").JsonValue[],
-          anchorItems: (nativeLogicalBaseMessages ?? messages) as import("./native-proxy-tools/types.js").JsonValue[],
-          scope: toolExecutionScope,
-          storage: historyRuntime.historyStorage!,
-        });
-        if (restored.historyIds.length > 0) {
-          messages = restored.items;
-          body = { ...body, messages: restored.items };
-        }
-      });
+      const restored = await historyRuntime.runOperation(() => materializeClaudeToolLedgerHistory({
+        messages: messages as import("./native-proxy-tools/types.js").JsonValue[],
+        markerMessages: nativeMarkerMessages,
+        scope: toolExecutionScope,
+        storage: historyRuntime.ledgerStorage!,
+      }));
+      hookTurnSeq = restored.turnSeq;
+      toolExecutionScope.contextVersion = `epoch:${restored.currentEpoch}`;
+      messages = restored.messages;
+      body = { ...body, messages: restored.messages };
     } catch (error) {
       return nativeToolErrorResponse(
-        error instanceof NativeToolHistoryConflictError ? 409 : 503,
-        error instanceof NativeToolHistoryConflictError ? "native_tool_history_conflict" : "native_tool_history_unavailable",
-        error instanceof NativeToolHistoryConflictError
+        error instanceof NativeToolLedgerConflictError ? 409 : 503,
+        error instanceof NativeToolLedgerConflictError ? "native_tool_history_conflict" : "native_tool_history_unavailable",
+        error instanceof NativeToolLedgerConflictError
           ? error.message
           : "Native Proxy Tool history could not be restored",
       );
@@ -1950,7 +1950,9 @@ export async function handleAnthropicMessages(
   // Prefer the extension's monotonic per-session turnSeq (survives context
   // compaction); fall back to the stateless count when it's not tracked
   // (extension disabled/unavailable, or no-tools auxiliary request).
-  const turnSeq = target.turnSeq > 0 ? target.turnSeq : countHumanTurns(messages, "anthropic");
+  const turnSeq = hookTurnSeq && hookTurnSeq > 0
+    ? hookTurnSeq
+    : target.turnSeq > 0 ? target.turnSeq : countHumanTurns(messages, "anthropic");
   const lf: LangfuseTurnContext = {
     traceId: langfuseTurnTraceId(sessionKey, turnSeq),
     turnSeq,
@@ -2259,7 +2261,6 @@ export async function handleAnthropicMessages(
       let upstreamSnapshot;
       try {
         const logicalMessages = nativeLogicalBaseMessages ?? messages;
-        const historyAnchor = createHistoryAnchor(logicalMessages);
         upstreamSnapshot = buildUpstreamRequestSnapshot({
           protocol: usesResponsesUpstream ? "responses" : "anthropic",
           clientProtocol: "anthropic",
@@ -2270,13 +2271,6 @@ export async function handleAnthropicMessages(
             ? { requestFingerprint: nativeLogicalRequestFingerprint }
             : {}),
           logicalBaseMessages: logicalMessages,
-          historyAnchor,
-          logicalTurnId: createLogicalTurnId({
-            scope: toolExecutionScope,
-            clientProtocol: "anthropic",
-            anchor: historyAnchor,
-            requestFingerprint: nativeLogicalRequestFingerprint ?? historyAnchor.prefixDigest,
-          }),
           observationIntent: buildPersistedToolObservationIntent({
             config,
             scope: toolExecutionScope,
@@ -2316,7 +2310,7 @@ export async function handleAnthropicMessages(
       const coordinatorOptions = {
         registry: nativeToolRuntime.registry,
         storage: nativeToolRuntime.storage,
-        historyStorage: nativeToolRuntime.historyStorage ?? undefined,
+        ledgerStorage: nativeToolRuntime.ledgerStorage ?? undefined,
         dispatcher: nativeToolRuntime.dispatcher,
         limits: config.nativeProxyTools,
         reenter,

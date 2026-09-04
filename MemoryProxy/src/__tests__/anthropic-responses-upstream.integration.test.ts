@@ -10,6 +10,7 @@ import {
   shutdownNativeProxyToolRuntime,
 } from "../native-proxy-tools/runtime.js";
 import { createApp } from "../server.js";
+import { createClaudeTurnMarker } from "../native-proxy-tools/turn-marker.js";
 import { __resetSessionStoreForTests, getSessionStore } from "../session/store.js";
 
 function event(type: string, value: Record<string, unknown>): string {
@@ -318,6 +319,8 @@ describe("Claude Code Anthropic client with a Responses upstream", () => {
     });
     await runtime.ready();
     __setNativeProxyToolRuntimeForTests(runtime);
+    const ledgerScope = { spaceId: "space-1", userId: "user-1", agentSource: "claude-code", sessionId: "native-session-1" };
+    const firstTurn = await runtime.ledgerStorage!.recordUserPrompt(ledgerScope);
     await getSessionStore().set("claude-code:native-session-1", {
       status: "initialized",
       keyId: "native-session-1",
@@ -363,7 +366,10 @@ describe("Claude Code Anthropic client with a Responses upstream", () => {
         model: "deepseek-v4-flash",
         stream: true,
         max_tokens: 1024,
-        messages: [{ role: "user", content: "What project rules apply?" }],
+        messages: [{ role: "user", content: [
+          { type: "text", text: "What project rules apply?" },
+          { type: "text", text: createClaudeTurnMarker(firstTurn.turnToken) },
+        ] }],
       }),
     });
     const visible = await response.text();
@@ -383,6 +389,7 @@ describe("Claude Code Anthropic client with a Responses upstream", () => {
     expect(visible).not.toContain("call_native");
     expect(visible).not.toContain("always run tests");
 
+    const secondTurn = await runtime.ledgerStorage!.recordUserPrompt(ledgerScope);
     const followUp = await createApp(proxyConfig).request("/claude-code/space-1/v1/messages", {
       method: "POST",
       headers: {
@@ -396,9 +403,15 @@ describe("Claude Code Anthropic client with a Responses upstream", () => {
         stream: true,
         max_tokens: 1024,
         messages: [
-          { role: "user", content: "What project rules apply?" },
+          { role: "user", content: [
+            { type: "text", text: "What project rules apply?" },
+            { type: "text", text: createClaudeTurnMarker(firstTurn.turnToken) },
+          ] },
           { role: "assistant", content: "hello from Responses" },
-          { role: "user", content: "Repeat the conclusion" },
+          { role: "user", content: [
+            { type: "text", text: "Repeat the conclusion" },
+            { type: "text", text: createClaudeTurnMarker(secondTurn.turnToken) },
+          ] },
         ],
       }),
     });

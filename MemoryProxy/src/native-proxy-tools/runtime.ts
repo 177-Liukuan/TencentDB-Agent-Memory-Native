@@ -1,9 +1,9 @@
 import { createHash } from "node:crypto";
 
 import { ClickHouseToolExecutionStorageAdapter } from "../db/clickhouse-tool-execution-storage-adapter.js";
-import { ClickHouseNativeToolHistoryStorageAdapter } from "../db/clickhouse-native-tool-history-storage-adapter.js";
-import { InMemoryNativeToolHistoryStorageAdapter } from "../db/in-memory-native-tool-history-storage-adapter.js";
-import type { NativeToolHistoryStorageAdapter } from "../db/native-tool-history-storage-adapter.js";
+import { ClickHouseNativeToolLedgerStorageAdapter } from "../db/clickhouse-native-tool-ledger-storage-adapter.js";
+import { InMemoryNativeToolLedgerStorageAdapter } from "../db/in-memory-native-tool-ledger-storage-adapter.js";
+import type { NativeToolLedgerStorageAdapter } from "../db/native-tool-ledger-storage-adapter.js";
 import type { ToolExecutionStorageAdapter } from "../db/tool-execution-storage-adapter.js";
 import type { UnifiedToolCall } from "../injection/adapters/interface.js";
 import type { ProxyConfig } from "../types.js";
@@ -40,7 +40,7 @@ export interface NativeProxyToolRuntime {
   enabled: boolean;
   registry: NativeProxyToolRegistry;
   storage: ToolExecutionStorageAdapter | null;
-  historyStorage: NativeToolHistoryStorageAdapter | null;
+  ledgerStorage: NativeToolLedgerStorageAdapter | null;
   dispatcher: NativeProxyToolExecutor | null;
   ready(): Promise<void>;
   readiness(): NativeProxyToolRuntimeReadiness;
@@ -59,7 +59,7 @@ export interface NativeProxyToolRuntime {
 
 export interface NativeProxyToolRuntimeDependencies {
   createStorage?(config: ProxyConfig): ToolExecutionStorageAdapter;
-  createHistoryStorage?(config: ProxyConfig): NativeToolHistoryStorageAdapter;
+  createLedgerStorage?(config: ProxyConfig): NativeToolLedgerStorageAdapter;
   createRegistry?(): NativeProxyToolRegistry;
   createDispatcher?(input: {
     config: ProxyConfig;
@@ -118,7 +118,7 @@ export function createNativeProxyToolRuntime(
       enabled: false,
       registry,
       storage: null,
-      historyStorage: null,
+      ledgerStorage: null,
       dispatcher: null,
       ready: async () => {},
       readiness: () => ({ ready: true, failed: false }),
@@ -133,10 +133,10 @@ export function createNativeProxyToolRuntime(
 
   const storage = dependencies.createStorage?.(config)
     ?? new ClickHouseToolExecutionStorageAdapter(config);
-  const historyStorage = dependencies.createHistoryStorage?.(config)
+  const ledgerStorage = dependencies.createLedgerStorage?.(config)
     ?? (dependencies.createStorage
-      ? new InMemoryNativeToolHistoryStorageAdapter()
-      : new ClickHouseNativeToolHistoryStorageAdapter(config));
+      ? new InMemoryNativeToolLedgerStorageAdapter()
+      : new ClickHouseNativeToolLedgerStorageAdapter(config));
   const baseDispatcher = dependencies.createDispatcher?.({ config, registry })
     ?? new NativeProxyToolDispatcher({ config, registry });
   const pendingExecutions = new Set<Promise<NativeToolResult>>();
@@ -176,7 +176,7 @@ export function createNativeProxyToolRuntime(
     if (!initialization) {
       const probe = Promise.all([
         storage.initializeAndProbe(),
-        historyStorage.initializeAndProbe(),
+        ledgerStorage.initializeAndProbe(),
       ]).then(
         () => {
           initialized = true;
@@ -232,7 +232,7 @@ export function createNativeProxyToolRuntime(
       }
       retainedTargets.clear();
       closed = true;
-      await Promise.all([storage.close(), historyStorage.close()]);
+      await Promise.all([storage.close(), ledgerStorage.close()]);
     })();
     return closing;
   };
@@ -241,7 +241,7 @@ export function createNativeProxyToolRuntime(
     enabled: true,
     registry,
     storage,
-    historyStorage,
+    ledgerStorage,
     dispatcher,
     ready,
     readiness: () => ({

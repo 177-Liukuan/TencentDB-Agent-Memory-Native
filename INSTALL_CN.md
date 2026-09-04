@@ -144,6 +144,17 @@ export ANTHROPIC_AUTH_TOKEN="<第 1.5 步建的业务用户的 sk-mem-...>"
 claude --model <PROXY_UPSTREAM_MODEL 里配的上游模型>
 ```
 
+如果启用了 Native Proxy Tool，请先用安装脚本写入 Claude Code 配置：
+
+```bash
+# 配置代理地址、访问令牌，并自动安装 UserPromptSubmit、PreCompact、PostCompact 三个 HTTP Hook
+bash MemoryProxy/scripts/setup-claude-code.sh \
+  --endpoint http://127.0.0.1:8096/claude-code/default \
+  --token "<业务用户的 sk-mem-...>"
+```
+
+三个 Hook 分别告诉 MemoryProxy“用户提交了新问题”“准备压缩上下文”和“压缩已经完成”。这样，Claude Code 看不到的 Native Tool 调用与结果会在请求模型前补回；生成压缩摘要时也使用同一套补全逻辑。脚本会保留已有的其他 Hook，重复执行不会重复添加。
+
 - `ANTHROPIC_BASE_URL` 把 CC 的 API 从 anthropic.com 改指到本机 proxy；
   路径里的 `default` 是 memory 实例 ID（`x-tdai-service-id`），我们的
   本地部署固定叫 `default`

@@ -15,6 +15,7 @@ import { hasAnalyseMarker, hasCostGuardMarker } from "./routes/whitelist.js";
 import { tryActivateStorage, tryActivateRedis } from "./injection/index.js";
 import { getEffectiveBackend } from "./storage/factory.js";
 import { getNativeProxyToolRuntime } from "./native-proxy-tools/runtime.js";
+import { handleClaudeContextHook } from "./routes/claude-context-hook.js";
 import type { ProxyConfig } from "./types.js";
 
 export function createApp(config: ProxyConfig): Hono {
@@ -141,6 +142,9 @@ export function createApp(config: ProxyConfig): Hono {
   // Native dispatcher. It is not exposed through model-facing prompt text.
   const memoryBridgeHandler = createMemoryBridgeHandler(config);
   app.post("/memory-bridge/*", (c) => memoryBridgeHandler(c));
+
+  // Claude Code 三个生命周期 Hook 共用一个入口，必须早于 agent 通配路由。
+  app.post("/claude-code/:spaceId/hooks/claude-code/context", (c) => handleClaudeContextHook(c, config));
 
   // ── Ops endpoint（在 catch-all `POST /*` 之前注册） ───────────────────────
   // /v3/instance/proxy-destroy — shark 销毁实例时清理 proxy 侧 COS 缓存 +

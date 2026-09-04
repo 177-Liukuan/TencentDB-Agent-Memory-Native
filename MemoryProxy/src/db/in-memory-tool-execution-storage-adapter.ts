@@ -15,7 +15,6 @@ import {
   serializeToolExecutionStateKey,
   validateToolExecutionContext,
   type ClientDispatchCas,
-  type CompressionCheckpointCas,
   type ReentryClaim,
   type ReentryCompletion,
   type ReentryRenewal,
@@ -269,19 +268,6 @@ export class InMemoryToolExecutionStorageAdapter implements ToolExecutionStorage
         || current.observationLeaseOwner !== completion.leaseOwner
       ) return null;
       current.observationStatus = "completed";
-      return current;
-    });
-  }
-
-  async compareAndSetCompressionCheckpoint(checkpoint: CompressionCheckpointCas): Promise<boolean> {
-    if (!checkpoint.checkpointId || !Number.isFinite(Date.parse(checkpoint.coveredAt))) return false;
-    return this.mutate(checkpoint.key, checkpoint.expectedRevision, (current) => {
-      if (current.responseStreamStatus !== "completed") return null;
-      if (current.upstreamSnapshot.compressionCheckpoint) return null;
-      current.upstreamSnapshot.compressionCheckpoint = {
-        id: checkpoint.checkpointId,
-        coveredAt: checkpoint.coveredAt,
-      };
       return current;
     });
   }

@@ -80,11 +80,10 @@ describe("Native Proxy Tool configuration", () => {
         backend: "clickhouse",
         table: "native_proxy_tool_execution_state",
       },
-      historyStorage: {
+      ledgerStorage: {
         backend: "clickhouse",
-        table: "native_proxy_tool_history",
-        checkpointTable: "native_proxy_tool_context_checkpoint",
-        ttlDays: 30,
+        table: "native_proxy_tool_ledger",
+        eventTable: "native_proxy_tool_context_event",
       },
     });
   });
@@ -109,11 +108,10 @@ describe("Native Proxy Tool configuration", () => {
           backend: "clickhouse",
           table: "tool_state_v1",
         },
-        historyStorage: {
+        ledgerStorage: {
           backend: "clickhouse",
           table: "tool_history_v1",
-          checkpointTable: "tool_checkpoint_v1",
-          ttlDays: 45,
+          eventTable: "tool_event_v1",
         },
       },
     });
@@ -130,11 +128,10 @@ describe("Native Proxy Tool configuration", () => {
         backend: "clickhouse",
         table: "tool_state_v1",
       },
-      historyStorage: {
+      ledgerStorage: {
         backend: "clickhouse",
         table: "tool_history_v1",
-        checkpointTable: "tool_checkpoint_v1",
-        ttlDays: 45,
+        eventTable: "tool_event_v1",
       },
     });
     expect(config.clickhouse).toMatchObject({
@@ -184,21 +181,20 @@ describe("Native Proxy Tool configuration", () => {
     })).toThrow(/nativeProxyTools\.stateStorage\.backend/);
   });
 
-  it("inherits the ClickHouse TTL only when history TTL is omitted", () => {
-    expect(buildConfigWithYaml({ clickhouse: { ttlDays: 12 } }).nativeProxyTools.historyStorage.ttlDays)
-      .toBe(12);
-    expect(buildConfigWithYaml({
-      clickhouse: { ttlDays: 12 },
-      nativeProxyTools: { historyStorage: { ttlDays: 0 } },
-    }).nativeProxyTools.historyStorage.ttlDays).toBe(0);
+  it("uses dedicated append-only ledger tables", () => {
+    expect(buildConfigWithYaml({}).nativeProxyTools.ledgerStorage).toEqual({
+      backend: "clickhouse",
+      table: "native_proxy_tool_ledger",
+      eventTable: "native_proxy_tool_context_event",
+    });
   });
 
   it.each(["bad-name", "db.table", "1history"])(
     "rejects unsafe history table identifier %s",
     (table) => {
       expect(() => buildConfigWithYaml({
-        nativeProxyTools: { historyStorage: { table } },
-      })).toThrow(/nativeProxyTools\.historyStorage\.table/);
+        nativeProxyTools: { ledgerStorage: { table } },
+      })).toThrow(/nativeProxyTools\.ledgerStorage\.table/);
     },
   );
 });
