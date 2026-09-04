@@ -110,16 +110,16 @@ describe("NativeProxyToolDispatcher", () => {
     } as any);
 
     const result = await dispatcher.execute(
-      proxyCall("skill_view", { skill_id: "skl-1" }, "skill-call-1"),
+      proxyCall("skill_view", { skill_name: "browser-use" }, "skill-call-1"),
       trustedContext(),
     );
 
     expect(memory).not.toHaveBeenCalled();
     expect(skill).toHaveBeenCalledWith(expect.objectContaining({
       callId: "skill-call-1",
-      definition: expect.objectContaining({ backend: "skill", route: "get" }),
+      definition: expect.objectContaining({ backend: "skill", route: "get-by-name" }),
       body: {
-        skill_id: "skl-1",
+        skill_name: "browser-use",
         include_content: true,
         include_manifest: true,
       },

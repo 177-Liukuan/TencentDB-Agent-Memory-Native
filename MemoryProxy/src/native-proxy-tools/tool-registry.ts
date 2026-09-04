@@ -306,7 +306,7 @@ const TOOLS: readonly NativeProxyToolDefinition[] = Object.freeze([
   }),
   definition({
     name: "skill_search",
-    description: "按关键词查找当前用户有权访问的团队云端 Skill，返回候选项及 skill_id；找到目标后使用 skill_view 读取正文。",
+    description: "按关键词查找当前用户有权访问的团队云端 Skill，返回候选项及 Skill 名称；找到目标后使用 skill_view 读取正文。",
     inputSchema: objectSchema({ query: stringProperty("Skill 关键词") }, ["query"]),
     backend: "skill", effect: "read", route: "search", exposure: "skill-read",
     validate: (input) => validate(input, ["query"], (record) => {
@@ -316,12 +316,12 @@ const TOOLS: readonly NativeProxyToolDefinition[] = Object.freeze([
   }),
   definition({
     name: "skill_view",
-    description: "按 skill_id 读取完整 SKILL.md 和资源目录；准备采用某个 Skill 前先读取其正文，需要资源文件时再使用 skill_files_read。",
-    inputSchema: objectSchema({ skill_id: stringProperty("Skill 标识") }, ["skill_id"]),
-    backend: "skill", effect: "read", route: "get", exposure: "skill-read",
-    validate: (input) => validate(input, ["skill_id"], (record) => {
-      const id = stringValue(record, "skill_id", { required: true });
-      return id.ok ? success([["skill_id", id.value], ["include_content", true], ["include_manifest", true]]) : id;
+    description: "按 skill_name 读取完整 SKILL.md 和资源目录；准备采用某个 Skill 前先读取其正文，需要资源文件时再使用 skill_files_read。",
+    inputSchema: objectSchema({ skill_name: stringProperty("Skill 名称", 64) }, ["skill_name"]),
+    backend: "skill", effect: "read", route: "get-by-name", exposure: "skill-read",
+    validate: (input) => validate(input, ["skill_name"], (record) => {
+      const name = stringValue(record, "skill_name", { required: true, max: 64 });
+      return name.ok ? success([["skill_name", name.value], ["include_content", true], ["include_manifest", true]]) : name;
     }),
   }),
   definition({
