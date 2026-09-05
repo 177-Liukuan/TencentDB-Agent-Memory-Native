@@ -44,6 +44,9 @@ const stringProperty = (description: string, maxLength = 2_000): Record<string, 
   type: "string", minLength: 1, maxLength, description,
 });
 
+const SKILL_NAME_PATTERN = "^[a-z0-9][a-z0-9-]*$";
+const SKILL_NAME_REGEX = /^[a-z0-9][a-z0-9-]*$/;
+
 const integerProperty = (minimum: number, maximum: number, defaultValue?: number): Record<string, unknown> => ({
   type: "integer", minimum, maximum,
   ...(defaultValue === undefined ? {} : { default: defaultValue }),
@@ -169,7 +172,7 @@ function idValidator(input: unknown): NativeToolValidationResult {
 function validateResource(value: unknown): { ok: true; value: Record<string, JsonValue> } | { ok: false; message: string } {
   const object = strictObject(value, ["path", "content", "encoding", "mime_type", "is_executable"]);
   if (!object.ok) return object;
-  const path = stringValue(object.value, "path", { required: true, max: 1_024 });
+  const path = stringValue(object.value, "path", { required: true, max: 512 });
   if (!path.ok) return path;
   const content = stringValue(object.value, "content", { required: true, max: 1_048_576, allowEmpty: true });
   if (!content.ok) return content;
@@ -211,8 +214,8 @@ function pathArray(input: InputRecord): { ok: true; value: JsonValue[] } | { ok:
   }
   const result: string[] = [];
   for (const value of raw) {
-    if (typeof value !== "string" || value.trim().length === 0 || value.trim().length > 1_024) {
-      return { ok: false, message: "paths must contain non-empty strings no longer than 1024 characters" };
+    if (typeof value !== "string" || value.trim().length === 0 || value.trim().length > 512) {
+      return { ok: false, message: "paths must contain non-empty strings no longer than 512 characters" };
     }
     result.push(value.trim());
   }
@@ -224,7 +227,7 @@ function definition(value: Omit<NativeProxyToolDefinition, "owner">): NativeProx
 }
 
 const resourceSchema = objectSchema({
-  path: stringProperty("Skill 资源中的相对路径", 1_024),
+  path: stringProperty("Skill 资源中的相对路径", 512),
   content: { type: "string", maxLength: 1_048_576 },
   encoding: { type: "string", enum: ["utf-8", "base64"], default: "utf-8" },
   mime_type: { type: "string", maxLength: 128 },
@@ -236,7 +239,7 @@ const resourceSchema = objectSchema({
 const TOOLS: readonly NativeProxyToolDefinition[] = Object.freeze([
   definition({
     name: "tdai_memory_search",
-    description: "语义搜索 L1 已提炼的长期记忆，适合查询用户偏好、身份、规则和历史结论；需要具体消息原文、引用或时间线时使用 tdai_conversation_search。",
+    description: "按关键词和语义搜索 L1 已提炼的长期记忆，适合查询用户偏好、身份、规则和历史结论。默认同时搜索当前 Agent 的自有记忆和已授权借入记忆，结果中的 source_agent_* 标明来源；需要具体消息原文、引用或时间线时使用 tdai_conversation_search。",
     inputSchema: objectSchema({ query: stringProperty("检索问题或关键词"), limit: integerProperty(1, 20, 5) }, ["query"]),
     backend: "memory", effect: "read", route: "atomic/search", exposure: "memory", validate: queryValidator,
   }),
@@ -286,7 +289,7 @@ const TOOLS: readonly NativeProxyToolDefinition[] = Object.freeze([
   }),
   definition({
     name: "tdai_scenario_ls",
-    description: "列出 L2 场景路径和摘要索引，不读取完整正文；确定目标路径后使用 tdai_read_scene 读取正文。",
+    description: "列出 L2 场景路径和摘要索引，不读取完整正文。System 中通常已经注入场景索引，仅在需要刷新或按 path_prefix 筛选时调用；确定目标路径后使用 tdai_read_scene 读取正文。",
     inputSchema: objectSchema({ path_prefix: { type: "string", maxLength: 1_024 } }),
     backend: "memory", effect: "read", route: "scenario/ls", exposure: "memory",
     validate: (input) => validate(input, ["path_prefix"], (record) => {
@@ -296,17 +299,25 @@ const TOOLS: readonly NativeProxyToolDefinition[] = Object.freeze([
   }),
   definition({
     name: "tdai_read_scene",
-    description: "读取从已注入的场景索引或 tdai_scenario_ls 结果中取得的 L2 场景路径全文；不要凭空构造 path。",
-    inputSchema: objectSchema({ path: stringProperty("场景路径", 1_024) }, ["path"]),
+    description: "读取从已注入的场景索引或 tdai_scenario_ls 结果中取得的 L2 场景路径全文；不要凭空构造 path。读取 imported_from 分段中的借入场景时，同时传入该分段列出的 agent_id。",
+    inputSchema: objectSchema({
+      path: stringProperty("场景路径", 1_024),
+      // L2 内容按 Agent 保存；借入场景需要把目录里的来源标识交给 Bridge 选择已授权数据源。
+      agent_id: stringProperty("借入场景所属的 Agent 标识", 256),
+    }, ["path"]),
     backend: "memory", effect: "read", route: "scenario/read", exposure: "memory",
-    validate: (input) => validate(input, ["path"], (record) => {
+    validate: (input) => validate(input, ["path", "agent_id"], (record) => {
       const path = stringValue(record, "path", { required: true, max: 1_024 });
-      return path.ok ? success([["path", path.value]]) : path;
+      if (!path.ok) return path;
+      const agentId = stringValue(record, "agent_id", { max: 256 });
+      return agentId.ok
+        ? success([["path", path.value], ["agent_id", agentId.value]])
+        : agentId;
     }),
   }),
   definition({
     name: "skill_search",
-    description: "按关键词查找当前用户有权访问的团队云端 Skill，返回候选项及 Skill 名称；找到目标后使用 skill_view 读取正文。",
+    description: "按关键词和语义检索当前用户有权访问的团队云端 Skill，不返回无权访问的私有 Skill。query 建议使用 2～5 个相关关键词；结果不理想时更换关键词重试，不要添加 Schema 中未定义的字段。搜索结果包含 Skill 名称；找到目标后使用 skill_view 读取完整正文和资源目录。",
     inputSchema: objectSchema({ query: stringProperty("Skill 关键词") }, ["query"]),
     backend: "skill", effect: "read", route: "search", exposure: "skill-read",
     validate: (input) => validate(input, ["query"], (record) => {
@@ -316,7 +327,7 @@ const TOOLS: readonly NativeProxyToolDefinition[] = Object.freeze([
   }),
   definition({
     name: "skill_view",
-    description: "按 skill_name 读取完整 SKILL.md 和资源目录；准备采用某个 Skill 前先读取其正文，需要资源文件时再使用 skill_files_read。",
+    description: "按 skill_name 读取完整 SKILL.md 和资源目录。skill_name 应来自已注入的 Skill 列表或 skill_search 结果；需要读取资源文件时，先从返回的目录取得 skill_id 和文件路径，再调用 skill_files_read。",
     inputSchema: objectSchema({ skill_name: stringProperty("Skill 名称", 64) }, ["skill_name"]),
     backend: "skill", effect: "read", route: "get-by-name", exposure: "skill-read",
     validate: (input) => validate(input, ["skill_name"], (record) => {
@@ -326,7 +337,7 @@ const TOOLS: readonly NativeProxyToolDefinition[] = Object.freeze([
   }),
   definition({
     name: "skill_files_read",
-    description: "读取 skill_view 资源目录中的单个文件；skill_id 和路径必须来自已经查看的 Skill，内容受结果大小限制。",
+    description: "读取某个 Skill 资源目录中的单个文件。skill_id 和 path 必须来自 skill_view 返回的资源目录。",
     inputSchema: objectSchema({ skill_id: stringProperty("Skill 标识"), path: stringProperty("资源相对路径", 1_024), encoding: { type: "string", enum: ["utf-8", "base64"], default: "utf-8" } }, ["skill_id", "path"]),
     backend: "skill", effect: "read", route: "files/read", exposure: "skill-read",
     validate: (input) => validate(input, ["skill_id", "path", "encoding"], (record) => {
@@ -338,7 +349,7 @@ const TOOLS: readonly NativeProxyToolDefinition[] = Object.freeze([
   }),
   definition({
     name: "skill_extract",
-    description: "归档当前会话并异步触发一次 Skill 抽取；仅在已经形成完整且值得复用的流程时使用。",
+    description: "归档当前会话并异步触发一次 Skill 提取，适合在用户已经完成一套完整且值得复用的流程时使用。可以通过可选的 reason 简要说明该流程值得提取的原因。",
     inputSchema: objectSchema({ reason: { type: "string", maxLength: 2_000 } }),
     backend: "skill", effect: "archive", route: "extract", exposure: "skill-read",
     validate: (input) => validate(input, ["reason"], (record) => {
@@ -348,11 +359,18 @@ const TOOLS: readonly NativeProxyToolDefinition[] = Object.freeze([
   }),
   definition({
     name: "skill_create",
-    description: "为当前 Agent 创建新的云端 Skill；修改已有 Skill 应使用 skill_update 或 skill_patch。",
-    inputSchema: objectSchema({ name: stringProperty("Skill 名称", 64), content: stringProperty("完整 SKILL.md", 262_144), resources: { type: "array", maxItems: 64, items: resourceSchema } }, ["name", "content"]),
+    description: "为当前 Agent 创建新的云端 Skill。content 必须是包含 frontmatter 的完整 SKILL.md，且 frontmatter.name 与 name 相同；可通过 resources 同时创建资源文件。修改已有 Skill 应使用 skill_update 或 skill_patch。",
+    inputSchema: objectSchema({
+      name: { ...stringProperty("Skill 名称，仅使用小写字母、数字和连字符", 64), pattern: SKILL_NAME_PATTERN },
+      content: stringProperty("完整 SKILL.md", 262_144),
+      resources: { type: "array", maxItems: 64, items: resourceSchema },
+    }, ["name", "content"]),
     backend: "skill", effect: "write", route: "create", exposure: "skill-write",
     validate: (input) => validate(input, ["name", "content", "resources"], (record) => {
       const name = stringValue(record, "name", { required: true, max: 64 }); if (!name.ok) return name;
+      if (!SKILL_NAME_REGEX.test(name.value!)) {
+        return { ok: false, message: "name must contain only lowercase letters, digits, and hyphens" };
+      }
       const content = stringValue(record, "content", { required: true, max: 262_144 }); if (!content.ok) return content;
       const resources = resourceArray(record, "resources", false); if (!resources.ok) return resources;
       return success([["name", name.value], ["content", content.value], ["resources", resources.value]]);
@@ -360,7 +378,7 @@ const TOOLS: readonly NativeProxyToolDefinition[] = Object.freeze([
   }),
   definition({
     name: "skill_update",
-    description: "用完整内容替换已有 Skill 的 SKILL.md，适合整体改写；小范围修改优先使用 skill_patch，版本锁由 Proxy 自动补充。",
+    description: "用完整内容替换已有 Skill 的 SKILL.md，并生成新版本，适合整体改写。content 必须是完整 SKILL.md，且不能更改 frontmatter.name；小范围修改优先使用 skill_patch。",
     inputSchema: objectSchema({ skill_id: stringProperty("Skill 标识"), content: stringProperty("新的完整 SKILL.md", 262_144) }, ["skill_id", "content"]),
     backend: "skill", effect: "write", route: "update", exposure: "skill-write",
     validate: (input) => validate(input, ["skill_id", "content"], (record) => {
@@ -371,7 +389,7 @@ const TOOLS: readonly NativeProxyToolDefinition[] = Object.freeze([
   }),
   definition({
     name: "skill_patch",
-    description: "通过字符串替换局部修改已有 Skill 的 SKILL.md；整体改写应使用 skill_update，版本锁由 Proxy 自动补充。",
+    description: "通过 old_string 与 new_string 的字符串替换局部修改已有 Skill 的 SKILL.md，并生成新版本。old_string 默认必须唯一匹配；确需替换全部同名片段时设置 replace_all=true。整体改写应使用 skill_update。",
     inputSchema: objectSchema({ skill_id: stringProperty("Skill 标识"), old_string: stringProperty("待替换文本", 262_144), new_string: { type: "string", maxLength: 262_144 }, replace_all: { type: "boolean", default: false } }, ["skill_id", "old_string", "new_string"]),
     backend: "skill", effect: "write", route: "patch", exposure: "skill-write",
     validate: (input) => validate(input, ["skill_id", "old_string", "new_string", "replace_all"], (record) => {
@@ -384,13 +402,13 @@ const TOOLS: readonly NativeProxyToolDefinition[] = Object.freeze([
   }),
   definition({
     name: "skill_delete",
-    description: "软删除当前 Agent 拥有的 Skill；版本锁由 Proxy 自动补充。",
+    description: "永久删除当前 Agent 拥有的 Skill，包括所有版本和资源文件；只在明确不再需要该 Skill 时使用。",
     inputSchema: objectSchema({ skill_id: stringProperty("Skill 标识") }, ["skill_id"]),
     backend: "skill", effect: "write", route: "delete", exposure: "skill-write", validate: idValidator,
   }),
   definition({
     name: "skill_files_write",
-    description: "新增或修改 Skill 资源文件；修改 SKILL.md 正文应使用 skill_update 或 skill_patch，版本锁由 Proxy 自动补充。",
+    description: "按相对路径新增或覆盖一个或多个 Skill 资源文件，并生成新版本；修改 SKILL.md 正文应使用 skill_update 或 skill_patch。",
     inputSchema: objectSchema({ skill_id: stringProperty("Skill 标识"), files: { type: "array", minItems: 1, maxItems: 64, items: resourceSchema } }, ["skill_id", "files"]),
     backend: "skill", effect: "write", route: "files/write", exposure: "skill-write",
     validate: (input) => validate(input, ["skill_id", "files"], (record) => {
@@ -401,8 +419,8 @@ const TOOLS: readonly NativeProxyToolDefinition[] = Object.freeze([
   }),
   definition({
     name: "skill_files_remove",
-    description: "删除 Skill 资源文件；修改 SKILL.md 正文应使用 skill_update 或 skill_patch，版本锁由 Proxy 自动补充。",
-    inputSchema: objectSchema({ skill_id: stringProperty("Skill 标识"), paths: { type: "array", minItems: 1, maxItems: 64, items: stringProperty("资源相对路径", 1_024) } }, ["skill_id", "paths"]),
+    description: "按相对路径删除一个或多个 Skill 资源文件；至少删除一个实际存在的文件时生成新版本。修改 SKILL.md 正文应使用 skill_update 或 skill_patch。",
+    inputSchema: objectSchema({ skill_id: stringProperty("Skill 标识"), paths: { type: "array", minItems: 1, maxItems: 64, items: stringProperty("资源相对路径", 512) } }, ["skill_id", "paths"]),
     backend: "skill", effect: "write", route: "files/remove", exposure: "skill-write",
     validate: (input) => validate(input, ["skill_id", "paths"], (record) => {
       const id = stringValue(record, "skill_id", { required: true }); if (!id.ok) return id;

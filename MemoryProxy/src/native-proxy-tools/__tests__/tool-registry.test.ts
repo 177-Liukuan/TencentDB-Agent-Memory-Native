@@ -191,22 +191,22 @@ describe("Native Proxy Tool Registry", () => {
   it("describes when to use related Native tools without transport instructions", () => {
     const registry = createDefaultNativeProxyToolRegistry();
     const expectedGuidance: Record<string, readonly string[]> = {
-      tdai_memory_search: ["L1", "tdai_conversation_search"],
+      tdai_memory_search: ["关键词和语义", "自有记忆", "已授权借入记忆", "source_agent_", "tdai_conversation_search"],
       tdai_atomic_query: ["不进行语义检索", "tdai_memory_search"],
       tdai_conversation_search: ["L0", "tdai_memory_search"],
       tdai_conversation_query: ["session_id", "tdai_conversation_search"],
-      tdai_scenario_ls: ["不读取完整正文", "tdai_read_scene"],
-      tdai_read_scene: ["tdai_scenario_ls", "全文"],
-      skill_search: ["Skill 名称", "skill_view"],
-      skill_view: ["skill_name", "SKILL.md", "skill_files_read"],
-      skill_files_read: ["skill_view", "路径"],
-      skill_extract: ["异步", "完整", "复用"],
-      skill_create: ["skill_update", "skill_patch"],
-      skill_update: ["整体", "skill_patch"],
-      skill_patch: ["局部", "skill_update"],
-      skill_delete: ["软删除"],
-      skill_files_write: ["资源文件", "skill_update"],
-      skill_files_remove: ["资源文件", "skill_update"],
+      tdai_scenario_ls: ["不读取完整正文", "已经注入", "刷新", "path_prefix", "tdai_read_scene"],
+      tdai_read_scene: ["tdai_scenario_ls", "全文", "借入场景", "agent_id"],
+      skill_search: ["关键词和语义", "有权访问", "2～5", "更换关键词", "skill_view"],
+      skill_view: ["skill_name", "Skill 列表", "skill_search", "skill_id", "路径", "skill_files_read"],
+      skill_files_read: ["skill_view", "skill_id", "path"],
+      skill_extract: ["异步", "适合", "完整", "复用", "reason"],
+      skill_create: ["当前 Agent", "frontmatter", "resources", "skill_update", "skill_patch"],
+      skill_update: ["完整", "新版本", "不能更改", "skill_patch"],
+      skill_patch: ["old_string", "唯一", "replace_all", "新版本", "skill_update"],
+      skill_delete: ["永久删除", "所有版本", "资源", "明确不再需要"],
+      skill_files_write: ["相对路径", "新版本", "skill_update", "skill_patch"],
+      skill_files_remove: ["相对路径", "新版本", "skill_update", "skill_patch"],
       tdai_knowledge_tools_list: ["Knowledge", "knowledge_id", "工具清单"],
       tdai_knowledge_tool_call: ["tools_list", "tool_name", "params"],
     };
@@ -216,6 +216,9 @@ describe("Native Proxy Tool Registry", () => {
       for (const phrase of phrases) expect(description).toContain(phrase);
       expect(description).not.toMatch(/bash|curl|https?|authorization|鉴权|请求头/i);
     }
+    expect(registry.require("skill_files_read").description).not.toContain("结果大小限制");
+    expect(registry.require("skill_extract").description).not.toContain("仅在");
+    expect(registry.require("skill_delete").description).not.toContain("软删除");
   });
 
   it.each([
@@ -276,6 +279,51 @@ describe("Native Proxy Tool Registry", () => {
       ok: true,
       value: { query: "identity", limit: 20 },
     });
+  });
+
+  it("publishes and preserves the authorized source Agent when reading an imported L2 scene", () => {
+    const tool = createDefaultNativeProxyToolRegistry().require("tdai_read_scene");
+
+    expect(tool.inputSchema).toMatchObject({
+      properties: { agent_id: { type: "string" } },
+    });
+    expect(tool.validate({ path: "project/rules", agent_id: "agent-imported" })).toEqual({
+      ok: true,
+      value: { path: "project/rules", agent_id: "agent-imported" },
+    });
+  });
+
+  it("publishes and enforces the Skill name format used by Skill Core", () => {
+    const tool = createDefaultNativeProxyToolRegistry().require("skill_create");
+
+    expect(tool.inputSchema).toMatchObject({
+      properties: {
+        name: { pattern: "^[a-z0-9][a-z0-9-]*$" },
+      },
+    });
+    expect(tool.validate({ name: "deploy-guide", content: "---\nname: deploy-guide\n---" }))
+      .toMatchObject({ ok: true });
+    expect(tool.validate({ name: "Deploy Guide", content: "---\nname: Deploy Guide\n---" }))
+      .toMatchObject({ ok: false });
+  });
+
+  it("rejects write-resource paths that Skill Core cannot accept", () => {
+    const registry = createDefaultNativeProxyToolRegistry();
+    const longPath = `files/${"a".repeat(507)}`;
+
+    expect(registry.require("skill_files_write").inputSchema).toMatchObject({
+      properties: {
+        files: { items: { properties: { path: { maxLength: 512 } } } },
+      },
+    });
+    expect(registry.require("skill_files_write").validate({
+      skill_id: "skl-1",
+      files: [{ path: longPath, content: "x" }],
+    })).toMatchObject({ ok: false });
+    expect(registry.require("skill_files_remove").validate({
+      skill_id: "skl-1",
+      paths: [longPath],
+    })).toMatchObject({ ok: false });
   });
 
   it.each([

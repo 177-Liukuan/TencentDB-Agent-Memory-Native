@@ -92,6 +92,59 @@ describe("executeSkillBridge", () => {
     expect(fetcher).not.toHaveBeenCalled();
   });
 
+  it.each([
+    ["update", { skill_id: "skl-1", content: "# Updated" }],
+    ["patch", { skill_id: "skl-1", old_string: "old", new_string: "new" }],
+    ["delete", { skill_id: "skl-1" }],
+    ["files/write", { skill_id: "skl-1", files: [{ path: "scripts/run.sh", content: "echo ok", encoding: "utf-8" }] }],
+    ["files/remove", { skill_id: "skl-1", paths: ["scripts/old.sh"] }],
+  ])("loads the current version before a first-session %s write", async (subpath, body) => {
+    await installSession();
+    const fetcher = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      const path = new URL(String(url)).pathname;
+      const outbound = JSON.parse(String(init?.body)) as Record<string, unknown>;
+
+      if (path === "/v3/skill/get") {
+        expect(outbound).toMatchObject({
+          skill_id: "skl-1",
+          user_id: "user-1",
+          team_id: "team-1",
+          agent_id: "agent-1",
+        });
+        return new Response(JSON.stringify({
+          code: 0,
+          data: { skill_id: "skl-1", version: 7 },
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+
+      expect(path).toBe(`/v3/skill/${subpath}`);
+      expect(outbound).toMatchObject({
+        ...body,
+        expected_version: 7,
+        user_id: "user-1",
+        team_id: "team-1",
+        agent_id: "agent-1",
+      });
+      return new Response(JSON.stringify({
+        code: 0,
+        data: subpath === "delete"
+          ? { skill_id: "skl-1", archived: true }
+          : { skill_id: "skl-1", version: 8 },
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    });
+
+    const result = await executeSkillBridge({
+      config: config(true),
+      subpath,
+      body,
+      sessionId: "session-1",
+      spaceId: "space-1",
+    }, { fetcher });
+
+    expect(result.status).toBe(200);
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
   it("cancels the upstream Skill request when the Native caller aborts", async () => {
     await installSession();
     const controller = new AbortController();

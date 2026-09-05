@@ -175,10 +175,11 @@ const WRITE_SUBPATHS = new Set<string>([
  *
  * Read ops: proxy injects `version` into outbound so plugin returns the pinned
  *   version's content (instead of head). Cross-tool consistency.
- * Write ops: proxy injects `expected_version` for optimistic locking. If head
- *   moved (external update), plugin returns 40901 SKILL_VERSION_STALE.
- * Delete / create / extract / search / listing / list / versions / files-download
- *   do NOT participate (soft-delete doesn't bump version; others are stateless).
+ * Write ops: proxy injects `expected_version` for optimistic locking. If the
+ *   session has not read this Skill yet, the bridge first reads the current
+ *   head version; this keeps `expected_version` out of the model-facing schema.
+ * Create / extract / search / listing / list / versions / files-download do
+ *   NOT participate. Delete needs the lock but has no new head to pin.
  */
 const READ_VERSION_OPS = new Set<string>(["get", "files/read"]);
 const WRITE_LOCK_OPS = new Set<string>([
@@ -837,22 +838,88 @@ export function createSkillBridgeHandler(
       }
 
       // ── Version pinning: inject pinned version for read/write ops ──
-      // Read (get/files_read): inject `version` → plugin returns pinned version's content
-      // Write (update/patch/files_write/files_remove): inject `expected_version` → optimistic lock
-      // First-access is not pinned yet → falls through to head; lazy-pin captures the version afterwards.
-      if (pinRepoInline && (READ_VERSION_OPS.has(sub) || WRITE_LOCK_OPS.has(sub))) {
+      // Read (get/files_read): inject `version` → plugin returns pinned version's content.
+      // Existing Skill writes never ask the model for expected_version. A session pin is
+      // preferred; on first access we read the current head before attempting the write.
+      if (pinRepoInline && READ_VERSION_OPS.has(sub)) {
         const skillId = typeof inboundBody.skill_id === "string" ? inboundBody.skill_id : undefined;
         if (skillId) {
           const pinRepo = pinRepoInline;
           const pinned = await pinRepo.getVersion(ids.space_id ?? "", ids.user_id, ids.agent_source, sessionKey, skillId);
           if (pinned !== null && pinned !== undefined) {
-            if (READ_VERSION_OPS.has(sub)) {
-              outbound.version = pinned;
-            } else {
-              outbound.expected_version = pinned;
+            outbound.version = pinned;
+          }
+          // First read without a pin intentionally walks head; the response is lazy-pinned below.
+        }
+      }
+
+      if (WRITE_LOCK_OPS.has(sub)) {
+        const skillId = typeof inboundBody.skill_id === "string" ? inboundBody.skill_id : undefined;
+        if (skillId) {
+          let expectedVersion: number | undefined;
+          if (pinRepoInline) {
+            const pinned = await pinRepoInline.getVersion(
+              ids.space_id ?? "",
+              ids.user_id,
+              ids.agent_source,
+              sessionKey,
+              skillId,
+            );
+            if (pinned !== null && pinned !== undefined) expectedVersion = pinned;
+          }
+
+          if (expectedVersion === undefined) {
+            // 未读过该 Skill 时没有会话版本记录。先取当前 head，再依靠 Core 的
+            // expected_version 检查防止“读取后、写入前”发生的并发覆盖。
+            const versionUrl = `${config.coreSkill.endpoint.replace(/\/$/, "")}/v3/skill/get`;
+            let versionResp: Response;
+            try {
+              versionResp = await fetcher(versionUrl, {
+                method: "POST",
+                headers: {
+                  "Authorization": `Bearer ${config.coreSkill.serviceToken}`,
+                  "x-tdai-service-id": ids.space_id || config.coreSkill.serviceId,
+                  "Content-Type": "application/json",
+                },
+                body: JSON.stringify({
+                  skill_id: skillId,
+                  team_id: ids.team_id,
+                  agent_id: ids.agent_id,
+                  user_id: ids.user_id,
+                  include_content: false,
+                  include_manifest: false,
+                }),
+                signal: upstreamSignal(c.req.raw),
+              });
+            } catch (err) {
+              return envelope(50301, `${TAG} failed to read current Skill version: ${(err as Error).message}`, 502);
+            }
+
+            const versionText = await versionResp.text().catch(() => "");
+            if (versionResp.status < 200 || versionResp.status >= 300) {
+              return new Response(versionText, {
+                status: versionResp.status,
+                headers: { "content-type": versionResp.headers.get("content-type") ?? "application/json" },
+              });
+            }
+            try {
+              const parsed = JSON.parse(versionText) as { code?: unknown; data?: { version?: unknown } };
+              if (parsed.code !== 0) {
+                return new Response(versionText, {
+                  status: versionResp.status,
+                  headers: { "content-type": "application/json" },
+                });
+              }
+              if (!Number.isInteger(parsed.data?.version) || (parsed.data?.version as number) < 1) {
+                return envelope(50201, `${TAG} current Skill response has no valid version`, 502);
+              }
+              expectedVersion = parsed.data!.version as number;
+            } catch {
+              return envelope(50201, `${TAG} failed to parse current Skill version`, 502);
             }
           }
-          // else: first access → walk head, response side will lazy-pin.
+
+          outbound.expected_version = expectedVersion;
         }
       }
     }
@@ -1010,8 +1077,8 @@ function filterTeamSearchResponse(respText: string, visible: Set<string>, topK: 
  * write already means "we won the optimistic lock at expected_version", the
  * new head is what subsequent reads/writes in this session should target.
  *
- * Delete does NOT lazy-pin — soft-delete doesn't advance the version, and
- * the skill is now archived (further ops will likely 404 or 40901 anyway).
+ * Delete does NOT lazy-pin — the Skill has been removed and there is no new
+ * head version for subsequent reads or writes.
  */
 async function tryLazyPin(
   sub: string,
