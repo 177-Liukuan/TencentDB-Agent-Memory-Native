@@ -1,12 +1,14 @@
 /** Config loading: YAML file → merge with CLI overrides → ProxyConfig. */
 
 import { readFileSync } from "node:fs";
+import { parseToolObservation } from "./memory/tool-observation.js";
 import { load as yamlLoad } from "js-yaml";
 import type { AgentUpstreamEntry, CostGuardConfig, ProxyConfig, RawYamlConfig } from "./types.js";
 
 const DEFAULT_UPSTREAM = "https://llm-upstream.example.com/v2/chat/completions";
 
 export const DEFAULT_CONFIG: ProxyConfig = {
+  evalToolObservation: { enabled: false, directory: "" },
   server: { host: "0.0.0.0", port: 8096, forwardTimeoutMs: 600_000 },
   upstream: { url: DEFAULT_UPSTREAM, apiKey: "", agents: {} },
   log: {
@@ -424,6 +426,7 @@ export function buildConfig(overrides: CliOverrides = {}): ProxyConfig {
       stripRequestLogContent:
         yaml.opik?.stripRequestLogContent ?? DEFAULT_CONFIG.opik.stripRequestLogContent,
     },
+    evalToolObservation: parseToolObservation(yaml.evalToolObservation),
     langfuse: {
       enabled: yaml.langfuse?.enabled ?? DEFAULT_CONFIG.langfuse.enabled,
       host: yaml.langfuse?.host ?? DEFAULT_CONFIG.langfuse.host,

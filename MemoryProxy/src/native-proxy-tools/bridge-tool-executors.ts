@@ -39,7 +39,8 @@ export function createBridgeToolExecutors(
   dependencies: BridgeToolExecutorDependencies = {},
 ): BridgeToolExecutors {
   return {
-    memory: async ({ definition, body, scope, signal }) => executeMemoryBridge({
+    memory: async ({ callId, definition, body, scope, signal }) => executeMemoryBridge({
+      callId,
       config,
       subpath: definition.route,
       body,
@@ -47,7 +48,8 @@ export function createBridgeToolExecutors(
       spaceId: scope.spaceId,
       signal,
     }, dependencies.memory ?? {}),
-    skill: async ({ definition, body, scope, signal }) => executeSkillBridge({
+    skill: async ({ callId, definition, body, scope, signal }) => executeSkillBridge({
+      callId,
       config,
       subpath: definition.route,
       body,

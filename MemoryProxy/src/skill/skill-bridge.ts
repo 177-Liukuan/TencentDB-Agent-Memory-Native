@@ -32,6 +32,7 @@ import { getProxyStorage } from "../storage/factory.js";
 import { getMetadataClient } from "../meta/client.js";
 import type { ProxyConfig } from "../types.js";
 import { emitBridgeToolCallTelemetry, agentSourceFromSessionKey } from "../memory/bridge-telemetry.js";
+import { observeToolRequest } from "../memory/tool-observation.js";
 import { getCoreSkillClient, type CoreSkillClient } from "./core-client.js";
 
 /**
@@ -364,6 +365,8 @@ export type VisibleSkillIdsResolver = (input: {
 }) => Promise<{ ids: string[] }>;
 
 export interface SkillBridgeDeps {
+  /** 仅由 Native 内部执行入口传入，不读取客户端自报的调用 ID。 */
+  observationCallId?: string;
   /** Override fetcher (tests). */
   fetcher?: typeof fetch;
   /** Override `Date.now` (tests). */
@@ -382,6 +385,7 @@ export interface SkillBridgeDeps {
 }
 
 export interface SkillBridgeExecutionInput {
+  callId?: string;
   config: ProxyConfig;
   subpath: string;
   body: Record<string, unknown>;
@@ -426,7 +430,7 @@ export async function executeSkillBridge(
       text: () => request.text(),
     },
   } as unknown as Context;
-  const response = await createSkillBridgeHandler(input.config, deps)(context);
+  const response = await createSkillBridgeHandler(input.config, { ...deps, observationCallId: input.callId })(context);
   return {
     status: response.status,
     text: await response.text().catch(() => ""),
@@ -537,6 +541,9 @@ export function createSkillBridgeHandler(
       ?? config.tdai?.serviceId
       ?? config.coreSkill?.serviceId
       ?? "";
+
+    // 每次工具请求只记录一次；不等后端返回，也不把后续元数据查询算作工具调用。
+    observeToolRequest(config, { sessionId: sessionKey, family: "skill", subpath: sub, callId: deps.observationCallId });
 
     // Backing storage for extract trigger + version pin.
     // When storage.enabled + mode!=off → ProxyStorage (Kv* repos).

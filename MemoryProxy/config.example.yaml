@@ -656,3 +656,7 @@ ccRequestRouting:
 
 # ── Per-Agent 上游路由 ─────────────────────────────────────────────────────
 # 见文件顶部 `upstream.agents` 一段。
+# 评测时开启，两组分别使用独立目录；容器部署须挂载到评测程序可读的位置。
+evalToolObservation:
+  enabled: false
+  directory: /var/lib/context-proxy/tool-observations

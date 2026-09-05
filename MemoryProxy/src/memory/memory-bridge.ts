@@ -28,6 +28,7 @@ import type { AgentContext } from "../injection/types.js";
 import { resolveFixedAssetCtxs, type FixedAssetCtx } from "../injection/injectors/tdai-fixed-asset.js";
 import type { TdaiIdentity } from "../tdai/types.js";
 import { emitBridgeToolCallTelemetry, agentSourceFromSessionKey } from "./bridge-telemetry.js";
+import { observeToolRequest } from "./tool-observation.js";
 
 const TAG = "[memory-bridge]";
 
@@ -263,6 +264,8 @@ export interface MemoryBridgeDeps {
 }
 
 export interface MemoryBridgeExecutionInput {
+  /** Native 自动重试继续使用原调用 ID，供评测去重。HTTP 调用不提供此值。 */
+  callId?: string;
   config: ProxyConfig;
   subpath: string;
   body: Record<string, unknown>;
@@ -331,6 +334,7 @@ export async function executeMemoryBridge(
     ?? input.config.tdai?.serviceId
     ?? input.config.coreSkill?.serviceId
     ?? "";
+  observeToolRequest(input.config, { sessionId: input.sessionId, family: "memory", subpath: sub, callId: input.callId });
   const loadIdentity = deps.loadSessionIdentity ?? loadDefaultSessionIdentity;
   const ids = await loadIdentity({
     config: input.config,

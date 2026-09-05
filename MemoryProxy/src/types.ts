@@ -386,6 +386,8 @@ export interface AgentUpstreamEntry {
 
 /** Top-level proxy configuration (merged from config file + CLI args). */
 export interface ProxyConfig {
+  /** 评测专用：记录到达 Bridge 的调用，默认关闭。 */
+  evalToolObservation?: { enabled: boolean; directory: string };
   server: {
     host: string; // default: "0.0.0.0"
     port: number; // default: 8096
@@ -659,6 +661,7 @@ export interface CreditPricingConfig {
 
 /** Raw YAML config file shape (all fields optional). */
 export interface RawYamlConfig {
+  evalToolObservation?: { enabled?: boolean; directory?: string };
   server?: {
     host?: string;
     port?: number;
