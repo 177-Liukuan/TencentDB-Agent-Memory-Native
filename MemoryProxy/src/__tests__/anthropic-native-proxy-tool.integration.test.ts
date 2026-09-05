@@ -129,14 +129,14 @@ function mixedCallFixture(
     + messageStop("tool_use");
 }
 
-function clientOnlyFixture(): string {
+function clientOnlyFixture(callId = "client-call-1"): string {
   return messageStart("msg-client")
     + frame("content_block_start", {
       type: "content_block_start",
       index: 0,
       content_block: {
         type: "tool_use",
-        id: "client-call-1",
+        id: callId,
         name: "client_shell",
         input: {},
       },
@@ -253,6 +253,119 @@ afterEach(async () => {
 });
 
 describe("Anthropic Native Proxy Tool handler", () => {
+  it.each([false, true])("keeps Native -> Client -> Client -> Native continuations across restart (initial mixed: %s)", async (mixed) => {
+    const proxyConfig = config();
+    const stateBackend = createInMemoryToolExecutionBackend();
+    const ledgerBackend = createInMemoryNativeToolLedgerBackend();
+    const ledgerScope = { spaceId: "space-1", userId: "user-1", agentSource: "claude-code", sessionId: "session-1" };
+    const execute = vi.fn(async () => ({ isError: false, value: { memories: ["rule"] } }));
+    const installRuntime = async () => {
+      const runtime = createNativeProxyToolRuntime(proxyConfig, {
+        createStorage: () => new InMemoryToolExecutionStorageAdapter({ backend: stateBackend }),
+        createLedgerStorage: () => new InMemoryNativeToolLedgerStorageAdapter({ backend: ledgerBackend }),
+        createDispatcher: () => ({ execute }),
+      });
+      await runtime.ready();
+      __setNativeProxyToolRuntimeForTests(runtime);
+      return runtime;
+    };
+    let runtime = await installRuntime();
+    const turn = await runtime.ledgerStorage!.recordUserPrompt(ledgerScope);
+    await installInitializedSession();
+    const bodies: Record<string, unknown>[] = [];
+    const fixtures = [
+      ...(mixed ? [mixedCallFixture()] : [nativeCallFixture(), clientOnlyFixture()]),
+      clientOnlyFixture("client-call-2"),
+      nativeCallFixture().replaceAll("native-call-1", "native-call-2"),
+      finalTextFixture(),
+    ];
+    vi.stubGlobal("fetch", vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      if (String(url) === "https://upstream.example/v1/messages") {
+        bodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+        const fixture = fixtures[bodies.length - 1];
+        if (!fixture) throw new Error("unexpected duplicate model request");
+        return singleConsumerSse(fixture).response;
+      }
+      return new Response(JSON.stringify({ code: 0, data: { items: [] } }), { status: 200 });
+    }));
+    const app = createApp(proxyConfig);
+    const headers = { "content-type": "application/json", "x-user-id": "user-1", "x-conversation-id": "session-1" };
+    const messages: Array<Record<string, unknown>> = [
+      { role: "user", content: [{ type: "text", text: "Check rules and workspace" }, { type: "text", text: createClaudeTurnMarker(turn.turnToken) }] },
+    ];
+    const request = () => app.request("/claude-code/space-1/v1/messages", {
+      method: "POST", headers,
+      body: JSON.stringify({
+        model: "claude-test", stream: true, max_tokens: 1024, system: "original system", messages,
+        tools: [{ name: "client_shell", description: "shell", input_schema: { type: "object" } }],
+      }),
+    });
+    const first = await request();
+    const firstText = await first.text();
+    expect(first.status, firstText).toBe(200);
+    expect(firstText).toContain("client-call-1");
+    expect(firstText).not.toContain("native-call");
+
+    for (const callId of ["client-call-1", "client-call-2"]) {
+      // 清掉进程内对象，仅复用已保存数据，验证恢复不依赖同一个 Coordinator 或内存请求。
+      await shutdownNativeProxyToolRuntime();
+      __resetNativeProxyToolRuntimeForTests();
+      runtime = await installRuntime();
+      messages.push(
+        { role: "assistant", content: [{ type: "tool_use", id: callId, name: "client_shell", input: { command: "pwd" } }] },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: callId, content: "/workspace" }] },
+      );
+      const response = await request();
+      const text = await response.text();
+      expect(response.status, text).toBe(200);
+      expect(text).toContain(callId === "client-call-1" ? "client-call-2" : "final answer");
+      expect(text).not.toContain("native-call");
+      expect(text).not.toContain("tdai_memory_search");
+      const requestCount = bodies.length;
+      const replay = await request();
+      expect(replay.status).toBe(200);
+      expect(await replay.text()).toBe(text);
+      expect(bodies).toHaveLength(requestCount);
+    }
+    expect(execute).toHaveBeenCalledTimes(2);
+    expect(bodies).toHaveLength(mixed ? 4 : 5);
+    const lastMessages = bodies.at(-1)!.messages as Array<{ content: unknown }>;
+    const calls = lastMessages.flatMap((message) => Array.isArray(message.content) ? message.content : [])
+      .filter((block) => block.type === "tool_use").map((block) => block.id);
+    const results = lastMessages.flatMap((message) => Array.isArray(message.content) ? message.content : [])
+      .filter((block) => block.type === "tool_result").map((block) => block.tool_use_id);
+    expect(calls).toEqual(["native-call-1", "client-call-1", "client-call-2", "native-call-2"]);
+    expect(results).toEqual(calls);
+    for (const body of bodies.slice(1)) {
+      expect(body.system).toEqual(bodies[0].system);
+      expect(body.tools).toEqual(bodies[0].tools);
+    }
+    expect(await runtime.ledgerStorage!.findRounds(ledgerScope, 0)).toHaveLength(2);
+    expect([...stateBackend.rows.values()].filter((state) => state.slots.some((slot) => slot.owner === "client")))
+      .toEqual([expect.objectContaining({ clientDispatchStatus: "completed" }), expect.objectContaining({ clientDispatchStatus: "completed" })]);
+
+    // 当前续写正确还不够：下一次真实用户请求必须仅靠长期记录还原同样的顺序。
+    await shutdownNativeProxyToolRuntime();
+    __resetNativeProxyToolRuntimeForTests();
+    stateBackend.rows.clear();
+    runtime = await installRuntime();
+    const nextTurn = await runtime.ledgerStorage!.recordUserPrompt(ledgerScope);
+    messages.push(
+      { role: "assistant", content: "final answer" },
+      { role: "user", content: [{ type: "text", text: "Next question" }, { type: "text", text: createClaudeTurnMarker(nextTurn.turnToken) }] },
+    );
+    fixtures.push(finalTextFixture("next answer"));
+    const next = await request();
+    expect(next.status, await next.clone().text()).toBe(200);
+    expect(await next.text()).toContain("next answer");
+    const restoredBlocks = (bodies.at(-1)!.messages as Array<{ content: unknown }>).flatMap((message) => Array.isArray(message.content) ? message.content : []);
+    expect(restoredBlocks.filter((block) => block.type === "tool_use").map((block) => block.id))
+      .toEqual(["native-call-1", "client-call-1", "client-call-2", "native-call-2"]);
+    expect(restoredBlocks.filter((block) => block.type === "tool_result").map((block) => block.tool_use_id))
+      .toEqual(["native-call-1", "client-call-1", "client-call-2", "native-call-2"]);
+    expect(execute).toHaveBeenCalledTimes(2);
+  });
+
   it("executes the two-step Knowledge Native Tool flow and hides both internal rounds", async () => {
     const proxyConfig = config();
     // 验证 Knowledge 可以独立开启，不依赖 Memory 工具开关碰巧把注入链路带起来。

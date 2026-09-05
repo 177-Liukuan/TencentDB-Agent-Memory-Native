@@ -617,22 +617,13 @@ export async function resumeClientToolResults(
       maxStorageAttempts,
       key,
     });
-    const reentryClaim = await claimClientReentry({
-      storage: input.storage,
-      key,
-      now,
-      createId,
-      limits: input.limits,
-      reentryLeaseMs: input.reentryLeaseMs,
-      maxStorageAttempts,
-    });
-
     const messages: JsonValue[] = [
       ...structuredClone(context.upstreamSnapshot.baseMessages),
       ...asAssistantMessages(context),
       ...asToolResultMessages(context),
     ];
-    if (input.ledgerStorage) {
+    // Native 之后可能连续出现纯客户端轮：仍恢复完整上下文，但本轮没有隐藏工具就不新增 Ledger。
+    if (input.ledgerStorage && context.slots.some((slot) => slot.owner === "proxy")) {
       try {
         // 重入前先落长期记录，确保下一次普通请求不会因短期状态过期而丢失这一轮隐藏历史。
         await input.ledgerStorage.appendRound(buildNativeToolLedgerRound(context));
@@ -644,6 +635,16 @@ export async function resumeClientToolResults(
         );
       }
     }
+    // 历史写入可按同一个 ID 重试；成功后才领取续写执行权，避免保存失败留下无实际请求的“处理中”。
+    const reentryClaim = await claimClientReentry({
+      storage: input.storage,
+      key,
+      now,
+      createId,
+      limits: input.limits,
+      reentryLeaseMs: input.reentryLeaseMs,
+      maxStorageAttempts,
+    });
     const round = context.round + 1;
     let upstreamRound: UpstreamRound;
     try {
@@ -674,6 +675,8 @@ export async function resumeClientToolResults(
       upstreamSnapshot: {
         ...structuredClone(context.upstreamSnapshot),
         baseMessages: structuredClone(messages),
+        // 本轮所有客户端结果已经收齐。后续隐藏调用应接在它们后面，不能继续沿用首次用户问题的位置。
+        previousClientToolCallId: [...clientSlots].sort((left, right) => left.slotIndex - right.slotIndex).at(-1)!.callId,
       },
       messages,
       round,

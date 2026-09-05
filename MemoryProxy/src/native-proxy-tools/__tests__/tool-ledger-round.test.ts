@@ -19,6 +19,20 @@ function context(): ToolExecutionContext {
 }
 
 describe("Native Tool ledger round", () => {
+  it.each(["anthropic", "responses"] as const)("retains the preceding Client call independently of upstream protocol (%s)", (protocol) => {
+    const value = context();
+    value.protocol = protocol;
+    value.upstreamSnapshot.protocol = protocol;
+    value.upstreamSnapshot.previousClientToolCallId = "client-before";
+    if (protocol === "responses") {
+      value.assistantSkeleton = [{ type: "function_call", call_id: "native", name: "tdai_memory_search", arguments: "{\"query\":\"q\"}" }];
+      value.slots[0]!.contentBlockIndex = 0;
+    }
+    expect(buildNativeToolLedgerRound(value)).toMatchObject({ previousClientToolCallId: "client-before" });
+    value.upstreamSnapshot.previousClientToolCallId = null;
+    expect(buildNativeToolLedgerRound(value)).toMatchObject({ previousClientToolCallId: null });
+  });
+
   it("stores hidden content and the exact Native result used by Anthropic", () => {
     expect(buildNativeToolLedgerRound(context())).toMatchObject({
       ledgerId: "space/user/claude-code/session/epoch%3A3/batch",

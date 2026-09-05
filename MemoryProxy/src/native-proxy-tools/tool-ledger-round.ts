@@ -95,5 +95,9 @@ export function buildNativeToolLedgerRound(context: ToolExecutionContext): Nativ
       isError: slot.isError === true,
     })),
     createdAt: context.createdAt,
+    // 轮数只描述内部模型续写；跨过纯 Client 轮时，必须另存客户端调用 ID 才能放回原位。
+    ...(context.upstreamSnapshot.previousClientToolCallId !== undefined
+      ? { previousClientToolCallId: context.upstreamSnapshot.previousClientToolCallId }
+      : {}),
   };
 }

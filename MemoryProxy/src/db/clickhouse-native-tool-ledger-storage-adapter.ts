@@ -31,6 +31,7 @@ export interface NativeToolLedgerRow extends Record<string, unknown> {
   ledger_id: string; space_id: string; user_id: string; agent_source: string; session_id: string;
   context_epoch: number | string; turn_seq: number | string; round: number | string; client_protocol: string;
   blocks_json: string; native_results_json: string; created_at: string;
+  previous_client_tool_call_id?: string | null;
 }
 export interface NativeToolContextEventRow extends Record<string, unknown> {
   event_id: string; space_id: string; user_id: string; agent_source: string; session_id: string;
@@ -64,7 +65,8 @@ export function createNativeToolLedgerTableDdl(table: string): string {
     `CREATE TABLE IF NOT EXISTS ${table} (`,
     " ledger_id String, space_id String, user_id String, agent_source LowCardinality(String), session_id String,",
     " context_epoch UInt32, turn_seq UInt64, round UInt32, client_protocol LowCardinality(String),",
-    " blocks_json String, native_results_json String, created_at DateTime64(3, 'UTC')",
+    " blocks_json String, native_results_json String, created_at DateTime64(3, 'UTC'),",
+    " previous_client_tool_call_id Nullable(String) DEFAULT NULL",
     ") ENGINE = ReplacingMergeTree(created_at)",
     "ORDER BY (space_id, user_id, agent_source, session_id, context_epoch, turn_seq, round, ledger_id)",
   ].join("\n");
@@ -89,6 +91,8 @@ export function encodeNativeToolLedgerRow(value: NativeToolLedgerRound): NativeT
     context_epoch: value.contextEpoch, turn_seq: value.turnSeq, round: value.round,
     client_protocol: value.clientProtocol, blocks_json: JSON.stringify(value.blocks),
     native_results_json: JSON.stringify(value.nativeResults), created_at: clickHouseTime(value.createdAt),
+    // SQL NULL 留给未记录位置的旧数据；空字符串表示已确认本轮没有前置客户端调用。
+    previous_client_tool_call_id: value.previousClientToolCallId === undefined ? null : value.previousClientToolCallId ?? "",
   };
 }
 export function decodeNativeToolLedgerRow(row: NativeToolLedgerRow): NativeToolLedgerRound {
@@ -101,6 +105,9 @@ export function decodeNativeToolLedgerRow(row: NativeToolLedgerRow): NativeToolL
     contextEpoch: Number(row.context_epoch), turnSeq: Number(row.turn_seq), round: Number(row.round),
     clientProtocol: row.client_protocol as NativeToolProtocol,
     blocks: parseJson(row.blocks_json), nativeResults: parseJson(row.native_results_json), createdAt: isoTime(row.created_at),
+    ...(row.previous_client_tool_call_id != null
+      ? { previousClientToolCallId: row.previous_client_tool_call_id || null }
+      : {}),
   };
 }
 export function encodeNativeToolContextEventRow(value: NativeToolContextEvent): NativeToolContextEventRow {
@@ -146,6 +153,8 @@ export class ClickHouseNativeToolLedgerStorageAdapter implements NativeToolLedge
     this.assertOpen(); if (this.initialized) return; await this.ensureClient();
     try {
       await this.getClient().command({ query: createNativeToolLedgerTableDdl(this.ledgerTable), clickhouse_settings: { wait_end_of_query: 1 } });
+      // 给已有表补一列即可，保留全部旧记录，不重写历史，也不改变执行状态表。
+      await this.getClient().command({ query: `ALTER TABLE ${this.ledgerTable} ADD COLUMN IF NOT EXISTS previous_client_tool_call_id Nullable(String) DEFAULT NULL`, clickhouse_settings: { wait_end_of_query: 1 } });
       await this.getClient().command({ query: createNativeToolContextEventTableDdl(this.eventTable), clickhouse_settings: { wait_end_of_query: 1 } });
       await this.getClient().query({ query: `SELECT ledger_id FROM ${this.ledgerTable} LIMIT 0`, format: "JSONEachRow" });
     } catch { throw new NativeToolLedgerStorageError("ClickHouse Native Tool ledger capability probe failed"); }

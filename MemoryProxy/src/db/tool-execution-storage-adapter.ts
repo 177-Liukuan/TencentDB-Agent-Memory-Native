@@ -363,6 +363,7 @@ export function validateToolExecutionContext(context: ToolExecutionContext): voi
     }
   }
   const snapshotKeys = new Set([
+    "previousClientToolCallId",
     "protocol",
     "clientProtocol",
     "baseMessages",
@@ -378,6 +379,11 @@ export function validateToolExecutionContext(context: ToolExecutionContext): voi
   ]);
   if (Object.keys(context.upstreamSnapshot).some((name) => !snapshotKeys.has(name))) {
     throw new ToolExecutionValidationError("Upstream request snapshot contains a non-allowlisted field");
+  }
+  const previousClientCall = context.upstreamSnapshot.previousClientToolCallId;
+  if (previousClientCall !== undefined && previousClientCall !== null
+    && (typeof previousClientCall !== "string" || previousClientCall.length === 0)) {
+    throw new ToolExecutionValidationError("Previous Client Tool Call ID is invalid");
   }
   if (context.upstreamSnapshot.nativeLeakMarkers !== undefined) {
     if (!Array.isArray(context.upstreamSnapshot.nativeLeakMarkers)) {

@@ -198,7 +198,8 @@ export class AnthropicToolLoopCoordinator {
   }
 
   async handleRound(input: ToolLoopRoundInput): Promise<ToolLoopDecision> {
-    const decision = await this.handleRoundInternal(input, false);
+    // 客户端回填结果后重新进入 Coordinator，仍属于原工具循环，不能当作外部首次请求。
+    const decision = await this.handleRoundInternal(input, input.parentStateKey !== undefined);
     if (decision.kind === "final" && decision.observationStateKey) {
       const prepared = await this.core.prepareObservation(
         decision.observationStateKey,

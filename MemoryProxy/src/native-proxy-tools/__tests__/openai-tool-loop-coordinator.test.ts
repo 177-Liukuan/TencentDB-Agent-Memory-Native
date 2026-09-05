@@ -67,6 +67,29 @@ function harness() {
 }
 
 describe("OpenAI Tool Loop coordinator", () => {
+  it.each([false, true])("persists a Client-only continuation (resumed: %s)", async (resumed) => {
+    const { coordinator, storage, reenter } = harness();
+    const clientBytes = toolRound([{ id: "c1", name: "client_shell", arguments: "{\"command\":\"pwd\"}" }]);
+    const parentStateKey = { ...scope, toolBatchId: "parent" };
+    reenter.mockImplementationOnce(async () => ({ stream: stream(clientBytes), status: 200, headers: new Headers() }));
+    const decision = await coordinator.handleRound({
+      stream: stream(resumed ? clientBytes : toolRound([{ id: "p1", name: "tdai_memory_search", arguments: "{\"query\":\"rules\"}" }])),
+      status: 200, headers: new Headers(), scope, turnSeq: 1, upstreamSnapshot: snapshot,
+      round: resumed ? 3 : 1, totalCalls: resumed ? 1 : 0,
+      ...(resumed ? { parentStateKey, parentReentryAttempt: 1 } : {}),
+    });
+
+    expect(decision.kind).toBe("client_dispatch");
+    if (decision.kind !== "client_dispatch") throw new Error("expected Client dispatch");
+    expect(await storage.get(decision.stateKey)).toMatchObject({
+      round: resumed ? 3 : 2, totalCalls: 1, clientDispatchStatus: "dispatched",
+      slots: [{ callId: "c1", owner: "client" }],
+      ...(resumed ? { parentStateKey, parentReentryAttempt: 1 } : {}),
+    });
+    expect(decoder.decode(decision.bytes)).toContain("client_shell");
+    expect(decoder.decode(decision.bytes)).not.toContain("tdai_memory_search");
+  });
+
   it("executes Proxy calls only at the round boundary and internally re-enters", async () => {
     const { coordinator, execute, reenter } = harness();
     const decision = await coordinator.handleRound({

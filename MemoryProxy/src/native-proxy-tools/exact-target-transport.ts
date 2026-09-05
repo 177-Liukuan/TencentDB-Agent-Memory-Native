@@ -76,6 +76,7 @@ export interface BuildUpstreamRequestSnapshotInput {
   observationIntent?: PersistedToolObservationIntent;
   logicalBaseMessages?: unknown[];
   clientProtocol?: NativeToolProtocol;
+  previousClientToolCallId?: string | null;
 }
 
 export interface ExactTargetTransportOptions {
@@ -165,6 +166,9 @@ export function buildUpstreamRequestSnapshot(
     ...(input.clientProtocol ? { clientProtocol: input.clientProtocol } : {}),
     baseMessages,
     logicalBaseMessages: cloneJson(logicalBaseMessages),
+    ...(input.previousClientToolCallId !== undefined
+      ? { previousClientToolCallId: input.previousClientToolCallId }
+      : {}),
     ...(input.requestFingerprint !== undefined
       ? { requestFingerprint: input.requestFingerprint }
       : {}),

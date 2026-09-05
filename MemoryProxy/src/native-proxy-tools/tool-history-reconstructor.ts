@@ -19,7 +19,6 @@ interface TurnPosition {
 }
 
 interface MixedRoundPosition {
-  round: number;
   assistantIndex: number;
   resultIndex: number;
 }
@@ -114,7 +113,7 @@ function locateMixedRound(
     if (resultIndex < 0) {
       throw new NativeToolLedgerConflictError(`Client Tool Result is missing for round ${round.round}`);
     }
-    return { round: round.round, assistantIndex: index, resultIndex };
+    return { assistantIndex: index, resultIndex };
   }
   throw new NativeToolLedgerConflictError(`Client Tool Call is missing for round ${round.round}`);
 }
@@ -187,6 +186,42 @@ function pureRoundMessages(round: NativeToolLedgerRound): JsonValue[] {
   ];
 }
 
+/** 只在当前用户问题范围内查找，不能借用上一轮同名工具或已经恢复的 Native 结果定位。 */
+function locatePreviousClientResult(messages: JsonValue[], start: number, end: number, callId: string): number {
+  const calls: number[] = [];
+  const results: number[] = [];
+  for (let index = start; index < end; index += 1) {
+    const message = record(messages[index]!);
+    if (!Array.isArray(message.content)) continue;
+    for (const block of message.content) {
+      if (message.role === "assistant" && toolUse(block)?.id === callId) calls.push(index);
+      if (message.role === "user" && toolResult(block)?.id === callId) results.push(index);
+    }
+  }
+  if (calls.length !== 1 || results.length !== 1 || results[0]! <= calls[0]!
+    || messages.slice(calls[0]! + 1, results[0]!).some((message) => record(message).role === "assistant")) {
+    throw new NativeToolLedgerConflictError(`Previous Client Tool Call/Result is missing or duplicated: ${callId}`);
+  }
+  return results[0]!;
+}
+
+function latestVisibleClientCall(messages: JsonValue[], start: number): string | null {
+  const calls = new Set<string>();
+  let latest: string | null = null;
+  for (const message of messages.slice(start)) {
+    const value = record(message);
+    if (!Array.isArray(value.content)) continue;
+    for (const block of value.content) {
+      const call = value.role === "assistant" ? toolUse(block) : null;
+      if (call) calls.add(call.id);
+      const result = value.role === "user" ? toolResult(block) : null;
+      if (result && calls.has(result.id)) latest = result.id;
+    }
+  }
+  if (latest !== null) locatePreviousClientResult(messages, start, messages.length, latest);
+  return latest;
+}
+
 /**
  * Claude Code 保留可见消息，本函数只把它看不到的 Native 内容插回原轮次。
  * 不读取文本含义，也不根据 reminder 或摘要提示猜测消息类型。
@@ -211,32 +246,30 @@ export function reconstructAnthropicToolLedger(input: {
     if (rounds.length === 0) continue;
 
     const mixed = rounds.filter((round) => clientRefs(round).length > 0);
-    const positions = mixed.map((round) => locateMixedRound(messages, start, end, round));
-    for (const round of mixed) {
-      fillMixedRound(messages, positions.find((position) => position.round === round.round)!, round);
-    }
+    // round 在新的 HTTP 工具链中可能重新从 1 开始，记录必须按 ledgerId 区分。
+    const positions = new Map(mixed.map((round) => [round.ledgerId, locateMixedRound(messages, start, end, round)]));
 
     const pure = rounds.filter((round) => clientRefs(round).length === 0);
     const insertions = new Map<number, NativeToolLedgerRound[]>();
     for (const round of pure) {
-      const nextMixed = positions.find((position) => position.round > round.round);
-      let insertionIndex: number;
-      if (nextMixed) insertionIndex = nextMixed.assistantIndex;
-      else {
-        const previousMixed = positions.filter((position) => position.round < round.round).at(-1);
-        const searchStart = previousMixed ? previousMixed.resultIndex + 1 : start;
-        insertionIndex = end;
-        for (let index = searchStart; index < end; index += 1) {
-          if (record(messages[index]!).role === "assistant") {
-            insertionIndex = index;
-            break;
-          }
-        }
+      const previous = round.previousClientToolCallId;
+      // 旧记录若遇到客户端工具，缺少足够依据区分“之前/之后”；明确报错，不再默默排错。
+      if (previous === undefined && messages.slice(start, end).some((message) => {
+        const value = record(message);
+        return value.role === "assistant" && Array.isArray(value.content) && value.content.some((block) => toolUse(block));
+      })) {
+        throw new NativeToolLedgerConflictError(`Legacy Native Tool round has no Client position: ${round.ledgerId}`);
       }
+      if (previous !== undefined && previous !== null && (typeof previous !== "string" || previous.length === 0)) {
+        throw new NativeToolLedgerConflictError(`Native Tool Client position is invalid: ${round.ledgerId}`);
+      }
+      const insertionIndex = previous == null ? start : locatePreviousClientResult(messages, start, end, previous) + 1;
       const grouped = insertions.get(insertionIndex) ?? [];
       grouped.push(round);
       insertions.set(insertionIndex, grouped);
     }
+    // 先按原始客户端消息确定全部位置，再补块、插消息，避免把本次恢复出的内容当作定位依据。
+    for (const round of mixed) fillMixedRound(messages, positions.get(round.ledgerId)!, round);
     for (const [index, grouped] of [...insertions.entries()].sort((left, right) => right[0] - left[0])) {
       const additions = grouped.sort((left, right) => left.round - right.round).flatMap(pureRoundMessages);
       messages.splice(index, 0, ...additions);
@@ -255,6 +288,7 @@ export async function materializeClaudeToolLedgerHistory(input: {
   turnSeq: number;
   currentEpoch: number;
   ledgerIds: string[];
+  previousClientToolCallId: string | null;
 }> {
   // 标记位置和历史插入必须基于同一份消息，否则 Claude Code 临时加入的
   // system 消息被协议适配器删掉后，旧工具记录会错插到下一轮用户问题之后。
@@ -295,5 +329,9 @@ export async function materializeClaudeToolLedgerHistory(input: {
     turnSeq: latestVisibleTurn,
     currentEpoch: context.currentEpoch,
     ledgerIds: rounds.map((round) => round.ledgerId),
+    previousClientToolCallId: latestVisibleClientCall(
+      extracted.messages,
+      turns.find((turn) => turn.turnSeq === latestVisibleTurn)?.insertAfterItem ?? extracted.messages.length,
+    ),
   };
 }

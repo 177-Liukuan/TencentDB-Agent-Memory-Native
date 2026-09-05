@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { DEFAULT_CONFIG } from "../config.js";
-import { InMemoryToolExecutionStorageAdapter } from "../db/in-memory-tool-execution-storage-adapter.js";
+import { createInMemoryToolExecutionBackend, InMemoryToolExecutionStorageAdapter } from "../db/in-memory-tool-execution-storage-adapter.js";
+import { createInMemoryNativeToolLedgerBackend, InMemoryNativeToolLedgerStorageAdapter } from "../db/in-memory-native-tool-ledger-storage-adapter.js";
 import { __resetInjectionPipelineForTests } from "../injection/index.js";
 import {
   __resetNativeProxyToolRuntimeForTests,
@@ -42,13 +43,13 @@ function finalResponsesRound(): string {
     });
 }
 
-function nativeResponsesRound(): string {
+function nativeResponsesRound(callId = "call_native", name = "tdai_memory_search", args: Record<string, string> = { query: "project rules" }): string {
   const item = {
     type: "function_call",
     id: "fc_native",
-    call_id: "call_native",
-    name: "tdai_memory_search",
-    arguments: "{\"query\":\"project rules\"}",
+    call_id: callId,
+    name,
+    arguments: JSON.stringify(args),
   };
   return event("response.created", {
     response: { id: "resp_native", model: "deepseek-v4-flash" },
@@ -141,6 +142,95 @@ afterEach(async () => {
 });
 
 describe("Claude Code Anthropic client with a Responses upstream", () => {
+  it("restores Client -> Native -> Client -> Native in order after runtime state is gone", async () => {
+    const proxyConfig = config();
+    proxyConfig.injection.enabled = true;
+    proxyConfig.injection.injectors = [];
+    proxyConfig.nativeProxyTools.enabled = true;
+    proxyConfig.clickhouse.enabled = true;
+    proxyConfig.tdai.enabled = true;
+    proxyConfig.tdai.memory.enabled = true;
+    proxyConfig.tdai.memory.inject = false;
+    proxyConfig.tdai.memory.writeL0 = false;
+    proxyConfig.extraction.enabled = false;
+    proxyConfig.sessionInit.enabled = true;
+    const stateBackend = createInMemoryToolExecutionBackend();
+    const ledgerBackend = createInMemoryNativeToolLedgerBackend();
+    const ledgerScope = { spaceId: "space-1", userId: "user-1", agentSource: "claude-code", sessionId: "position-session" };
+    const execute = vi.fn(async () => ({ isError: false, value: "memory result" }));
+    const installRuntime = async () => {
+      const runtime = createNativeProxyToolRuntime(proxyConfig, {
+        createStorage: () => new InMemoryToolExecutionStorageAdapter({ backend: stateBackend }),
+        createLedgerStorage: () => new InMemoryNativeToolLedgerStorageAdapter({ backend: ledgerBackend }),
+        createDispatcher: () => ({ execute }),
+      });
+      await runtime.ready();
+      __setNativeProxyToolRuntimeForTests(runtime);
+      return runtime;
+    };
+    let runtime = await installRuntime();
+    const turn = await runtime.ledgerStorage!.recordUserPrompt(ledgerScope);
+    await getSessionStore().set("claude-code:position-session", {
+      status: "initialized", keyId: "position-session", startedAt: Date.now(), attemptCount: 0, userId: "user-1", bypassed: false,
+      sessionInfo: { session_id: "position-session", team_id: "team-1", agent_id: "agent-1", user_id: "user-1", space_id: "space-1" },
+      agentDetail: null, taskDetail: null,
+    });
+    const fixtures = [
+      nativeResponsesRound("client-1", "Bash", { command: "pwd" }),
+      nativeResponsesRound("native-1"),
+      nativeResponsesRound("client-2", "Bash", { command: "pwd" }),
+      nativeResponsesRound("native-2"), finalResponsesRound(), finalResponsesRound(),
+    ];
+    const bodies: Array<{ input: Array<Record<string, unknown>> }> = [];
+    vi.stubGlobal("fetch", vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      if (!String(url).startsWith("https://api.deepseek.com")) return new Response(JSON.stringify({ code: 0, data: {} }), { status: 200 });
+      bodies.push(JSON.parse(String(init?.body)));
+      return new Response(fixtures[bodies.length - 1], { status: 200, headers: { "content-type": "text/event-stream" } });
+    }));
+    const app = createApp(proxyConfig);
+    const messages: Array<Record<string, unknown>> = [
+      { role: "user", content: [{ type: "text", text: "Check workspace" }, { type: "text", text: createClaudeTurnMarker(turn.turnToken) }] },
+    ];
+    const request = () => app.request("/claude-code/space-1/v1/messages", {
+      method: "POST", headers: { "content-type": "application/json", "x-user-id": "user-1", "x-conversation-id": "position-session" },
+      body: JSON.stringify({ model: "deepseek-v4-flash", stream: true, max_tokens: 1024, messages,
+        tools: [{ name: "Bash", description: "Run command", input_schema: { type: "object" } }],
+      }),
+    });
+    expect(await (await request()).text()).toContain("client-1");
+    for (const callId of ["client-1", "client-2"]) {
+      messages.push(
+        { role: "assistant", content: [{ type: "tool_use", id: callId, name: "Bash", input: { command: "pwd" } }] },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: callId, content: "/workspace" }] },
+      );
+      const response = await request();
+      const text = await response.text();
+      expect(response.status, text).toBe(200);
+      expect(text).toContain(callId === "client-1" ? "client-2" : "hello from Responses");
+      expect(text).not.toContain("tdai_memory_search");
+      expect(text).not.toContain("native-1");
+      expect(text).not.toContain("native-2");
+    }
+    // 不保留当前请求快照，验证长期记录自身已经包含正确的客户端位置。
+    await shutdownNativeProxyToolRuntime();
+    __resetNativeProxyToolRuntimeForTests();
+    stateBackend.rows.clear();
+    runtime = await installRuntime();
+    const next = await runtime.ledgerStorage!.recordUserPrompt(ledgerScope);
+    messages.push(
+      { role: "assistant", content: "hello from Responses" },
+      { role: "user", content: [{ type: "text", text: "Continue" }, { type: "text", text: createClaudeTurnMarker(next.turnToken) }] },
+    );
+    const response = await request();
+    expect(response.status, await response.clone().text()).toBe(200);
+    expect(await response.text()).toContain("hello from Responses");
+    expect(bodies.at(-1)!.input.filter((item) => item.type === "function_call").map((item) => item.call_id))
+      .toEqual(["client-1", "native-1", "client-2", "native-2"]);
+    expect(bodies.at(-1)!.input.filter((item) => item.type === "function_call_output").map((item) => item.call_id))
+      .toEqual(["client-1", "native-1", "client-2", "native-2"]);
+    expect(execute).toHaveBeenCalledTimes(2);
+  });
+
   it("forwards Responses JSON to /responses and streams Anthropic SSE back", async () => {
     let upstreamUrl = "";
     let upstreamHeaders = new Headers();

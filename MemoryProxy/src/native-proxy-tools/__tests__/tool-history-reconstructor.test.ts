@@ -7,7 +7,7 @@ import {
 } from "../tool-history-reconstructor.js";
 import { createClaudeTurnMarker } from "../turn-marker.js";
 import { InMemoryNativeToolLedgerStorageAdapter } from "../../db/in-memory-native-tool-ledger-storage-adapter.js";
-import type { NativeToolLedgerRound, NativeToolSessionScope } from "../types.js";
+import type { JsonValue, NativeToolLedgerRound, NativeToolSessionScope } from "../types.js";
 
 const scope: NativeToolSessionScope = {
   spaceId: "space-1",
@@ -40,6 +40,102 @@ function nativeRound(overrides: Partial<NativeToolLedgerRound> = {}): NativeTool
 }
 
 describe("Anthropic Tool Ledger reconstruction", () => {
+  it("distinguishes two mixed responses whose independent model loops both used round 1", () => {
+    const messages: JsonValue[] = [{ role: "user", content: "问题" }];
+    const rounds: NativeToolLedgerRound[] = [];
+    for (const suffix of ["a", "b"]) {
+      messages.push(
+        { role: "assistant", content: [{ type: "tool_use", id: `client-${suffix}`, name: "Read", input: {} }] },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: `client-${suffix}`, content: suffix }] },
+      );
+      rounds.push(nativeRound({
+        ledgerId: suffix, round: 1,
+        blocks: [
+          { kind: "native_tool", blockIndex: 0, callId: `native-${suffix}`, toolName: "tdai_memory_search", input: {} },
+          { kind: "client_tool_ref", blockIndex: 1, callId: `client-${suffix}`, toolName: "Read" },
+        ],
+        nativeResults: [{ callId: `native-${suffix}`, value: suffix, isError: false }],
+      }));
+    }
+    const result = reconstructAnthropicToolLedger({ messages, rounds: rounds.reverse(), turns: [{ turnSeq: 1, insertAfterItem: 1 }] });
+    expect(result[1]).toMatchObject({ content: [{ id: "native-a" }, { id: "client-a" }] });
+    expect(result[3]).toMatchObject({ content: [{ id: "native-b" }, { id: "client-b" }] });
+    expect(result[2]).toMatchObject({ content: [{ tool_use_id: "native-a" }, { tool_use_id: "client-a" }] });
+    expect(result[4]).toMatchObject({ content: [{ tool_use_id: "native-b" }, { tool_use_id: "client-b" }] });
+  });
+
+  // 原问题不是 A/B 之间排错，而是两者跨过了中间由 Claude Code 保存的 Bash。
+  it.each([1, 4])("restores hidden rounds around consecutive Client calls even when round restarts at %s", (lastRound) => {
+    const messages: JsonValue[] = [{ role: "user", content: "问题" }];
+    for (const id of ["client-1", "client-2"]) {
+      messages.push(
+        { role: "assistant", content: [{ type: "tool_use", id, name: "Bash", input: {} }] },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: id, content: id }, { type: "text", text: "保留提醒" }] },
+      );
+    }
+    const hidden = (id: string, round: number, previousClientToolCallId: string | null) => nativeRound({
+      ledgerId: id, round, previousClientToolCallId,
+      blocks: [{ kind: "native_tool", blockIndex: 0, callId: id, toolName: "tdai_memory_search", input: {} }],
+      nativeResults: [{ callId: id, value: id, isError: false }],
+    });
+    const restored = reconstructAnthropicToolLedger({
+      messages, turns: [{ turnSeq: 1, insertAfterItem: 1 }],
+      rounds: [hidden("native-c", lastRound + 1, "client-2"), hidden("native-a", 1, null), hidden("native-b", lastRound, "client-2")],
+    });
+    const blocks = restored.flatMap((message) => (message as { content: JsonValue[] }).content);
+    const calls = blocks.filter((block) => (block as { type?: string }).type === "tool_use");
+    const results = blocks.filter((block) => (block as { type?: string }).type === "tool_result");
+    expect(calls.map((block) => (block as { id: string }).id)).toEqual(["native-a", "client-1", "client-2", "native-b", "native-c"]);
+    expect(results.map((block) => (block as { tool_use_id: string }).tool_use_id)).toEqual(["native-a", "client-1", "client-2", "native-b", "native-c"]);
+    expect(blocks.filter((block) => (block as { text?: string }).text === "保留提醒")).toHaveLength(2);
+    expect(messages).toHaveLength(5);
+  });
+
+  it("does not move the first Native call ahead of earlier Client work in the same turn", () => {
+    const result = reconstructAnthropicToolLedger({
+      messages: [
+        { role: "user", content: "问题" },
+        { role: "assistant", content: [{ type: "tool_use", id: "read", name: "Read", input: {} }] },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: "read", content: "file" }] },
+        { role: "assistant", content: "回答" },
+      ],
+      turns: [{ turnSeq: 1, insertAfterItem: 1 }],
+      rounds: [nativeRound({ round: 1, previousClientToolCallId: "read" })],
+    });
+    expect(result[1]).toMatchObject({ content: [{ id: "read" }] });
+    expect(result[3]).toMatchObject({ content: [{ id: "native-a" }] });
+  });
+
+  it.each(["absent", "duplicate", "missing-result", "previous-turn", "legacy"])("rejects an unusable Client position (%s) instead of guessing", (kind) => {
+    const messages: JsonValue[] = [
+      { role: "user", content: "问题" },
+      { role: "assistant", content: [{ type: "tool_use", id: "read", name: "Read", input: {} }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "read", content: "file" }] },
+    ];
+    if (kind === "duplicate") messages.push(...structuredClone(messages.slice(1)));
+    if (kind === "missing-result") messages.pop();
+    if (kind === "previous-turn") messages.push({ role: "user", content: "新问题" });
+    expect(() => reconstructAnthropicToolLedger({
+      messages,
+      turns: [{ turnSeq: 1, insertAfterItem: kind === "previous-turn" ? 4 : 1 }],
+      rounds: [nativeRound(kind === "legacy" ? {} : { previousClientToolCallId: kind === "absent" ? "unknown" : "read" })],
+    })).toThrow(NativeToolLedgerConflictError);
+  });
+
+  it("captures only the latest real turn's visible Client position before adding hidden history", async () => {
+    const storage = new InMemoryNativeToolLedgerStorageAdapter();
+    const first = await storage.recordUserPrompt(scope);
+    const marker = (token: string): JsonValue => ({ role: "user", content: [{ type: "text", text: "问题" }, { type: "text", text: createClaudeTurnMarker(token) }] });
+    const messages: JsonValue[] = [marker(first.turnToken),
+      { role: "assistant", content: [{ type: "tool_use", id: "read", name: "Read", input: {} }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "read", content: "file" }] },
+    ];
+    expect(await materializeClaudeToolLedgerHistory({ messages, scope, storage })).toMatchObject({ previousClientToolCallId: "read" });
+    const second = await storage.recordUserPrompt(scope);
+    messages.push(marker(second.turnToken));
+    expect(await materializeClaudeToolLedgerHistory({ messages, scope, storage })).toMatchObject({ previousClientToolCallId: null });
+  });
+
   it("inserts a pure Native round between the user request and final answer", () => {
     const result = reconstructAnthropicToolLedger({
       messages: [
@@ -145,14 +241,14 @@ describe("Anthropic Tool Ledger reconstruction", () => {
       ],
       turns: [{ turnSeq: 1, insertAfterItem: 1 }],
       rounds: [
-        nativeRound({ ledgerId: "before", round: 0 }),
+        nativeRound({ ledgerId: "before", round: 0, previousClientToolCallId: null }),
         nativeRound({
           ledgerId: "mixed", round: 1,
           blocks: [{ kind: "client_tool_ref", blockIndex: 0, callId: "client-b", toolName: "Read" }],
           nativeResults: [],
         }),
         nativeRound({
-          ledgerId: "after", round: 2,
+          ledgerId: "after", round: 2, previousClientToolCallId: "client-b",
           blocks: [{
             kind: "native_tool", blockIndex: 0, callId: "native-c",
             toolName: "skill_view", input: { skill_id: "s" },

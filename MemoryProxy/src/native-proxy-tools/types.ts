@@ -78,6 +78,8 @@ export interface NativeToolLedgerRound {
   blocks: NativeToolLedgerBlock[];
   nativeResults: NativeToolLedgerResult[];
   createdAt: string;
+  /** 放在本 Turn 中这个客户端工具结果之后；null 表示用户问题后，缺省表示旧记录未保存位置。 */
+  previousClientToolCallId?: string | null;
 }
 
 export interface NativeToolUserTurn {
@@ -209,6 +211,8 @@ export interface UpstreamRequestSnapshot {
   baseMessages: JsonValue[];
   /** Original client-visible history used only for ordinary telemetry/writeback. */
   logicalBaseMessages?: JsonValue[];
+  /** 只从客户端可见历史取得；内部 Native 续写沿用，客户端结果返回后才更新。 */
+  previousClientToolCallId?: string | null;
   /** Cumulative hidden Native calls from earlier rounds in this logical turn. */
   nativeLeakMarkers?: PersistedNativeToolLeakMarker[];
   /** Stable digest used only to replay an interrupted current request. */

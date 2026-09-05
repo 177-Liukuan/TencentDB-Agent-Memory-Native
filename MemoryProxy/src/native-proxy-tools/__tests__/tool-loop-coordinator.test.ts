@@ -289,6 +289,28 @@ async function eventually(assertion: () => void, timeoutMs = 1_000): Promise<voi
 }
 
 describe("AnthropicToolLoopCoordinator", () => {
+  it("persists a Client-only round immediately after resuming Client results", async () => {
+    const parentStateKey = { ...scope(), toolBatchId: "parent" };
+    const onClientDispatchPrepared = vi.fn(async () => {});
+    const { coordinator, storage, ledgerStorage, execute, reenter } = coordinatorHarness({ onClientDispatchPrepared });
+
+    const decision = await coordinator.handleRound(roundInput(byteStream(clientFixture()).stream, {
+      parentStateKey, parentReentryAttempt: 1, round: 3, totalCalls: 1,
+    }));
+
+    expect(decision.kind).toBe("client_dispatch");
+    if (decision.kind !== "client_dispatch") throw new Error("expected Client dispatch");
+    expect(await storage.get(decision.stateKey)).toMatchObject({
+      parentStateKey, parentReentryAttempt: 1, round: 3, totalCalls: 1,
+      clientDispatchStatus: "dispatched", slots: [{ callId: "client-1", owner: "client" }],
+    });
+    expect(onClientDispatchPrepared).toHaveBeenCalledTimes(1);
+    expect(visibleToolStarts(decision.bytes)).toEqual([{ index: 0, id: "client-1" }]);
+    expect(await ledgerStorage.findRounds(scope(), 0)).toEqual([]);
+    expect(execute).not.toHaveBeenCalled();
+    expect(reenter).not.toHaveBeenCalled();
+  });
+
   it.each([
     ["no-tool", concat(messageStart(), messageStop("end_turn"))],
     ["Client-only", clientFixture()],

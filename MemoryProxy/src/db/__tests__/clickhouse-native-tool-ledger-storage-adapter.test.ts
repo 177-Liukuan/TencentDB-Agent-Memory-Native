@@ -23,6 +23,11 @@ const event: NativeToolContextEvent = {
 };
 
 describe("ClickHouse Native Tool ledger encoding", () => {
+  it.each([null, "client-before"])("persists the Client insertion position (%s)", (previousClientToolCallId) => {
+    const value = { ...round, previousClientToolCallId };
+    expect(decodeNativeToolLedgerRow(encodeNativeToolLedgerRow(value))).toEqual(value);
+  });
+
   it("creates append-only ledger and context-event tables without TTL", () => {
     expect(createNativeToolLedgerTableDdl("native_proxy_tool_ledger")).toContain("ReplacingMergeTree");
     expect(createNativeToolLedgerTableDdl("native_proxy_tool_ledger")).not.toContain("TTL");

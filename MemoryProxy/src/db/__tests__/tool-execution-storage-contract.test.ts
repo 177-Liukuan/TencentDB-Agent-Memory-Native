@@ -109,6 +109,18 @@ function pendingContext(
 }
 
 describe("validateToolExecutionContext durable replay boundary", () => {
+  it.each([null, "client-before"])("allows a persisted Client position (%s)", (previousClientToolCallId) => {
+    const context = pendingContext(new Date());
+    context.upstreamSnapshot.previousClientToolCallId = previousClientToolCallId;
+    expect(() => validateToolExecutionContext(context)).not.toThrow();
+  });
+
+  it.each(["", 123, {}])("rejects invalid persisted Client positions (%j)", (invalid) => {
+    const context = pendingContext(new Date());
+    context.upstreamSnapshot.previousClientToolCallId = invalid as string;
+    expect(() => validateToolExecutionContext(context)).toThrow(ToolExecutionValidationError);
+  });
+
   it("rejects malformed or unsafe persisted response headers with a validation error", () => {
     const context = pendingContext(new Date(), {
       clientDispatchStatus: "completed",

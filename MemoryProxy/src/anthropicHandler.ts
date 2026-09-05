@@ -1315,6 +1315,7 @@ export async function handleAnthropicMessages(
       })
     : null;
   let hookTurnSeq: number | undefined;
+  let previousClientToolCallId: string | null | undefined;
   if (toolExecutionScope && historyRuntime?.ledgerStorage) {
     try {
       const sessionContext = await historyRuntime.ledgerStorage.getSessionContext(toolExecutionScope);
@@ -1922,6 +1923,7 @@ export async function handleAnthropicMessages(
         storage: historyRuntime.ledgerStorage!,
       }));
       hookTurnSeq = restored.turnSeq;
+      previousClientToolCallId = restored.previousClientToolCallId;
       toolExecutionScope.contextVersion = `epoch:${restored.currentEpoch}`;
       // 先在 Claude Code 原始消息上恢复工具历史，再执行 Anthropic 原有的
       // 边界规则：system 只允许放在顶层，不能留在 messages 中。
@@ -2291,6 +2293,7 @@ export async function handleAnthropicMessages(
             ? { requestFingerprint: nativeLogicalRequestFingerprint }
             : {}),
           logicalBaseMessages: logicalMessages,
+          previousClientToolCallId,
           observationIntent: buildPersistedToolObservationIntent({
             config,
             scope: toolExecutionScope,

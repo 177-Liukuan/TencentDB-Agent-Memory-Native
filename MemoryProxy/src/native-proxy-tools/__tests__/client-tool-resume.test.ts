@@ -309,6 +309,115 @@ describe("OpenAI Responses Client Tool Result extraction", () => {
 });
 
 describe("resumeClientToolResults", () => {
+  it.each([false, true])("resumes a Client-only continuation without writing Native history (client error: %s)", async (isError) => {
+    const ledgerStorage = new InMemoryNativeToolLedgerStorageAdapter();
+    const harness = resumeHarness({ ledgerStorage });
+    const state = mixedState();
+    state.round = 2;
+    state.slots = state.slots.filter((entry) => entry.owner === "client").map((entry, index) => ({
+      ...entry, slotIndex: index, contentBlockIndex: index,
+    }));
+    state.assistantSkeleton = state.slots.map((entry) => ({
+      type: "tool_use", id: entry.callId, name: entry.toolName, input: entry.input!,
+    }));
+    // 本轮没有 Native，但前一轮的隐藏历史和首次请求配置仍须带给原模型。
+    state.upstreamSnapshot.baseMessages.push(
+      { role: "assistant", content: [{ type: "tool_use", id: "old-native", name: "tdai_memory_search", input: { query: "rules" } }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "old-native", content: "memory" }] },
+    );
+    await harness.storage.create(state);
+
+    const decision = await resumeClientToolResults(harness.input(resultBody([
+      { callId: "c2", content: "second output" },
+      { callId: "c1", content: "first output", isError },
+    ])));
+
+    expect(decision).toMatchObject({ kind: "reentered", round: 3, totalCalls: 2 });
+    expect(harness.execute).not.toHaveBeenCalled();
+    expect(harness.reenter).toHaveBeenCalledTimes(1);
+    expect(harness.reenter.mock.calls[0][0]).toMatchObject({
+      upstreamSnapshot: state.upstreamSnapshot,
+      messages: [
+        ...state.upstreamSnapshot.baseMessages,
+        { role: "assistant", content: state.assistantSkeleton },
+        { role: "user", content: [
+          { type: "tool_result", tool_use_id: "c1", content: "first output", ...(isError ? { is_error: true } : {}) },
+          { type: "tool_result", tool_use_id: "c2", content: "second output" },
+        ] },
+      ],
+    });
+    expect(await ledgerStorage.findRounds(scope(), 0)).toEqual([]);
+  });
+
+  it.each([false, true])("allows an immediate retry after history write failure (write committed: %s)", async (committed) => {
+    const ledgerStorage = new InMemoryNativeToolLedgerStorageAdapter();
+    const append = ledgerStorage.appendRound.bind(ledgerStorage);
+    vi.spyOn(ledgerStorage, "appendRound").mockImplementationOnce(async (round) => {
+      if (committed) await append(round);
+      throw new Error("database connection lost");
+    });
+    const harness = resumeHarness({ ledgerStorage });
+    const state = mixedState({ p1: { status: "succeeded", result: "p1", isError: false } });
+    await harness.storage.create(state);
+
+    expect(await resumeClientToolResults(harness.input())).toMatchObject({
+      kind: "error", code: "native_tool_history_unavailable", status: 503,
+    });
+    expect(harness.reenter).not.toHaveBeenCalled();
+    expect(await harness.storage.get(state.key)).toMatchObject({ clientDispatchStatus: "dispatched" });
+    expect(await resumeClientToolResults(harness.input())).toMatchObject({ kind: "reentered", reentryAttempt: 1 });
+    expect(harness.reenter).toHaveBeenCalledTimes(1);
+    expect(harness.execute).not.toHaveBeenCalled();
+    expect(await ledgerStorage.findRounds(scope(), 0)).toHaveLength(1);
+  });
+
+  it("keeps failed Native results and empty Client output in call order without re-execution", async () => {
+    const ledgerStorage = new InMemoryNativeToolLedgerStorageAdapter();
+    const harness = resumeHarness({ ledgerStorage });
+    const state = mixedState({
+      p1: { status: "failed", result: { code: "native_tool_timeout" }, isError: true },
+    });
+    await harness.storage.create(state);
+    const decision = await resumeClientToolResults(harness.input(resultBody([
+      { callId: "c2", content: [] }, { callId: "c1", content: "" },
+    ])));
+
+    expect(decision.kind).toBe("reentered");
+    expect(harness.execute).not.toHaveBeenCalled();
+    expect(harness.reenter.mock.calls[0][0].messages.at(-1)).toEqual({ role: "user", content: [
+      { type: "tool_result", tool_use_id: "p1", content: '{"code":"native_tool_timeout"}', is_error: true },
+      { type: "tool_result", tool_use_id: "c1", content: "" },
+      { type: "tool_result", tool_use_id: "c2", content: [] },
+      { type: "tool_result", tool_use_id: "p2", content: '{"memories":["p2-result"]}' },
+    ] });
+    expect((await ledgerStorage.findRounds(scope(), 0))[0].nativeResults[0]).toEqual({
+      callId: "p1", value: '{"code":"native_tool_timeout"}', isError: true,
+    });
+  });
+
+  it.each([
+    ["missing result", "error"],
+    ["duplicate result", "error"],
+    ["aborted stream", "not_applicable"],
+    ["not dispatched", "not_applicable"],
+  ])("does not accept partial or ineligible results: %s", async (condition, expectedKind) => {
+    const harness = resumeHarness();
+    const state = mixedState({ p1: { status: "succeeded", result: "p1", isError: false } });
+    let body = resultBody();
+    if (condition === "missing result") body = resultBody([{ callId: "c1", content: "one" }]);
+    if (condition === "duplicate result") body = resultBody([{ callId: "c1", content: "one" }, { callId: "c1", content: "one" }]);
+    if (condition === "aborted stream") state.responseStreamStatus = "aborted";
+    if (condition === "not dispatched") state.clientDispatchStatus = "pending";
+    await harness.storage.create(state);
+
+    // 未真正下发的状态不能认领客户端结果；没有匹配记录时仍交还普通客户端处理流程。
+    expect(await resumeClientToolResults(harness.input(body))).toMatchObject({ kind: expectedKind });
+    expect(harness.reenter).not.toHaveBeenCalled();
+    expect(harness.execute).not.toHaveBeenCalled();
+    expect((await harness.storage.get(state.key))!.slots.filter((entry) => entry.owner === "client"))
+      .toEqual(expect.arrayContaining([expect.objectContaining({ callId: "c1", status: "pending" }), expect.objectContaining({ callId: "c2", status: "pending" })]));
+  });
+
   it("registers Tool Results before a trailing system control message and re-enters", async () => {
     const harness = resumeHarness();
     await harness.storage.create(mixedState({

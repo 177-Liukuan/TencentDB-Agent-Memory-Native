@@ -4,6 +4,12 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createClient, type ClickHouseClient } from "@clickhouse/client";
 
 import { DEFAULT_CONFIG } from "../../../src/config.js";
+import { InMemoryNativeToolLedgerStorageAdapter } from "../../../src/db/in-memory-native-tool-ledger-storage-adapter.js";
+import {
+  completeClientToolReentry,
+  createPersistedClientReentryOutcome,
+  resumeClientToolResults,
+} from "../../../src/native-proxy-tools/client-tool-resume.js";
 import type { ToolExecutionContext } from "../../../src/native-proxy-tools/types.js";
 import {
   ClickHouseToolExecutionStorageAdapter,
@@ -71,6 +77,48 @@ describeIntegration("real ClickHouse Native Tool state", () => {
   let cleanupClient: ClickHouseClient | undefined;
   let primary: ClickHouseToolExecutionStorageAdapter;
   let secondary: ClickHouseToolExecutionStorageAdapter;
+
+  it("resumes a Client-only round across instances and replays without another model request", async () => {
+    const state = testContext(randomUUID());
+    state.round = 2;
+    state.responseStreamStatus = "completed";
+    state.clientDispatchStatus = "dispatched";
+    state.slots = [{
+      callId: "client-only", slotIndex: 0, contentBlockIndex: 0,
+      toolName: "Bash", owner: "client", input: { command: "pwd" },
+      argumentsComplete: true, status: "pending", executionAttempt: 0,
+    }];
+    state.assistantSkeleton = [{ type: "tool_use", id: "client-only", name: "Bash", input: { command: "pwd" } }];
+    await primary.create(state);
+    const ledgerStorage = new InMemoryNativeToolLedgerStorageAdapter();
+    let modelRequests = 0;
+    const input = {
+      body: { messages: [{ role: "user", content: [{ type: "tool_result", tool_use_id: "client-only", content: "/workspace" }] }] },
+      scope: state.key,
+      storage: secondary,
+      ledgerStorage,
+      dispatcher: { execute: async () => { throw new Error("Client result must not execute a Native Tool"); } },
+      limits: structuredClone(DEFAULT_CONFIG.nativeProxyTools),
+      reenter: async () => {
+        modelRequests++;
+        return { stream: new ReadableStream<Uint8Array>({ start(c) { c.close(); } }), status: 200, headers: new Headers() };
+      },
+    };
+    const resumed = await resumeClientToolResults(input);
+    expect(resumed.kind).toBe("reentered");
+    if (resumed.kind !== "reentered") throw new Error("expected Client re-entry");
+    expect(await ledgerStorage.findRounds(state.key, 0)).toEqual([]);
+    expect(await primary.get(state.key)).toMatchObject({
+      clientDispatchStatus: "resuming", slots: [{ callId: "client-only", status: "succeeded", result: "/workspace" }],
+    });
+    await completeClientToolReentry(secondary, state.key, resumed.reentryLeaseOwner,
+      createPersistedClientReentryOutcome({ kind: "final", status: 200, headers: new Headers(), bytes: new TextEncoder().encode("done") }));
+    const replay = await resumeClientToolResults({ ...input, storage: primary });
+    expect(replay.kind).toBe("replay");
+    if (replay.kind !== "replay") throw new Error("expected stored response");
+    expect(new TextDecoder().decode(replay.bytes)).toBe("done");
+    expect(modelRequests).toBe(1);
+  }, 30_000);
 
   beforeAll(async () => {
     const url = requiredEnvironment("NATIVE_TOOL_CLICKHOUSE_URL");

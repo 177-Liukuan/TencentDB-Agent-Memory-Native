@@ -116,7 +116,8 @@ export class OpenAIToolLoopCoordinator {
   }
 
   async handleRound(input: OpenAIToolLoopRoundInput): Promise<OpenAIToolLoopDecision> {
-    const decision = await this.handleRoundInternal(input, false);
+    // 客户端结果续写需要沿用原请求快照，包括随后生成的纯客户端工具轮。
+    const decision = await this.handleRoundInternal(input, input.parentStateKey !== undefined);
     if (decision.kind === "final" && decision.observationStateKey) {
       const ok = await this.core.prepareObservation(
         decision.observationStateKey,
@@ -197,7 +198,8 @@ export class OpenAIToolLoopCoordinator {
       const snapshot = parser.snapshot();
       const nativeCalls = snapshot.toolCalls.filter((call) => call.owner === "proxy");
       const clientCalls = snapshot.toolCalls.filter((call) => call.owner === "client");
-      if (nativeCalls.length === 0) {
+      // 外部纯客户端请求可以直返；Native 之后的客户端轮仍要保存短期状态，不能误判为最终回答。
+      if (nativeCalls.length === 0 && !(internal && clientCalls.length > 0)) {
         return {
           kind: internal ? "final" : "replay",
           bytes: this.codec.buildReplaySse?.(snapshot.rawBytes) ?? snapshot.rawBytes,
@@ -210,7 +212,7 @@ export class OpenAIToolLoopCoordinator {
         totalCalls: input.totalCalls,
         callsThisRound: nativeCalls.length,
       });
-      if (limitFailure) {
+      if (nativeCalls.length > 0 && limitFailure) {
         return this.error(limitFailure.code, limitFailure.message, limitFailure.status, [snapshot]);
       }
 

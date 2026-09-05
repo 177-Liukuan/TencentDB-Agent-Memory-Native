@@ -181,6 +181,33 @@ function harness(onClientDispatchPrepared?: (dispatch: { bytes: Uint8Array }) =>
 }
 
 describe("Anthropic client / Responses upstream Tool Loop", () => {
+  it.each([false, true])("persists converted Client-only continuations (resumed: %s)", async (resumed) => {
+    const onPrepared = vi.fn(async (_dispatch: { bytes: Uint8Array }) => {});
+    const { coordinator, storage, reenter } = harness(onPrepared);
+    const client = callRound([{ index: 0, id: "fc_client", callId: "c1", name: "Bash", arguments: "{\"command\":\"pwd\"}" }]);
+    const parentStateKey = { ...scope, toolBatchId: "parent" };
+    reenter.mockImplementationOnce(async () => ({ stream: stream(client), status: 200, headers }));
+
+    const decision = await coordinator.handleRound({
+      stream: stream(resumed ? client : callRound([{ index: 0, id: "fc_native", callId: "p1", name: "tdai_memory_search", arguments: "{\"query\":\"rules\"}" }])),
+      status: 200, headers, scope, turnSeq: 1, upstreamSnapshot: snapshot,
+      round: resumed ? 3 : 1, totalCalls: resumed ? 1 : 0,
+      ...(resumed ? { parentStateKey, parentReentryAttempt: 1 } : {}),
+    });
+
+    expect(decision.kind).toBe("client_dispatch");
+    if (decision.kind !== "client_dispatch") throw new Error("expected Client dispatch");
+    expect(onPrepared).toHaveBeenCalledTimes(1);
+    expect(await storage.get(decision.stateKey)).toMatchObject({
+      round: resumed ? 3 : 2, totalCalls: 1, clientDispatchStatus: "dispatched",
+      slots: [{ callId: "c1", owner: "client" }],
+      clientDispatchOutcome: { bodyBase64: Buffer.from(decision.bytes).toString("base64") },
+    });
+    expect(decoder.decode(decision.bytes)).toContain("event: message_start");
+    expect(decoder.decode(decision.bytes)).not.toContain("response.output_item");
+    expect(decoder.decode(decision.bytes)).not.toContain("tdai_memory_search");
+  });
+
   it("executes a Native call using Responses re-entry and returns only Anthropic SSE", async () => {
     const { coordinator, execute, reenter } = harness();
     const decision = await coordinator.handleRound({
