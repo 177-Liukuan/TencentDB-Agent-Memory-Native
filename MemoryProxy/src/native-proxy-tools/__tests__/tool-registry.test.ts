@@ -395,6 +395,47 @@ describe("Native Proxy Tool injection", () => {
   });
 
   it.each([
+    { profile: true, splitBlocks: false },
+    { profile: true, splitBlocks: true },
+    { profile: false, splitBlocks: false },
+    { profile: false, splitBlocks: true },
+  ])("keeps the Memory guide before Skill guidance like Baseline: $profile/$splitBlocks", async ({ profile, splitBlocks }) => {
+    const hooks = new HookRegistryImpl();
+    hooks.register(new NativeProxyToolsInjector({
+      enabled: true,
+      registry: createDefaultNativeProxyToolRegistry(),
+      skillEnabled: true,
+    }));
+    const pipeline = new InjectionPipeline(hooks, new Map([["anthropic", new AnthropicAdapter()]]));
+    // 缓存资产既可能被合成一个 System 文本块，也可能仍分块；两种形式都不能把规则移到 Skill 后面。
+    const parts = [
+      "Original system prompt",
+      ...(profile ? ["<tdai_profile_memory>\nL3 and L2 index\n</tdai_profile_memory>"] : []),
+      "<session_context>Current task</session_context>",
+      "## Skills (mandatory)\n<available_skills>\n- example: Relevant workflow\n</available_skills>\nOnly proceed without loading a skill if genuinely none are relevant to the task.",
+    ];
+    const output = await pipeline.process({
+      model: "claude-test", stream: true,
+      system: splitBlocks ? parts.map((text) => ({ type: "text", text })) : parts.join("\n\n"),
+      messages: [{ role: "user", content: "Implement a task" }],
+    }, metadata);
+    const system = typeof output.system === "string" ? output.system
+      : (output.system as Array<{ text: string }>).map((block) => block.text).join("\n");
+    const guideStart = system.indexOf("<memory-tools-guide>");
+    const guideEnd = system.indexOf("</memory-tools-guide>");
+    expect(guideStart).toBeGreaterThan(-1);
+    expect(guideEnd).toBeLessThan(system.indexOf("## Skills (mandatory)"));
+    if (profile) {
+      expect(guideStart).toBeGreaterThan(system.indexOf("</tdai_profile_memory>"));
+      expect(guideEnd).toBeLessThan(system.indexOf("<session_context>"));
+    }
+    expect(system.match(/<memory-tools-guide>/g)).toHaveLength(1);
+    for (const part of parts) expect(system).toContain(part);
+    expect(output.tools).toHaveLength(10);
+    expect(output.messages).toEqual([{ role: "user", content: [{ type: "text", text: "Implement a task" }] }]);
+  });
+
+  it.each([
     { memoryEnabled: true, skillEnabled: true },
     { memoryEnabled: true, skillEnabled: false },
     { memoryEnabled: false, skillEnabled: true },

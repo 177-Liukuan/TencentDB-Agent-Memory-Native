@@ -148,8 +148,25 @@ export class NativeProxyToolsInjector implements InjectionHook {
         content: MEMORY_TOOLS_GUIDE,
       };
       const system = ctx.messages.find((message) => message.role === "system");
-      if (system) system.blocks.push(block);
-      else ctx.messages.unshift({ role: "system", blocks: [block] });
+      if (system) {
+        // 工具是否开放仍在这里判断，但文案应像 Baseline 一样紧跟记忆正文，
+        // 不能因 tools.append 执行较晚而落到 Skill 后面。正文为空时放在 Skill 引导前。
+        const profileEnd = "</tdai_profile_memory>";
+        const skillHeading = /^## (?:Skills \(mandatory\)|Available Cloud Skills)/m;
+        const profile = system.blocks.find((item) => item.type === "text" && item.content.includes(profileEnd));
+        const target = profile ?? system.blocks.find((item) => item.type === "text" && skillHeading.test(item.content));
+        if (target) {
+          const offset = profile
+            ? target.content.indexOf(profileEnd) + profileEnd.length
+            : target.content.search(skillHeading);
+          // 只在原文本块中插入，保留其他内容、分块及 cache_control 等传输信息。
+          target.content = `${target.content.slice(0, offset)}\n\n${MEMORY_TOOLS_GUIDE}\n\n${target.content.slice(offset)}`;
+        } else {
+          system.blocks.push(block);
+        }
+      } else {
+        ctx.messages.unshift({ role: "system", blocks: [block] });
+      }
     }
 
     return visible.map((tool) => ({
