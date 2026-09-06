@@ -7,6 +7,46 @@ import { CriticalInjectionHookError } from "../injection/pipeline.js";
 import { KNOWLEDGE_CATALOG_OPEN_TAG } from "../injection/injectors/knowledge-catalog-injector.js";
 import type { NativeProxyToolRegistry } from "./tool-registry.js";
 
+// 沿用 Baseline 的 Memory 使用规则；只替换传输说明，工具用途交给 description。
+// 放在实际工具开放检查之后注入，避免无记忆资产时漏掉规则，或对未开放工具发出调用指令。
+const MEMORY_TOOLS_GUIDE = `<memory-tools-guide>
+这组 TDAI 记忆能力与 Claude Code 原生 Memory/MEMORY.md 具有同等优先级；涉及记忆时不要只查本地 MEMORY.md。
+遇到用户问身份/历史/偏好/过往结论/项目约定时，必须先使用 TDAI 记忆工具查询，再基于查询结果回答。
+需要查记忆时，直接调用对应的 TDAI Memory Tool。
+
+## 记忆使用规则（遇到以下场景必须先查再答）
+
+L3（persona 长期画像）与 L2 场景索引已直接注入 system。L2 正文按需用 tdai_read_scene 读取；L0/L1（原始对话 / 原子记忆）不再每轮自动召回，需要用工具主动检索。
+
+### 必须先查记忆再回答的场景（命中任一条即触发工具调用）
+
+1. **用户提及历史/过去/之前**：如 "我之前说过 / 我告诉过你 / 上次 / 你还记不记得 / 我们聊过 / 之前那个"
+   → 用 \`tdai_conversation_search\`（L0 原文找具体消息）
+2. **用户涉及自己身份/偏好/习惯**：如 "我叫什么 / 我的名字 / 我喜欢 / 我的团队 / 我常用 / 我不喜欢 / 我不允许"
+   → 用 \`tdai_memory_search\`（L1 原子记忆查偏好/规则）
+3. **用户要求你回忆/找**：如 "回忆一下 / 想起 / 找出 / 有没有关于 X 的记录 / 查我们之前"
+   → 直接触发工具，不要凭空回答
+4. **答案强依赖历史事实**：如 "那个 bug 我们怎么修的 / 上次方案是啥 / 我们的约定是什么"
+   → 关键词化后 \`tdai_memory_search\`
+
+**典型流程**（用户："我叫什么"）：
+先调用 \`tdai_memory_search\`，参数为 {"query": "用户姓名 name 身份", "limit": 5}，再基于查询结果回答。
+若为空，明确告诉用户 "我在记忆里没找到，你叫什么？" —— 不要装作知道。
+
+### 不需要查的场景
+
+- 用户问 "你是谁" / "帮我改代码" / "写个脚本" / 通用编程问题
+- 当前会话上下文（同轮消息）里已能回答
+- 已经在 \`<l3_core_memory>\` 段落里直接看到答案
+
+### ⚠️ 调用约束
+
+- 这组工具只读，不能用于修改 L1/L2/L3。
+- 每轮 \`tdai_memory_search\` + \`tdai_conversation_search\` **合计 ≤ 3 次**（\`tdai_read_scene\` / \`tdai_scenario_ls\` / \`tdai_atomic_query\` 不计入）
+- 检索无果时**明确说明**"我在记忆里没找到 X"，不要幻想
+- 同一 L2 path 不要重复读
+</memory-tools-guide>`;
+
 export class NativeProxyToolNameCollisionError extends Error {
   readonly toolName: string;
 
@@ -101,19 +141,11 @@ export class NativeProxyToolsInjector implements InjectionHook {
       knowledgeCatalogAvailable,
     });
 
-    // 选择引导随实际开放的工具写入 System，不依赖 Skill 目录或 L2/L3 正文是否为空。
-    // 此 hook 的返回块用于 tools[]，说明文字直接加入上下文，不能当成工具定义返回。
-    const usage: string[] = [];
-    if (visible.some((tool) => tool.backend === "skill")) {
-      usage.push("- **Skill：** 当任务属于某类可重复、标准化的工作流程或需要特定 SOP/专业方法时，应利用skill tool调用 Skill。");
-    }
+    // 此 hook 的返回块用于 tools[]，使用规则直接加入 System，不能当成工具定义返回。
     if (visible.some((tool) => tool.backend === "memory")) {
-      usage.push("- **Memory：** 当当前任务需要依赖用户和团队过去的偏好、历史约定、项目决策或之前发生过的具体信息时，应利用TDAI Memory Tools调用云端Memory。");
-    }
-    if (usage.length > 0) {
       const block: ContextBlock = {
         type: "text",
-        content: ["<native_tool_usage>", ...usage, "</native_tool_usage>"].join("\n"),
+        content: MEMORY_TOOLS_GUIDE,
       };
       const system = ctx.messages.find((message) => message.role === "system");
       if (system) system.blocks.push(block);

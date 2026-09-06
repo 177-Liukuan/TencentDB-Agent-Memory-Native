@@ -188,25 +188,25 @@ describe("Native Proxy Tool Registry", () => {
     }
   });
 
-  it("describes when to use related Native tools without transport instructions", () => {
+  it("preserves Baseline tool purposes without adding selection priorities or transport instructions", () => {
     const registry = createDefaultNativeProxyToolRegistry();
     const expectedGuidance: Record<string, readonly string[]> = {
-      tdai_memory_search: ["关键词和语义", "自有记忆", "已授权借入记忆", "source_agent_", "tdai_conversation_search"],
-      tdai_atomic_query: ["不进行语义检索", "tdai_memory_search"],
-      tdai_conversation_search: ["L0", "tdai_memory_search"],
-      tdai_conversation_query: ["session_id", "tdai_conversation_search"],
-      tdai_scenario_ls: ["不读取完整正文", "已经注入", "刷新", "path_prefix", "tdai_read_scene"],
-      tdai_read_scene: ["tdai_scenario_ls", "全文", "借入场景", "agent_id"],
-      skill_search: ["关键词和语义", "有权访问", "2～5", "更换关键词", "skill_view"],
-      skill_view: ["skill_name", "Skill 列表", "skill_search", "skill_id", "路径", "skill_files_read"],
-      skill_files_read: ["skill_view", "skill_id", "path"],
-      skill_extract: ["异步", "适合", "完整", "复用", "reason"],
-      skill_create: ["当前 Agent", "frontmatter", "resources", "skill_update", "skill_patch"],
-      skill_update: ["完整", "新版本", "不能更改", "skill_patch"],
-      skill_patch: ["old_string", "唯一", "replace_all", "新版本", "skill_update"],
-      skill_delete: ["永久删除", "所有版本", "资源", "明确不再需要"],
-      skill_files_write: ["相对路径", "新版本", "skill_update", "skill_patch"],
-      skill_files_remove: ["相对路径", "新版本", "skill_update", "skill_patch"],
+      tdai_memory_search: ["L1 原子记忆", "按相关度排序", "self + imported", "source_agent_", "偏好"],
+      tdai_atomic_query: ["type / 时间窗 / 分页", "不做语义检索"],
+      tdai_conversation_search: ["L0", "具体消息原文 / 引用 / 时间线", "self + imported", "source_agent_"],
+      tdai_conversation_query: ["按 session 顺序取 L0 历史消息"],
+      tdai_scenario_ls: ["含 summary，不含正文", "system 已注入索引", "刷新/按前缀过滤"],
+      tdai_read_scene: ["tdai_scenario_ls", "全文", "imported_from", "agent_id"],
+      skill_search: ["关键词 + 语义", "有权限访问", "2-5", "换一组关键词", "自带的 skill 不够"],
+      skill_view: ["skill_name", "<available_skills>", "skill_search", "manifest", "skill_files_read"],
+      skill_files_read: ["skill_view", "skill_id", "path", "返回文件内容及编码"],
+      skill_extract: ["异步", "适合", "完整", "复用", "不用传 messages"],
+      skill_create: ["新建 skill", "当前 agent"],
+      skill_update: ["替换 SKILL.md", "version+1"],
+      skill_patch: ["子串替换", "避免大 diff"],
+      skill_delete: ["永久删除", "所有版本", "资源"],
+      skill_files_write: ["增/改资源文件", "version+1"],
+      skill_files_remove: ["删资源文件", "实际删除文件", "version+1"],
       tdai_knowledge_tools_list: ["Knowledge", "knowledge_id", "工具清单"],
       tdai_knowledge_tool_call: ["tools_list", "tool_name", "params"],
     };
@@ -219,6 +219,8 @@ describe("Native Proxy Tool Registry", () => {
     expect(registry.require("skill_files_read").description).not.toContain("结果大小限制");
     expect(registry.require("skill_extract").description).not.toContain("仅在");
     expect(registry.require("skill_delete").description).not.toContain("软删除");
+    expect(registry.require("tdai_conversation_search").description).not.toContain("优先使用");
+    expect(registry.require("skill_update").description).not.toContain("优先使用");
   });
 
   it.each([
@@ -352,12 +354,52 @@ describe("Native Proxy Tool Registry", () => {
 });
 
 describe("Native Proxy Tool injection", () => {
+  it("serializes Skill parameter guidance in the schema without changing write exposure", async () => {
+    const hooks = new HookRegistryImpl();
+    hooks.register(new NativeProxyToolsInjector({
+      enabled: true, memoryEnabled: false, skillEnabled: true, allowSkillWrite: true,
+      registry: createDefaultNativeProxyToolRegistry(),
+    }));
+    const pipeline = new InjectionPipeline(hooks, new Map([["anthropic", new AnthropicAdapter()]]));
+    const output = await pipeline.process({
+      model: "claude-test", stream: true,
+      messages: [{ role: "user", content: "update a reusable workflow" }],
+    }, metadata);
+    const tools = output.tools as Array<{ name: string; description: string; input_schema: Record<string, unknown> }>;
+    const extract = tools.find((tool) => tool.name === "skill_extract")!;
+    expect(extract.description).not.toContain("reason");
+    expect(extract.input_schema).toMatchObject({
+      properties: { reason: { description: expect.stringContaining("识别边界") } },
+    });
+    expect(extract.input_schema).not.toHaveProperty("required");
+    const create = tools.find((tool) => tool.name === "skill_create")!;
+    expect(create.description).not.toContain("frontmatter");
+    expect(create.input_schema).toMatchObject({
+      properties: {
+        content: { description: expect.stringContaining("frontmatter.name") },
+        resources: { description: expect.stringContaining("资源文件") },
+      },
+      required: ["name", "content"],
+    });
+    expect(tools.find((tool) => tool.name === "skill_update")!.input_schema).toMatchObject({
+      properties: { content: { description: expect.stringContaining("不能更改 frontmatter.name") } },
+    });
+    expect(tools.find((tool) => tool.name === "skill_patch")!.input_schema).toMatchObject({
+      properties: {
+        old_string: { description: expect.any(String) },
+        new_string: { description: expect.stringContaining("空字符串") },
+        replace_all: { default: false, description: expect.stringContaining("唯一匹配") },
+      },
+    });
+    expect(tools).toHaveLength(10);
+  });
+
   it.each([
-    { memoryEnabled: true, skillEnabled: true, labels: ["Skill", "Memory"] },
-    { memoryEnabled: true, skillEnabled: false, labels: ["Memory"] },
-    { memoryEnabled: false, skillEnabled: true, labels: ["Skill"] },
-    { memoryEnabled: false, skillEnabled: false, labels: [] },
-  ])("adds usage guidance only for available tool families: $labels", async ({ memoryEnabled, skillEnabled, labels }) => {
+    { memoryEnabled: true, skillEnabled: true },
+    { memoryEnabled: true, skillEnabled: false },
+    { memoryEnabled: false, skillEnabled: true },
+    { memoryEnabled: false, skillEnabled: false },
+  ])("retains the Memory guide without assets only when Memory tools are exposed: $memoryEnabled/$skillEnabled", async ({ memoryEnabled, skillEnabled }) => {
     const hooks = new HookRegistryImpl();
     hooks.register(new NativeProxyToolsInjector({
       enabled: true,
@@ -371,10 +413,18 @@ describe("Native Proxy Tool injection", () => {
       messages: [{ role: "user", content: "a task without preloaded assets" }],
     }, metadata);
     const system = typeof output.system === "string" ? output.system : JSON.stringify(output.system ?? "");
-    for (const label of ["Skill", "Memory"]) {
-      expect(system.includes(`**${label}：**`)).toBe(labels.includes(label));
+    expect(system).not.toContain("<native_tool_usage>");
+    expect(system.match(/<memory-tools-guide>/g) ?? []).toHaveLength(memoryEnabled ? 1 : 0);
+    if (memoryEnabled) {
+      expect(system).toContain("用户提及历史/过去/之前");
+      expect(system).toContain("用户涉及自己身份/偏好/习惯");
+      expect(system).toContain("用户要求你回忆/找");
+      expect(system).toContain("答案强依赖历史事实");
+      expect(system).toContain("当前会话上下文（同轮消息）里已能回答");
+      expect(system).toContain("合计 ≤ 3 次");
+      expect(system).toContain("同等优先级");
+      expect(system).not.toMatch(/curl|Bash|二者都应/);
     }
-    expect(system.match(/<native_tool_usage>/g) ?? []).toHaveLength(labels.length ? 1 : 0);
     expect(output.tools ?? []).toHaveLength((memoryEnabled ? 6 : 0) + (skillEnabled ? 4 : 0));
   });
 
@@ -695,7 +745,6 @@ describe("Native Proxy Tool injection", () => {
     ]));
     const forbiddenTags = new RegExp([
       "<tdai_" + "memory_tools>",
-      "<memory-" + "tools-guide>",
       "<skill_" + "tools>",
       "<knowledge_" + "tools>",
     ].join("|"));

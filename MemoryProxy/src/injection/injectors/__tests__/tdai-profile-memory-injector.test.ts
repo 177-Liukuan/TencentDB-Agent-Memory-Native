@@ -8,7 +8,7 @@ afterEach(() => {
 });
 
 describe("TDAI profile memory prompt", () => {
-  it("explains cloud-memory priority and directs L2 reads to tdai_read_scene", async () => {
+  it("keeps profile material separate from the tool usage guide", async () => {
     vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
       const url = String(input);
       const data = url.endsWith("/v3/core/read")
@@ -59,12 +59,10 @@ describe("TDAI profile memory prompt", () => {
     const prompt = blocks[0]?.content ?? "";
 
     expect(prompt).toContain(
-      "以下是 TDAI 长期记忆，它与 Claude Code 本地 MEMORY.md 是不同的数据源，但具有同等优先级。",
-    );
-    expect(prompt).toContain(
-      "L2 只列路径和摘要，需要正文时使用 `tdai_read_scene` 读取所列路径。",
+      "以下是 TDAI 为当前 agent 维护的长期工作记忆（自有 + 借入分段；L2 仅给索引，按需用工具读全文）：",
     );
     expect(prompt).toContain("用户偏好简洁的回答。");
     expect(prompt).toContain("`projects/native-tool.md` — Native Tool 项目约定");
+    expect(prompt).not.toMatch(/二者都应|tdai_memory_search|<native_tool_usage>|<memory-tools-guide>/);
   });
 });

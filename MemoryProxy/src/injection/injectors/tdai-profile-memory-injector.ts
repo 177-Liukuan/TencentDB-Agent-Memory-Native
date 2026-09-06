@@ -77,29 +77,14 @@ export class TdaiProfileMemoryInjector implements InjectionHook {
     // 对每个 agent 独立拉 L3 + L2 索引（不读 L2 全文）
     const groups = await Promise.all(ctxs.map((c) => loadAgentProfile(client, c)));
 
-    // No profile material means no prompt block. Native search is injected
-    // independently in tools[] and never needs a text fallback here.
+    // 动态记忆只保留 Baseline 的正文和索引。使用规则随实际开放的 Memory
+    // 工具注入；不能因 L2/L3 为空而丢掉 L0/L1 的查询引导。
     const hasAnything = groups.some((g) => g.l3 || g.l2Entries.length > 0);
     if (!hasAnything) return [];
 
     const lines: string[] = [
       "<tdai_profile_memory>",
-      "以下是 TDAI 云端长期记忆，与文件系统中的记忆属于不同数据源，但具有同等优先级；需要使用历史信息时，二者都应查询和参考。",
-      "",
-      "- `L3`：可直接参考当前注入的长期画像内容。",
-      "- `L0/L1`：原始对话和已提炼记忆不会自动注入，需要时通过 TDAI Memory Tools 主动查询。",
-      "- `L2`：当前仅提供场景路径和摘要；需要完整正文时，使用 `tdai_read_scene` 读取对应路径。",
-      "",
-      "TDAI 云端记忆保存用户和团队过去的偏好、历史约定、项目决策及具体对话，可通过以下 Memory Tool 查询和读取：",
-      "",
-      "- `tdai_memory_search`：按关键词或含义查找已经提炼的偏好、规则和历史结论。",
-      "- `tdai_atomic_query`：按已知的记忆类型、时间范围和分页条件读取已提炼的记忆。",
-      "- `tdai_conversation_search`：查找过去的具体对话、原话和讨论过程。",
-      "- `tdai_conversation_query`：按已知的会话 ID，顺序读取该会话的历史消息。",
-      "- `tdai_scenario_ls`：查看场景记忆的路径和摘要；当前已注入 L2 目录时，通常无需重复查询。",
-      "- `tdai_read_scene`：按场景目录提供的路径，读取对应记忆的完整正文。",
-      "",
-      "当任务涉及用户身份、偏好、过往经历、历史事件或项目约定，且当前上下文中没有可靠答案时，应查询 TDAI 云端记忆。",
+      "以下是 TDAI 为当前 agent 维护的长期工作记忆（自有 + 借入分段；L2 仅给索引，按需用工具读全文）：",
     ];
     let l2TotalCount = 0;
     let l3Count = 0;

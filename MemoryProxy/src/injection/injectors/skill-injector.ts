@@ -47,23 +47,34 @@ export interface SkillInjectorConfig {
 /**
  * Prompt boilerplate wrapping the `<available_skills>` listing.
  *
- * 目录只说明读取方式；Memory / Skill 的选择引导随实际开放的真工具统一注入。
+ * 保留 Baseline 的加载条件和语气，只替换调用方式。这里不要求调用可能
+ * 未开放的 skill_create / skill_patch；写能力仍由实际注入的 Schema 决定。
  */
 const NATIVE_SKILL_LISTING_HEADER =
-  "## Available Cloud Skills\n"
+  "## Skills (mandatory)\n"
+  + "Before replying, scan the skills below. If a skill matches or is even partially relevant "
+  + "to your task, you MUST load it by calling the `skill_view` tool and follow its instructions. "
+  + "Err on the side of loading — it is always better to have context you don't need "
+  + "than to miss critical steps, pitfalls, or established workflows. "
+  + "Skills contain specialized knowledge — API endpoints, tool-specific commands, "
+  + "and proven workflows that outperform general-purpose approaches. Load the skill "
+  + "even if you think you could handle the task with basic tools like web_search or terminal. "
+  + "Skills also encode the user's preferred approach, conventions, and quality standards "
+  + "for tasks like code review, planning, and testing — load them even for tasks you "
+  + "already know how to do, because the skill defines how it should be done here.\n"
+  + "以下是你（当前 agent）自带的云端 skill 列表。这些 skill 存储在你的 agent 名下，\n"
+  + "优先使用它们完成任务。如果你觉得自带的 skill 不够，可以用 skill_search 工具\n"
+  + "在团队的 skill 库中检索更多（跨 agent 共享）。\n"
   + "\n"
-  + "当前 Agent 关联的云端 Skill，可用于提供完成任务的方法、操作流程和参考文件，云端 Skill 内容通过下面的 Skill Tool读取，不存在于本地文件系统中。\n"
-  + "\n"
-  + "- `skill_search`：根据当前任务查找相关的云端 Skill。\n"
-  + "- `skill_view`：读取指定 Skill 的完整 `SKILL.md` 内容及其资源目录。\n"
-  + "- `skill_files_read`：读取指定 Skill 中的参考文件、脚本或其他资源文件。\n";
+  + "**重要：这些 skill 存储在云端，不能通过本地文件工具直接访问，\n"
+  + "必须调用 skill_view 读取正文和资源目录，再用 skill_files_read 读取资源文件。**";
 const REFERENCE_ONLY_SKILL_LISTING_HEADER =
   "## Available Cloud Skills (reference only)\n"
   + "以下是当前 Agent 关联的云端 Skill 元数据。"
   + "当前请求未提供云端 Skill 工具，只能将名称和描述作为背景信息。";
 
 const NATIVE_SKILL_LISTING_FOOTER =
-  "只有在实际读取 Skill 内容后，才能声称已经使用该 Skill。";
+  "Only proceed without loading a skill if genuinely none are relevant to the task.";
 
 const REFERENCE_ONLY_SKILL_LISTING_FOOTER =
   "未读取 Skill 正文时，不要声称已经加载或执行其内容。";

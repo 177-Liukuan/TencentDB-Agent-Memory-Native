@@ -13,7 +13,13 @@ describe("Skill capability prompt", () => {
     expect(output).toContain("skill_search");
     expect(output).toContain("skill_view");
     expect(output).toContain("skill_files_read");
-    expect(output).toContain("云端 Skill 内容通过上述 Skill 工具读取，不在本地文件系统中。");
+    expect(output).toContain("even partially relevant");
+    expect(output).toContain("you MUST load it by calling the `skill_view` tool");
+    expect(output).toContain("even if you think you could handle the task");
+    expect(output).toContain("Only proceed without loading a skill if genuinely none are relevant");
+    expect(output).toContain("- deploy: Deploy the project");
+    expect(output).toContain("优先使用它们完成任务");
+    expect(output).not.toMatch(/skill_patch|skill_create/);
     expect(output).not.toContain("不要使用本地 `Read` 或 `Bash` 访问");
     expect(output).not.toMatch(/does not expose|没有提供给模型/i);
     expect(output).not.toMatch(/curl/i);
@@ -29,6 +35,7 @@ describe("Skill capability prompt", () => {
     expect(output).toContain("当前请求未提供云端 Skill 工具");
     expect(output).not.toContain("skill_search");
     expect(output).not.toContain("skill_view");
+    expect(output).not.toContain("MUST load");
     expect(output).not.toMatch(/curl/i);
   });
 });
