@@ -64,9 +64,7 @@ describe("TDAI profile memory prompt", () => {
     expect(prompt).toContain(
       "L2 只列路径和摘要，需要正文时使用 `tdai_read_scene` 读取所列路径。",
     );
-    expect(prompt).toContain(
-      "涉及用户身份、偏好、过往经历或项目约定时，不要只依赖本地记忆，可以调用 TDAI 相关工具查询云端记忆；当前上下文没有可靠答案时，应使用 TDAI Memory 工具查询。",
-    );
+    expect(prompt).toContain("用户偏好简洁的回答。");
     expect(prompt).toContain("`projects/native-tool.md` — Native Tool 项目约定");
   });
 });

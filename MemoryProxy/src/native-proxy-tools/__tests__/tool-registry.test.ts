@@ -353,6 +353,32 @@ describe("Native Proxy Tool Registry", () => {
 
 describe("Native Proxy Tool injection", () => {
   it.each([
+    { memoryEnabled: true, skillEnabled: true, labels: ["Skill", "Memory"] },
+    { memoryEnabled: true, skillEnabled: false, labels: ["Memory"] },
+    { memoryEnabled: false, skillEnabled: true, labels: ["Skill"] },
+    { memoryEnabled: false, skillEnabled: false, labels: [] },
+  ])("adds usage guidance only for available tool families: $labels", async ({ memoryEnabled, skillEnabled, labels }) => {
+    const hooks = new HookRegistryImpl();
+    hooks.register(new NativeProxyToolsInjector({
+      enabled: true,
+      registry: createDefaultNativeProxyToolRegistry(),
+      memoryEnabled,
+      skillEnabled,
+    }));
+    const pipeline = new InjectionPipeline(hooks, new Map([["anthropic", new AnthropicAdapter()]]));
+    const output = await pipeline.process({
+      model: "claude-test", stream: true,
+      messages: [{ role: "user", content: "a task without preloaded assets" }],
+    }, metadata);
+    const system = typeof output.system === "string" ? output.system : JSON.stringify(output.system ?? "");
+    for (const label of ["Skill", "Memory"]) {
+      expect(system.includes(`**${label}：**`)).toBe(labels.includes(label));
+    }
+    expect(system.match(/<native_tool_usage>/g) ?? []).toHaveLength(labels.length ? 1 : 0);
+    expect(output.tools ?? []).toHaveLength((memoryEnabled ? 6 : 0) + (skillEnabled ? 4 : 0));
+  });
+
+  it.each([
     { stream: false, enabled: true, expected: 0 },
     { stream: true, enabled: false, expected: 0 },
     { stream: true, enabled: true, expected: 6 },

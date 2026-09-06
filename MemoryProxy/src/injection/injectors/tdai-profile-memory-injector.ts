@@ -39,7 +39,7 @@ export class TdaiProfileMemoryInjector implements InjectionHook {
   constructor(
     private baseConfig: TdaiMemoryConfig,
     private coreSkillCfg: Pick<CoreSkillConfig, "endpoint" | "serviceToken" | "serviceId" | "timeoutMs"> | null = null,
-  ) {}
+  ) { }
 
   async execute(ctx: AgentContext): Promise<ContextBlock[]> {
     const caps = ctx.metadata.custom?.assetCapabilities as { chat_memory?: boolean } | undefined;
@@ -84,11 +84,23 @@ export class TdaiProfileMemoryInjector implements InjectionHook {
 
     const lines: string[] = [
       "<tdai_profile_memory>",
-      "以下是 TDAI 长期记忆，它与 Claude Code 本地 MEMORY.md 是不同的数据源，但具有同等优先级。",
-      "L3 内容可直接参考；L2 只列路径和摘要，需要正文时使用 `tdai_read_scene` 读取所列路径。",
-      "涉及用户身份、偏好、过往经历或项目约定时，不要只依赖本地记忆，可以调用 TDAI 相关工具查询云端记忆；当前上下文没有可靠答案时，应使用 TDAI Memory 工具查询。",
+      "以下是 TDAI 云端长期记忆，与文件系统中的记忆属于不同数据源，但具有同等优先级；需要使用历史信息时，二者都应查询和参考。",
+      "",
+      "- `L3`：可直接参考当前注入的长期画像内容。",
+      "- `L0/L1`：原始对话和已提炼记忆不会自动注入，需要时通过 TDAI Memory Tools 主动查询。",
+      "- `L2`：当前仅提供场景路径和摘要；需要完整正文时，使用 `tdai_read_scene` 读取对应路径。",
+      "",
+      "TDAI 云端记忆保存用户和团队过去的偏好、历史约定、项目决策及具体对话，可通过以下 Memory Tool 查询和读取：",
+      "",
+      "- `tdai_memory_search`：按关键词或含义查找已经提炼的偏好、规则和历史结论。",
+      "- `tdai_atomic_query`：按已知的记忆类型、时间范围和分页条件读取已提炼的记忆。",
+      "- `tdai_conversation_search`：查找过去的具体对话、原话和讨论过程。",
+      "- `tdai_conversation_query`：按已知的会话 ID，顺序读取该会话的历史消息。",
+      "- `tdai_scenario_ls`：查看场景记忆的路径和摘要；当前已注入 L2 目录时，通常无需重复查询。",
+      "- `tdai_read_scene`：按场景目录提供的路径，读取对应记忆的完整正文。",
+      "",
+      "当任务涉及用户身份、偏好、过往经历、历史事件或项目约定，且当前上下文中没有可靠答案时，应查询 TDAI 云端记忆。",
     ];
-
     let l2TotalCount = 0;
     let l3Count = 0;
     for (const g of groups) {

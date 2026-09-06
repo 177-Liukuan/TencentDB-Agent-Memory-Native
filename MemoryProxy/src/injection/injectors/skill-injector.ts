@@ -47,16 +47,16 @@ export interface SkillInjectorConfig {
 /**
  * Prompt boilerplate wrapping the `<available_skills>` listing.
  *
- * 这里只说明本次请求真实具备的能力；具体参数和权限仍以结构化 Tool Schema
- * 为准，避免重新引入 Fake Tool 时代的命令说明。
+ * 目录只说明读取方式；Memory / Skill 的选择引导随实际开放的真工具统一注入。
  */
 const NATIVE_SKILL_LISTING_HEADER =
   "## Available Cloud Skills\n"
-  + "以下是当前 Agent 关联的云端 Skill。\n"
-  + "需要查找或读取 Skill 内容时，使用 `skill_search` 和 `skill_view`；"
-  + "读取 Skill 资源文件时，使用 `skill_files_read`。\n"
-  + "云端 Skill 内容通过上述 Skill 工具读取，不在本地文件系统中。";
-
+  + "\n"
+  + "当前 Agent 关联的云端 Skill，可用于提供完成任务的方法、操作流程和参考文件，云端 Skill 内容通过下面的 Skill Tool读取，不存在于本地文件系统中。\n"
+  + "\n"
+  + "- `skill_search`：根据当前任务查找相关的云端 Skill。\n"
+  + "- `skill_view`：读取指定 Skill 的完整 `SKILL.md` 内容及其资源目录。\n"
+  + "- `skill_files_read`：读取指定 Skill 中的参考文件、脚本或其他资源文件。\n";
 const REFERENCE_ONLY_SKILL_LISTING_HEADER =
   "## Available Cloud Skills (reference only)\n"
   + "以下是当前 Agent 关联的云端 Skill 元数据。"
@@ -149,7 +149,7 @@ export class SkillInjector implements InjectionHook {
     private config: SkillInjectorConfig,
     /** Optional override (tests). */
     private clientOverride?: CoreSkillClient,
-  ) {}
+  ) { }
 
   /**
    * Live-path execute (cache-miss self-heal).
@@ -246,8 +246,8 @@ export class SkillInjector implements InjectionHook {
     const serviceId = space_id || undefined;
     console.log(
       `${TAG} ${trigger} team=${team_id} agent=${agent_id}`
-        + ` space=${space_id ?? "(none)"} serviceId=${serviceId ?? "(fallback config)"}`
-        + ` query=${JSON.stringify(query?.slice(0, 80) ?? null)}`,
+      + ` space=${space_id ?? "(none)"} serviceId=${serviceId ?? "(fallback config)"}`
+      + ` query=${JSON.stringify(query?.slice(0, 80) ?? null)}`,
     );
 
     let result: ListingResult;
@@ -260,7 +260,7 @@ export class SkillInjector implements InjectionHook {
       }, { serviceId });
       console.log(
         `${TAG} ${trigger} result mode=${result.mode}`
-          + ` hits=${result.hits?.length ?? 0} listingLen=${(result.listing ?? "").length}`,
+        + ` hits=${result.hits?.length ?? 0} listingLen=${(result.listing ?? "").length}`,
       );
     } catch (err) {
       console.warn(

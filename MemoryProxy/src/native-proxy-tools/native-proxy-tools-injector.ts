@@ -66,7 +66,7 @@ export class NativeProxyToolsInjector implements InjectionHook {
   readonly cacheStrategy = "none" as const;
   readonly critical = true;
 
-  constructor(private readonly options: NativeProxyToolsInjectorOptions) {}
+  constructor(private readonly options: NativeProxyToolsInjectorOptions) { }
 
   execute(ctx: AgentContext): ContextBlock[] {
     if (!this.isEligibleRequest(ctx)) return [];
@@ -100,6 +100,25 @@ export class NativeProxyToolsInjector implements InjectionHook {
         capabilities?.llm_wiki !== false || capabilities?.code_graph !== false,
       knowledgeCatalogAvailable,
     });
+
+    // 选择引导随实际开放的工具写入 System，不依赖 Skill 目录或 L2/L3 正文是否为空。
+    // 此 hook 的返回块用于 tools[]，说明文字直接加入上下文，不能当成工具定义返回。
+    const usage: string[] = [];
+    if (visible.some((tool) => tool.backend === "skill")) {
+      usage.push("- **Skill：** 当任务属于某类可重复、标准化的工作流程或需要特定 SOP/专业方法时，应利用skill tool调用 Skill。");
+    }
+    if (visible.some((tool) => tool.backend === "memory")) {
+      usage.push("- **Memory：** 当当前任务需要依赖用户和团队过去的偏好、历史约定、项目决策或之前发生过的具体信息时，应利用TDAI Memory Tools调用云端Memory。");
+    }
+    if (usage.length > 0) {
+      const block: ContextBlock = {
+        type: "text",
+        content: ["<native_tool_usage>", ...usage, "</native_tool_usage>"].join("\n"),
+      };
+      const system = ctx.messages.find((message) => message.role === "system");
+      if (system) system.blocks.push(block);
+      else ctx.messages.unshift({ role: "system", blocks: [block] });
+    }
 
     return visible.map((tool) => ({
       type: "custom" as const,
