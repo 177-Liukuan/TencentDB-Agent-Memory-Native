@@ -351,6 +351,10 @@ export async function executeMemoryBridge(
   }
 
   const inboundBody = input.body;
+  // session_id 是历史查询条件，不是当前执行会话的身份；未指定时应允许跨会话检索。
+  // 当前会话仍用于身份解析、工具状态和埋点，不能随查询目标一起切换。
+  const { session_id: requestedSessionId, ...queryBody } = inboundBody;
+  const querySessionId = typeof requestedSessionId === "string" ? requestedSessionId.trim() : "";
 
   const upstreamUrl = `${input.config.coreSkill.endpoint.replace(/\/$/, "")}/v3/${sub}`;
   const upstreamToken =
@@ -366,11 +370,11 @@ export async function executeMemoryBridge(
   const resolveContexts = deps.resolveMemoryContexts ?? resolveMemoryCtxs;
   const ctxs = await resolveContexts(input.config, ids, input.sessionId);
   const makeOutbound = (target: FixedAssetCtx): Record<string, unknown> => ({
-    ...inboundBody,
+    ...queryBody,
     user_id: target.userId,
     team_id: target.teamId,
     agent_id: target.agentId,
-    session_id: ids.session_id,
+    ...(querySessionId ? { session_id: querySessionId } : {}),
     ...(ids.task_id ? { task_id: ids.task_id } : {}),
   });
   const fetcher = deps.fetcher ?? globalThis.fetch.bind(globalThis);

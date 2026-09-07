@@ -44,7 +44,7 @@ function deps(overrides: Partial<MemoryBridgeDeps> = {}): MemoryBridgeDeps {
 }
 
 describe("executeMemoryBridge", () => {
-  it("overwrites model identity with trusted session identity", async () => {
+  it("overwrites access identity while preserving the requested source session", async () => {
     let upstreamBody: Record<string, unknown> | undefined;
     let upstreamHeaders: HeadersInit | undefined;
     const fetcher = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
@@ -80,13 +80,43 @@ describe("executeMemoryBridge", () => {
       user_id: "user-1",
       team_id: "team-1",
       agent_id: "agent-1",
-      session_id: "session-1",
+      session_id: "model-session",
       task_id: "task-1",
     });
     expect(new Headers(upstreamHeaders).get("authorization")).toBe("Bearer tdai-secret");
     expect(new Headers(upstreamHeaders).get("x-tdai-service-id")).toBe("space-1");
     expect(result).toMatchObject({ status: 200, contentType: "application/json" });
     expect(JSON.parse(result.text)).toMatchObject({ data: { items: [{ id: "memory-1" }] } });
+  });
+
+  it.each([
+    ["conversation/query", { session_id: " history-session " }, "history-session"],
+    ["conversation/search", { session_id: "history-session" }, "history-session"],
+    ["conversation/search", {}, undefined],
+    ["conversation/search", { session_id: " " }, undefined],
+  ])("keeps query scope separate from execution scope: %s %j", async (subpath, filter, expectedSession) => {
+    let outbound: Record<string, unknown> | undefined;
+    const loadSessionIdentity = vi.fn(async () => trustedIdentity);
+    const emitTelemetry = vi.fn();
+    const result = await executeMemoryBridge({
+      config: config(), subpath, body: { query: "past decision", ...filter },
+      sessionId: "session-1", spaceId: "space-1",
+    }, deps({
+      loadSessionIdentity, emitTelemetry,
+      fetcher: (async (_url, init) => {
+        outbound = JSON.parse(String(init?.body));
+        return new Response(JSON.stringify({ code: 0, data: { messages: [] } }), {
+          headers: { "content-type": "application/json" },
+        });
+      }) as typeof fetch,
+    }));
+
+    expect(result.status).toBe(200);
+    if (expectedSession === undefined) expect(outbound).not.toHaveProperty("session_id");
+    else expect(outbound?.session_id).toBe(expectedSession);
+    expect(outbound).toMatchObject({ user_id: "user-1", team_id: "team-1", agent_id: "agent-1", task_id: "task-1" });
+    expect(loadSessionIdentity).toHaveBeenCalledWith(expect.objectContaining({ sessionId: "session-1" }));
+    expect(emitTelemetry).toHaveBeenCalledWith(expect.objectContaining({ sessionKey: "claude-code:session-1" }));
   });
 
   it("fans out Memory search and merges results in score order", async () => {
