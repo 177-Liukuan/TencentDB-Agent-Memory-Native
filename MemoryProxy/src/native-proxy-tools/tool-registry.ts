@@ -279,11 +279,12 @@ const TOOLS: readonly NativeProxyToolDefinition[] = Object.freeze([
   definition({
     name: "tdai_conversation_query",
     description: "按 session 顺序取 L0 历史消息。",
-    inputSchema: objectSchema({ session_id: stringProperty("需要读取的会话标识"), limit: integerProperty(1, 200, 50), offset: integerProperty(0, 100_000, 0) }, ["session_id"]),
+    // 与 Core 的 100 条上限一致，避免模型按 Schema 合法生成参数后仍被后端拒绝。
+    inputSchema: objectSchema({ session_id: stringProperty("需要读取的会话标识"), limit: integerProperty(1, 100, 50), offset: integerProperty(0, 100_000, 0) }, ["session_id"]),
     backend: "memory", effect: "read", route: "conversation/query", exposure: "memory",
     validate: (input) => validate(input, ["session_id", "limit", "offset"], (record) => {
       const session = stringValue(record, "session_id", { required: true }); if (!session.ok) return session;
-      const limit = integerValue(record, "limit", 1, 200, 50); if (!limit.ok) return limit;
+      const limit = integerValue(record, "limit", 1, 100, 50); if (!limit.ok) return limit;
       const offset = integerValue(record, "offset", 0, 100_000, 0); if (!offset.ok) return offset;
       return success([["session_id", session.value], ["limit", limit.value], ["offset", offset.value]]);
     }),

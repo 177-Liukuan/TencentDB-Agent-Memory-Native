@@ -270,6 +270,33 @@ describe("Native Proxy Tool Registry", () => {
       .toMatchObject({ ok: false });
   });
 
+  it("publishes the Core conversation query limit without changing the default", () => {
+    const tool = createDefaultNativeProxyToolRegistry().require("tdai_conversation_query");
+
+    expect(tool.inputSchema).toMatchObject({
+      properties: { limit: { type: "integer", minimum: 1, maximum: 100, default: 50 } },
+    });
+    expect(tool.validate({ session_id: "session-old" })).toEqual({
+      ok: true, value: { session_id: "session-old", limit: 50, offset: 0 },
+    });
+  });
+
+  it.each([1, 100])("accepts conversation query limit %i", (limit) => {
+    const tool = createDefaultNativeProxyToolRegistry().require("tdai_conversation_query");
+
+    expect(tool.validate({ session_id: "session-old", limit })).toEqual({
+      ok: true, value: { session_id: "session-old", limit, offset: 0 },
+    });
+  });
+
+  it.each([0, 101, 200, 1.5])("rejects conversation query limit %s outside the Core contract", (limit) => {
+    const tool = createDefaultNativeProxyToolRegistry().require("tdai_conversation_query");
+
+    expect(tool.validate({ session_id: "session-old", limit })).toMatchObject({
+      ok: false, message: expect.stringContaining("limit"),
+    });
+  });
+
   it("normalizes valid input and applies the default result limit", () => {
     const tool = createDefaultNativeProxyToolRegistry().require("tdai_memory_search");
 
