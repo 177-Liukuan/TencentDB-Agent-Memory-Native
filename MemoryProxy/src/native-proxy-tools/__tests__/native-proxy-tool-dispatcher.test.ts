@@ -64,6 +64,41 @@ function dispatcherWithBridge(
 }
 
 describe("NativeProxyToolDispatcher", () => {
+  it("consumes a bridge rejection even when the bridge aborts synchronously", async () => {
+    const abort = new AbortController();
+    const bridge = vi.fn(async () => {
+      abort.abort();
+      throw new Error("backend cancelled");
+    });
+    const result = await dispatcherWithBridge(bridge).execute(memoryCall(), trustedContext(), abort.signal);
+    expect(result).toMatchObject({ isError: true, value: { code: "native_tool_cancelled" } });
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(bridge).toHaveBeenCalledTimes(1);
+  });
+
+  it("cancels an in-flight tool and never retries it", async () => {
+    const abort = new AbortController();
+    let bridgeSignal: AbortSignal | undefined;
+    const bridge = vi.fn(async (input) => {
+      bridgeSignal = input.signal;
+      abort.abort();
+      return bridgeResult({ code: 1 }, 503);
+    });
+    const result = await dispatcherWithBridge(bridge).execute(memoryCall(), trustedContext(), abort.signal);
+    expect(result).toMatchObject({ isError: true, value: { code: "native_tool_cancelled", retryable: false } });
+    expect(bridgeSignal?.aborted).toBe(true);
+    expect(bridge).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not dispatch a tool after the client has cancelled", async () => {
+    const abort = new AbortController();
+    abort.abort();
+    const bridge = vi.fn(async () => bridgeResult({ code: 0, data: [] }));
+    const result = await dispatcherWithBridge(bridge).execute(memoryCall(), trustedContext(), abort.signal);
+    expect(result).toMatchObject({ isError: true, value: { code: "native_tool_cancelled" } });
+    expect(bridge).not.toHaveBeenCalled();
+  });
+
   it("dispatches Knowledge tools through the Knowledge executor", async () => {
     const knowledge = vi.fn(async () => bridgeResult({
       code: 0,

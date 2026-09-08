@@ -41,6 +41,40 @@ function sentBody(): Record<string, unknown> {
 }
 
 describe("exact Anthropic target transport", () => {
+  it("uses each re-entry's cancellation signal, not a retained prior request signal", async () => {
+    const snapshot = buildUpstreamRequestSnapshot({
+      body: sentBody(), url: "https://upstream.example/v1/messages", model: "claude-test", authSource: "agent",
+    });
+    const abort = new AbortController();
+    const fetchImpl = vi.fn<typeof fetch>(async (_url, init) => {
+      if (fetchImpl.mock.calls.length === 1) {
+        abort.abort();
+        init?.signal?.throwIfAborted();
+      }
+      return new Response(responseStream());
+    });
+    const reenter = createRetainedExactTargetTransport({ capturedSnapshot: snapshot, headers: {}, timeoutMs: 5000, fetchImpl });
+    const request = { upstreamSnapshot: snapshot, messages: snapshot.baseMessages, round: 2, totalCalls: 1 };
+    await expect(reenter({ ...request, signal: abort.signal })).rejects.toThrow();
+    const next = await reenter({ ...request, signal: new AbortController().signal });
+    expect(next.status).toBe(200);
+    expect(fetchImpl.mock.calls[0][1]?.signal?.aborted).toBe(true);
+    expect(fetchImpl.mock.calls[1][1]?.signal?.aborted).toBe(false);
+    expect(String(fetchImpl.mock.calls[1][1]?.body)).not.toContain("signal");
+  });
+
+  it("does not fetch when cancelled during rate-limit waiting", async () => {
+    const abort = new AbortController();
+    const snapshot = buildUpstreamRequestSnapshot({ body: sentBody(), url: "https://upstream.example/v1/messages", model: "claude-test", authSource: "agent" });
+    const fetchImpl = vi.fn<typeof fetch>(async () => new Response(responseStream()));
+    const reenter = createRetainedExactTargetTransport({
+      capturedSnapshot: snapshot, headers: {}, timeoutMs: 5000, fetchImpl,
+      beforeFetch: async () => { abort.abort(); },
+    });
+    await expect(reenter({ upstreamSnapshot: snapshot, messages: [], round: 2, totalCalls: 1, signal: abort.signal })).rejects.toThrow();
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
   it("fingerprints logical requests canonically and persists the explicit original payload", () => {
     const first = {
       model: "claude-test",

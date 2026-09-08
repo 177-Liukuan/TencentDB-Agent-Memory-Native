@@ -270,7 +270,9 @@ async function sendExactRound(
   options: ExactTargetTransportOptions,
 ): Promise<UpstreamRound> {
   validateSnapshot(request.upstreamSnapshot);
+  request.signal?.throwIfAborted();
   await options.beforeFetch?.(request.upstreamSnapshot.target.model);
+  request.signal?.throwIfAborted();
   const fetchImpl = options.fetchImpl ?? fetch;
   let response: Response;
   try {
@@ -278,7 +280,9 @@ async function sendExactRound(
       method: "POST",
       headers,
       body: JSON.stringify(buildReentryBody(request.upstreamSnapshot, request.messages)),
-      signal: AbortSignal.timeout(options.timeoutMs),
+      signal: request.signal
+        ? AbortSignal.any([request.signal, AbortSignal.timeout(options.timeoutMs)])
+        : AbortSignal.timeout(options.timeoutMs),
     });
   } catch {
     throw new Error("Native Proxy Tool upstream re-entry failed");

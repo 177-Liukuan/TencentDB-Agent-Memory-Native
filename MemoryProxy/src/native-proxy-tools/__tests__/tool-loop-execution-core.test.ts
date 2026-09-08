@@ -84,22 +84,25 @@ async function createStreamingBatch(
 
 describe("ToolLoopExecutionCore", () => {
   it("applies one protocol-neutral call-limit policy", () => {
-    const { core } = harness();
+    const core = new ToolLoopExecutionCore({
+      storage: new InMemoryToolExecutionStorageAdapter(), dispatcher: { execute: vi.fn() },
+      limits: { ...DEFAULT_CONFIG.nativeProxyTools, maxRounds: 5, maxCallsPerRound: 8, maxTotalCalls: 20 },
+    });
 
     expect(core.limitFailure({ round: 1, totalCalls: 1, callsThisRound: 1 })).toBeNull();
     expect(core.limitFailure({
-      round: DEFAULT_CONFIG.nativeProxyTools.maxRounds + 1,
+      round: 6,
       totalCalls: 0,
       callsThisRound: 1,
     })).toMatchObject({ code: "native_tool_limit_exceeded", status: 400 });
     expect(core.limitFailure({
       round: 1,
       totalCalls: 0,
-      callsThisRound: DEFAULT_CONFIG.nativeProxyTools.maxCallsPerRound + 1,
+      callsThisRound: 9,
     })).toMatchObject({ code: "native_tool_limit_exceeded", status: 400 });
     expect(core.limitFailure({
       round: 1,
-      totalCalls: DEFAULT_CONFIG.nativeProxyTools.maxTotalCalls,
+      totalCalls: 20,
       callsThisRound: 1,
     })).toMatchObject({ code: "native_tool_limit_exceeded", status: 400 });
   });

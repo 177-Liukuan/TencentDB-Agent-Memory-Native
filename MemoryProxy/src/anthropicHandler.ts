@@ -730,6 +730,7 @@ async function forwardWithRetry(
   forwardTimeoutMs: number,
   sessionKeyForDebug?: string,
   rateLimitContext?: { config: ProxyConfig; instanceId?: string },
+  requestSignal?: AbortSignal,
 ): Promise<{ resp: Response; retried: boolean }> {
   let upstreamResp: Response | undefined;
   let forwardFailed = false;
@@ -799,7 +800,7 @@ async function forwardWithRetry(
       method: "POST",
       headers: upstreamHeaders,
       body: JSON.stringify(upstreamBody),
-      signal: AbortSignal.timeout(forwardTimeoutMs),
+      signal: requestSignal ? AbortSignal.any([requestSignal, AbortSignal.timeout(forwardTimeoutMs)]) : AbortSignal.timeout(forwardTimeoutMs),
     });
   } catch (err: unknown) {
     if (err instanceof DOMException && err.name === "TimeoutError") {
@@ -813,6 +814,8 @@ async function forwardWithRetry(
   if (upstreamResp) {
     pipe.forwardDone(upstreamResp.status);
   }
+
+  requestSignal?.throwIfAborted();
 
   const shouldRetry = target.retryTarget &&
     (forwardFailed || (upstreamResp && upstreamResp.status >= 400 && upstreamResp.status < 500));
@@ -840,7 +843,7 @@ async function forwardWithRetry(
         method: "POST",
         headers: retryHeaders,
         body: JSON.stringify(originalBody),
-        signal: AbortSignal.timeout(forwardTimeoutMs),
+        signal: requestSignal ? AbortSignal.any([requestSignal, AbortSignal.timeout(forwardTimeoutMs)]) : AbortSignal.timeout(forwardTimeoutMs),
       });
       if (upstreamResp.ok) {
         pipe.info("RETRY_SUCCESS", `Retry returned ${upstreamResp.status}`);
@@ -1391,6 +1394,7 @@ export async function handleAnthropicMessages(
       storage: nativeStorage,
       ledgerStorage: nativeToolRuntime.ledgerStorage ?? undefined,
       dispatcher: nativeDispatcher,
+      signal: c.req.raw.signal,
       limits: config.nativeProxyTools,
       reentryLeaseMs,
       reenter: resumeExactReentry,
@@ -1447,6 +1451,7 @@ export async function handleAnthropicMessages(
         storage: nativeStorage,
         ledgerStorage: nativeToolRuntime.ledgerStorage ?? undefined,
         dispatcher: nativeDispatcher,
+        signal: c.req.raw.signal,
         limits: config.nativeProxyTools,
         reenter: exactReentry,
         trackBackgroundOperation: (operation: () => Promise<void>) => nativeToolRuntime.trackBackgroundOperation(operation),
@@ -2138,6 +2143,7 @@ export async function handleAnthropicMessages(
       pipe, forwardTimeoutMs,
       sessionKey,
       { config, instanceId: spaceId || undefined },
+      c.req.raw.signal,
     );
     upstreamResp = result.resp;
     retried = result.retried;
@@ -2335,6 +2341,7 @@ export async function handleAnthropicMessages(
         storage: nativeToolRuntime.storage,
         ledgerStorage: nativeToolRuntime.ledgerStorage ?? undefined,
         dispatcher: nativeToolRuntime.dispatcher,
+        signal: c.req.raw.signal,
         limits: config.nativeProxyTools,
         reenter,
         trackBackgroundOperation: (operation: () => Promise<void>) => nativeToolRuntime.trackBackgroundOperation(operation),

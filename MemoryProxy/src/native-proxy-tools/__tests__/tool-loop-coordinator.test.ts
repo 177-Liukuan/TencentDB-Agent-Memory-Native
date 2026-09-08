@@ -229,7 +229,8 @@ function roundInput(stream: ReadableStream<Uint8Array>, overrides: Partial<ToolL
 }
 
 function coordinatorHarness(options: {
-  execute?: (call: UnifiedToolCall, context: ToolExecutionScope) => Promise<NativeToolResult>;
+  signal?: AbortSignal;
+  execute?: (call: UnifiedToolCall, context: ToolExecutionScope, signal?: AbortSignal) => Promise<NativeToolResult>;
   reenter?: (request: NativeReentryRequest) => Promise<UpstreamRound>;
   configure?: (config: typeof DEFAULT_CONFIG) => void;
   beforeReenter?: () => Promise<void>;
@@ -247,7 +248,7 @@ function coordinatorHarness(options: {
   options.configure?.(config);
   const storage = new InMemoryToolExecutionStorageAdapter({ now: () => fixedNow });
   const ledgerStorage = options.ledgerStorage ?? new InMemoryNativeToolLedgerStorageAdapter();
-  const execute = vi.fn(options.execute ?? (async (call: UnifiedToolCall) => ({
+  const execute = vi.fn<NonNullable<typeof options.execute>>(options.execute ?? (async (call: UnifiedToolCall) => ({
     isError: false,
     value: { memories: [`result:${call.callId}`] },
   })));
@@ -258,6 +259,7 @@ function coordinatorHarness(options: {
   })));
   let sequence = 0;
   const coordinator = new AnthropicToolLoopCoordinator({
+    signal: options.signal,
     registry: createDefaultNativeProxyToolRegistry(),
     storage,
     ledgerStorage,
@@ -289,6 +291,46 @@ async function eventually(assertion: () => void, timeoutMs = 1_000): Promise<voi
 }
 
 describe("AnthropicToolLoopCoordinator", () => {
+  it("completes beyond the old round and call budgets and preserves counters", async () => {
+    const harness = coordinatorHarness({ reenter: async (request) => ({
+      stream: byteStream(request.round <= 7 ? nativeFixture(9) : finalFixture()).stream,
+      status: 200,
+      headers: new Headers(),
+    }) });
+    const decision = await harness.coordinator.handleRound(roundInput(byteStream(nativeFixture(9)).stream));
+    expect(decision.kind).toBe("final");
+    expect(harness.execute).toHaveBeenCalledTimes(63);
+    expect(harness.reenter.mock.calls.at(-1)?.[0]).toMatchObject({ round: 8, totalCalls: 63 });
+  });
+
+  it("cancels an idle upstream reader without starting tools or re-entry", async () => {
+    const abort = new AbortController();
+    const cancel = vi.fn();
+    const stream = new ReadableStream<Uint8Array>({ cancel });
+    const harness = coordinatorHarness({ signal: abort.signal });
+    const running = harness.coordinator.handleRound(roundInput(stream));
+    abort.abort();
+    const decision = await running;
+    expect(decision).toMatchObject({ kind: "error", code: "native_tool_cancelled", status: 499 });
+    expect(cancel).toHaveBeenCalledTimes(1);
+    expect(harness.execute).not.toHaveBeenCalled();
+    expect(harness.reenter).not.toHaveBeenCalled();
+  }, 1_000);
+
+  it("keeps a completed tool result but does not re-enter after cancellation", async () => {
+    const abort = new AbortController();
+    const harness = coordinatorHarness({
+      signal: abort.signal,
+      beforeReenter: async () => { abort.abort(); },
+    });
+    const decision = await harness.coordinator.handleRound(roundInput(byteStream(nativeFixture()).stream));
+    expect(decision).toMatchObject({ kind: "error", code: "native_tool_cancelled" });
+    expect(harness.reenter).not.toHaveBeenCalled();
+    expect((await harness.storage.get({ ...scope(), toolBatchId: "id-1" }))?.slots[0]).toMatchObject({
+      status: "succeeded", result: { memories: ["result:proxy-1"] },
+    });
+  });
+
   it("persists a Client-only round immediately after resuming Client results", async () => {
     const parentStateKey = { ...scope(), toolBatchId: "parent" };
     const onClientDispatchPrepared = vi.fn(async () => {});

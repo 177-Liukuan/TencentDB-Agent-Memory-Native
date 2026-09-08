@@ -1,4 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { request as httpRequest } from "node:http";
+import { serve } from "@hono/node-server";
 
 import { DEFAULT_CONFIG } from "../config.js";
 import {
@@ -253,6 +255,101 @@ afterEach(async () => {
 });
 
 describe("Anthropic Native Proxy Tool handler", () => {
+  it("aborts internal re-entry when the actual HTTP client disconnects", async () => {
+    const proxyConfig = config();
+    const runtime = createNativeProxyToolRuntime(proxyConfig, {
+      createStorage: () => new InMemoryToolExecutionStorageAdapter(),
+      createLedgerStorage: () => new InMemoryNativeToolLedgerStorageAdapter(),
+      createDispatcher: () => ({ execute: async () => ({ isError: false, value: { memories: ["rule"] } }) }),
+    });
+    await runtime.ready();
+    __setNativeProxyToolRuntimeForTests(runtime);
+    await installInitializedSession();
+    const turn = await runtime.ledgerStorage!.recordUserPrompt({
+      spaceId: "space-1", userId: "user-1", agentSource: "claude-code", sessionId: "session-1",
+    });
+    let reentrySignal: AbortSignal | null | undefined;
+    let requests = 0;
+    vi.stubGlobal("fetch", vi.fn(async (url, init?: RequestInit) => {
+      if (String(url) !== "https://upstream.example/v1/messages") return new Response(JSON.stringify({ code: 0, data: { items: [] } }));
+      if (++requests === 1) return singleConsumerSse(nativeCallFixture()).response;
+      reentrySignal = init?.signal;
+      return new Promise<Response>((_resolve, reject) => {
+        reentrySignal?.addEventListener("abort", () => reject(reentrySignal?.reason), { once: true });
+      });
+    }));
+    const app = createApp(proxyConfig);
+    const server = serve({ fetch: app.fetch, hostname: "127.0.0.1", port: 0 });
+    await new Promise<void>((resolve) => { if (server.listening) resolve(); else server.once("listening", resolve); });
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("expected TCP server");
+    const client = httpRequest({ hostname: "127.0.0.1", port: address.port, path: "/claude-code/space-1/v1/messages", method: "POST",
+      headers: { "content-type": "application/json", "x-user-id": "user-1", "x-conversation-id": "session-1" },
+    });
+    client.on("error", () => {});
+    try {
+      client.end(JSON.stringify({ model: "claude-test", stream: true, messages: [{ role: "user", content: [
+        { type: "text", text: "Check rules" }, { type: "text", text: createClaudeTurnMarker(turn.turnToken) },
+      ] }] }));
+      await vi.waitFor(() => expect(reentrySignal).toBeDefined());
+      client.destroy();
+      await vi.waitFor(() => expect(reentrySignal?.aborted).toBe(true));
+      await runtime.close();
+      expect(requests).toBe(2);
+    } finally {
+      client.destroy();
+      await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    }
+  });
+
+  it.each(["initial", "reentry", "tool"])("propagates request cancellation at the %s boundary", async (phase) => {
+    const proxyConfig = config();
+    const abort = new AbortController();
+    const execute = vi.fn(async (_call, _scope, signal?: AbortSignal) => {
+      if (phase === "tool") {
+        abort.abort();
+        expect(signal?.aborted).toBe(true);
+      }
+      return { isError: false, value: { memories: ["rule"] } };
+    });
+    const runtime = createNativeProxyToolRuntime(proxyConfig, {
+      createStorage: () => new InMemoryToolExecutionStorageAdapter(),
+      createLedgerStorage: () => new InMemoryNativeToolLedgerStorageAdapter(),
+      createDispatcher: () => ({ execute }),
+    });
+    await runtime.ready();
+    __setNativeProxyToolRuntimeForTests(runtime);
+    await installInitializedSession();
+    const turn = await runtime.ledgerStorage!.recordUserPrompt({
+      spaceId: "space-1", userId: "user-1", agentSource: "claude-code", sessionId: "session-1",
+    });
+    let requests = 0;
+    let cancelledUpstream: AbortSignal | null | undefined;
+    vi.stubGlobal("fetch", vi.fn(async (url, init?: RequestInit) => {
+      if (String(url) === "https://upstream.example/v1/messages") {
+        requests++;
+        if (phase === "initial" || (phase === "reentry" && requests === 2)) {
+          cancelledUpstream = init?.signal;
+          abort.abort();
+          init?.signal?.throwIfAborted();
+        }
+        return singleConsumerSse(requests === 1 ? nativeCallFixture() : finalTextFixture()).response;
+      }
+      return new Response(JSON.stringify({ code: 0, data: { items: [] } }));
+    }));
+    const response = await createApp(proxyConfig).request("/claude-code/space-1/v1/messages", {
+      method: "POST", signal: abort.signal,
+      headers: { "content-type": "application/json", "x-user-id": "user-1", "x-conversation-id": "session-1" },
+      body: JSON.stringify({ model: "claude-test", stream: true, messages: [{ role: "user", content: [
+        { type: "text", text: "Check rules" }, { type: "text", text: createClaudeTurnMarker(turn.turnToken) },
+      ] }] }),
+    });
+    expect(response.status).toBeGreaterThanOrEqual(400);
+    expect(requests).toBe(phase === "reentry" ? 2 : 1);
+    if (phase !== "tool") expect(cancelledUpstream?.aborted).toBe(true);
+    expect(execute).toHaveBeenCalledTimes(phase === "initial" ? 0 : 1);
+  });
+
   it.each([false, true])("keeps Native -> Client -> Client -> Native continuations across restart (initial mixed: %s)", async (mixed) => {
     const proxyConfig = config();
     const stateBackend = createInMemoryToolExecutionBackend();

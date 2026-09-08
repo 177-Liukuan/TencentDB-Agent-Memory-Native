@@ -169,20 +169,22 @@ function successfulRound(): UpstreamRound {
 }
 
 function resumeHarness(options: {
+  signal?: AbortSignal;
   storage?: InMemoryToolExecutionStorageAdapter;
-  execute?: (call: UnifiedToolCall, context: ToolExecutionScope) => Promise<NativeToolResult>;
+  execute?: (call: UnifiedToolCall, context: ToolExecutionScope, signal?: AbortSignal) => Promise<NativeToolResult>;
   reenter?: (request: NativeReentryRequest) => Promise<UpstreamRound>;
   now?: () => Date;
   ledgerStorage?: NativeToolLedgerStorageAdapter;
 } = {}) {
   const storage = options.storage ?? new InMemoryToolExecutionStorageAdapter({ now: () => fixedNow });
-  const execute = vi.fn(options.execute ?? (async () => ({
+  const execute = vi.fn<NonNullable<typeof options.execute>>(options.execute ?? (async () => ({
     isError: false,
     value: { memories: ["recovered"] },
   })));
   const reenter = vi.fn(options.reenter ?? (async () => successfulRound()));
   let sequence = 0;
   const input = (body = resultBody(), inputScope = scope()): ClientToolResumeInput => ({
+    signal: options.signal,
     body,
     scope: inputScope,
     storage,
@@ -309,6 +311,36 @@ describe("OpenAI Responses Client Tool Result extraction", () => {
 });
 
 describe("resumeClientToolResults", () => {
+  it("does not recover pending tools when this resume request is cancelled", async () => {
+    const abort = new AbortController();
+    abort.abort();
+    const harness = resumeHarness({ signal: abort.signal });
+    await harness.storage.create(mixedState());
+    const decision = await resumeClientToolResults(harness.input());
+    expect(decision).toMatchObject({ kind: "error", code: "native_tool_cancelled", status: 499 });
+    expect(harness.execute).not.toHaveBeenCalled();
+    expect(harness.reenter).not.toHaveBeenCalled();
+  });
+
+  it("closes the claimed re-entry when cancelled, without losing completed results", async () => {
+    const abort = new AbortController();
+    const harness = resumeHarness({ signal: abort.signal, reenter: async (request) => {
+      abort.abort();
+      request.signal?.throwIfAborted();
+      return successfulRound();
+    } });
+    const state = mixedState({ p1: { status: "succeeded", result: { memories: ["saved"] }, isError: false } });
+    await harness.storage.create(state);
+    const decision = await resumeClientToolResults(harness.input());
+    expect(decision).toMatchObject({ kind: "error", code: "native_tool_cancelled", status: 499 });
+    const saved = await harness.storage.get(state.key);
+    expect(saved).toMatchObject({ clientDispatchStatus: "completed", reentryOutcome: { kind: "error", status: 499 } });
+    expect(saved?.slots.every((slot) => slot.status === "succeeded")).toBe(true);
+    const retry = await resumeClientToolResults({ ...harness.input(), signal: new AbortController().signal });
+    expect(retry).toMatchObject({ kind: "replay", status: 499 });
+    expect(harness.reenter).toHaveBeenCalledTimes(1);
+  });
+
   it.each([false, true])("resumes a Client-only continuation without writing Native history (client error: %s)", async (isError) => {
     const ledgerStorage = new InMemoryNativeToolLedgerStorageAdapter();
     const harness = resumeHarness({ ledgerStorage });

@@ -11,8 +11,11 @@ export type NativeToolEffect = "read" | "write" | "archive";
 
 export interface NativeProxyToolsConfig {
   enabled: boolean;
+  /** 0 disables this loop budget. Counters are still persisted for history and recovery. */
   maxRounds: number;
+  /** 0 disables the per-round call budget. */
   maxCallsPerRound: number;
+  /** 0 disables the cumulative call budget. */
   maxTotalCalls: number;
   toolTimeoutMs: number;
   maxResultBytes: number;

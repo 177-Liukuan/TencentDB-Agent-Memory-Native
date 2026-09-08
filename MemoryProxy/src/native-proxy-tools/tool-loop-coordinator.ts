@@ -15,6 +15,7 @@ import {
 } from "./anthropic-response-rebuilder.js";
 import type { NativeProxyToolDispatcher } from "./native-proxy-tool-dispatcher.js";
 import type { NativeProxyToolRegistry } from "./tool-registry.js";
+import { cancelReaderOnAbort } from "./cancel-reader.js";
 import {
   persistToolLoopResponse,
   ToolLoopCoreFailure,
@@ -36,6 +37,8 @@ export interface UpstreamRound {
 }
 
 export interface NativeReentryRequest {
+  /** Current HTTP request only; never persist or retain it with the upstream target. */
+  signal?: AbortSignal;
   upstreamSnapshot: UpstreamRequestSnapshot;
   messages: JsonValue[];
   round: number;
@@ -78,6 +81,7 @@ export type ToolLoopDecision =
     } & ToolLoopBytesDecision);
 
 export interface AnthropicToolLoopCoordinatorOptions {
+  signal?: AbortSignal;
   registry: NativeProxyToolRegistry;
   storage: ToolExecutionStorageAdapter;
   ledgerStorage?: NativeToolLedgerStorageAdapter;
@@ -178,14 +182,16 @@ class AnthropicSseFrameFeeder {
   }
 }
 
-async function drainStream(stream: ReadableStream<Uint8Array>): Promise<void> {
+async function drainStream(stream: ReadableStream<Uint8Array>, signal?: AbortSignal): Promise<void> {
   const reader = stream.getReader();
+  const detach = cancelReaderOnAbort(reader, signal);
   try {
     while (true) {
       const next = await reader.read();
       if (next.done) break;
     }
   } finally {
+    detach();
     reader.releaseLock();
   }
 }
@@ -226,7 +232,7 @@ export class AnthropicToolLoopCoordinator {
   ): Promise<ToolLoopDecision> {
     if (input.status < 200 || input.status >= 300) {
       try {
-        await drainStream(input.stream);
+        await drainStream(input.stream, this.options.signal);
         return this.errorDecision(
           new CoordinatorFailure(
             "upstream_non_2xx",
@@ -254,6 +260,7 @@ export class AnthropicToolLoopCoordinator {
     let stateKey: ToolExecutionStateKey | undefined;
     let messageCompleted = false;
     let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+    let detachAbort: (() => void) | undefined;
 
     const fail = async (failure: ToolLoopCoreFailure): Promise<ToolLoopDecision> => {
       if (stateKey) await this.core.markAborted(stateKey);
@@ -261,6 +268,7 @@ export class AnthropicToolLoopCoordinator {
     };
 
     const scheduleExecution = (call: UnifiedToolCall): void => {
+      this.options.signal?.throwIfAborted();
       if (executionTasks.has(call.callId)) return;
       const persistOperation = () => this.core.executeAndPersist(call, input.scope, stateKey!);
       const task = (this.options.trackBackgroundOperation
@@ -271,10 +279,12 @@ export class AnthropicToolLoopCoordinator {
 
     try {
       reader = input.stream.getReader();
+      detachAbort = cancelReaderOnAbort(reader, this.options.signal);
       while (!messageCompleted) {
         let next: ReadableStreamReadResult<Uint8Array>;
         try {
           next = await reader.read();
+          this.options.signal?.throwIfAborted();
         } catch {
           return fail(new CoordinatorFailure(
             "upstream_stream_interrupted",
@@ -297,6 +307,7 @@ export class AnthropicToolLoopCoordinator {
 
         const frames = feeder.push(next.value);
         for (const rawFrame of frames) {
+          this.options.signal?.throwIfAborted();
           const events = parser.push(rawFrame);
           for (const event of events) {
             if (event.type === "protocol_error") {
@@ -365,6 +376,7 @@ export class AnthropicToolLoopCoordinator {
         }
       }
       parser.finish();
+      detachAbort?.();
       const snapshot = parser.snapshot();
       if (!messageCompleted || !snapshot.messageCompleted) {
         return fail(new CoordinatorFailure(
@@ -375,10 +387,12 @@ export class AnthropicToolLoopCoordinator {
       }
 
       const nativeCalls = snapshot.toolCalls.filter((call) => call.owner === "proxy");
+      this.options.signal?.throwIfAborted();
       const clientCalls = snapshot.toolCalls.filter((call) => call.owner === "client");
       if (nativeCalls.length === 0) {
         if (internalRound && clientCalls.length > 0) {
           await this.options.beforeClientDispatch?.();
+          this.options.signal?.throwIfAborted();
           stateKey = await this.createBatch(input, snapshot);
           await this.persistSnapshot(stateKey, snapshot, "completed", input.totalCalls);
           const bytes = replayAnthropicBytes(snapshot);
@@ -434,6 +448,7 @@ export class AnthropicToolLoopCoordinator {
       }
       const totalCalls = input.totalCalls + nativeCalls.length;
       if (clientCalls.length > 0) await this.options.beforeClientDispatch?.();
+      this.options.signal?.throwIfAborted();
       await this.persistSnapshot(stateKey, snapshot, "completed", totalCalls);
       // 到轮末才启动尚未执行的写/archive 调用；客户端工具也只有此时才可统一下发。
       for (const call of nativeCalls) scheduleExecution(call);
@@ -478,6 +493,7 @@ export class AnthropicToolLoopCoordinator {
       }
 
       await Promise.all(executionTasks.values());
+      this.options.signal?.throwIfAborted();
       const completedState = await this.options.storage.get(stateKey);
       if (!completedState || completedState.slots.some((slot) => (
         slot.owner === "proxy" && slot.status !== "succeeded" && slot.status !== "failed"
@@ -498,7 +514,9 @@ export class AnthropicToolLoopCoordinator {
       await this.core.persistCompletedHistory(stateKey);
       const nextRoundNumber = input.round + 1;
       await this.options.beforeReenter?.();
+      this.options.signal?.throwIfAborted();
       const nextRound = await this.options.reenter({
+        signal: this.options.signal,
         upstreamSnapshot: structuredClone(input.upstreamSnapshot),
         messages: structuredClone(messages),
         round: nextRoundNumber,
@@ -538,6 +556,7 @@ export class AnthropicToolLoopCoordinator {
           );
       return fail(failure);
     } finally {
+      detachAbort?.();
       reader?.releaseLock();
     }
   }
@@ -585,6 +604,9 @@ export class AnthropicToolLoopCoordinator {
     input: ToolLoopRoundInput,
     snapshot: AnthropicStreamSnapshot,
   ): ToolLoopDecision {
+    if (this.options.signal?.aborted) {
+      failure = new CoordinatorFailure("native_tool_cancelled", "Native Proxy Tool request was cancelled", 499);
+    }
     const bytes = new TextEncoder().encode(JSON.stringify({
       type: "error",
       error: {

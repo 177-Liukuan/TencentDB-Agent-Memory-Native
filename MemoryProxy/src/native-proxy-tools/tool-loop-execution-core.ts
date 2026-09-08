@@ -34,6 +34,7 @@ export class ToolLoopCoreFailure extends Error {
 }
 
 export interface ToolLoopExecutionCoreOptions {
+  signal?: AbortSignal;
   storage: ToolExecutionStorageAdapter;
   ledgerStorage?: NativeToolLedgerStorageAdapter;
   dispatcher: Pick<NativeProxyToolDispatcher, "execute">;
@@ -132,10 +133,11 @@ export class ToolLoopExecutionCore {
   }
 
   limitFailure(input: ToolLoopLimitInput): ToolLoopCoreFailure | null {
+    const { maxRounds, maxCallsPerRound, maxTotalCalls } = this.options.limits;
     if (
-      input.round > this.options.limits.maxRounds
-      || input.callsThisRound > this.options.limits.maxCallsPerRound
-      || input.totalCalls + input.callsThisRound > this.options.limits.maxTotalCalls
+      (maxRounds > 0 && input.round > maxRounds)
+      || (maxCallsPerRound > 0 && input.callsThisRound > maxCallsPerRound)
+      || (maxTotalCalls > 0 && input.totalCalls + input.callsThisRound > maxTotalCalls)
     ) {
       return new ToolLoopCoreFailure(
         "native_tool_limit_exceeded",
@@ -219,6 +221,7 @@ export class ToolLoopExecutionCore {
     scope: ToolExecutionScope,
     key: ToolExecutionStateKey,
   ): Promise<void> {
+    this.options.signal?.throwIfAborted();
     const leaseOwner = `native-tool-worker-${this.createId()}`;
     const leaseUntil = new Date(
       this.now().getTime() + nativeToolLeaseDurationMs(this.options.limits.toolTimeoutMs),
@@ -230,6 +233,7 @@ export class ToolLoopExecutionCore {
       const slot = current.slots.find((candidate) => candidate.callId === call.callId);
       if (!slot || slot.status === "succeeded" || slot.status === "failed") return;
       if (slot.status === "running") return;
+      this.options.signal?.throwIfAborted();
       claimed = await this.options.storage.tryClaimSlotExecution({
         key,
         callId: call.callId,
@@ -243,7 +247,7 @@ export class ToolLoopExecutionCore {
 
     let result: NativeToolResult;
     try {
-      result = await this.options.dispatcher.execute(call, scope);
+      result = await this.options.dispatcher.execute(call, scope, this.options.signal);
     } catch {
       result = genericExecutionError();
     }

@@ -9,6 +9,7 @@ import {
   buildOpenAIToolMessages,
 } from "./openai-response-rebuilder.js";
 import type { NativeProxyToolRegistry } from "./tool-registry.js";
+import { cancelReaderOnAbort } from "./cancel-reader.js";
 import {
   persistToolLoopResponse,
   ToolLoopCoreFailure,
@@ -63,6 +64,7 @@ export type OpenAIToolLoopDecision =
   | { kind: "error"; code: string; message: string; bytes: Uint8Array; status: number; headers: Headers; rounds: ToolStreamSnapshot[] };
 
 export interface OpenAIToolLoopCoordinatorOptions {
+  signal?: AbortSignal;
   registry: NativeProxyToolRegistry;
   storage: ToolExecutionStorageAdapter;
   ledgerStorage?: NativeToolLedgerStorageAdapter;
@@ -137,6 +139,7 @@ export class OpenAIToolLoopCoordinator {
     let streamingStateKey: ToolExecutionStateKey | undefined;
     const executionTasks = new Map<string, Promise<void>>();
     const scheduleExecution = (call: UnifiedToolCall): void => {
+      this.options.signal?.throwIfAborted();
       if (!streamingStateKey || executionTasks.has(call.callId)) return;
       const operation = () => this.core.executeAndPersist(call, input.scope, streamingStateKey!);
       const task = (this.options.trackBackgroundOperation
@@ -146,9 +149,11 @@ export class OpenAIToolLoopCoordinator {
     };
     try {
       const reader = input.stream.getReader();
+      const detachAbort = cancelReaderOnAbort(reader, this.options.signal);
       try {
         while (true) {
           const next = await reader.read();
+          this.options.signal?.throwIfAborted();
           if (next.done) break;
           const events = parser.push(next.value);
           if (events.some((event) => event.type === "protocol_error")) {
@@ -160,6 +165,7 @@ export class OpenAIToolLoopCoordinator {
           // 没有同等可靠的边界，只在整轮结束后统一确认并执行。
           if (this.codec.protocol === "responses") {
             for (const event of events) {
+              this.options.signal?.throwIfAborted();
               if (event.type !== "tool_call_completed") continue;
               const partial = parser.snapshot();
               const nativeCount = partial.toolCalls.filter((call) => call.owner === "proxy").length;
@@ -188,6 +194,7 @@ export class OpenAIToolLoopCoordinator {
         if (streamingStateKey) await this.core.markAborted(streamingStateKey);
         return this.error("upstream_stream_interrupted", "OpenAI upstream stream was interrupted", 502, [parser.snapshot()]);
       } finally {
+        detachAbort();
         reader.releaseLock();
       }
       const finishEvents = parser.finish();
@@ -196,6 +203,7 @@ export class OpenAIToolLoopCoordinator {
         return this.error("upstream_stream_incomplete", "OpenAI upstream stream ended before the round boundary", 502, [parser.snapshot()]);
       }
       const snapshot = parser.snapshot();
+      this.options.signal?.throwIfAborted();
       const nativeCalls = snapshot.toolCalls.filter((call) => call.owner === "proxy");
       const clientCalls = snapshot.toolCalls.filter((call) => call.owner === "client");
       // 外部纯客户端请求可以直返；Native 之后的客户端轮仍要保存短期状态，不能误判为最终回答。
@@ -230,6 +238,7 @@ export class OpenAIToolLoopCoordinator {
       const totalCalls = input.totalCalls + nativeCalls.length;
       if (clientCalls.length > 0) {
         await this.options.beforeClientDispatch?.();
+        this.options.signal?.throwIfAborted();
         const bytes = this.codec.buildClientVisibleSse(snapshot.rawBytes, new Set(nativeCalls.map((call) => call.contentBlockIndex)));
         const outcome = persistToolLoopResponse(bytes, input.status, input.headers);
         const pending = await this.core.transitionClientDispatch(stateKey, "none", "pending", outcome);
@@ -247,6 +256,7 @@ export class OpenAIToolLoopCoordinator {
       }
 
       await Promise.all(executionTasks.values());
+      this.options.signal?.throwIfAborted();
       const context = await this.options.storage.get(stateKey);
       if (!context || context.slots.some((slot) => slot.owner === "proxy" && !["succeeded", "failed"].includes(slot.status))) {
         return this.error("native_tool_result_unavailable", "Native Proxy Tool result could not be persisted", 503, [snapshot]);
@@ -257,7 +267,9 @@ export class OpenAIToolLoopCoordinator {
       ];
       await this.core.persistCompletedHistory(stateKey);
       await this.options.beforeReenter?.();
+      this.options.signal?.throwIfAborted();
       const next = await this.options.reenter({
+        signal: this.options.signal,
         upstreamSnapshot: structuredClone(input.upstreamSnapshot), messages: structuredClone(messages),
         round: input.round + 1, totalCalls,
       });
@@ -323,10 +335,16 @@ export class OpenAIToolLoopCoordinator {
 
   private async drain(stream: ReadableStream<Uint8Array>): Promise<void> {
     const reader = stream.getReader();
-    try { while (!(await reader.read()).done) { /* consume */ } } finally { reader.releaseLock(); }
+    const detach = cancelReaderOnAbort(reader, this.options.signal);
+    try { while (!(await reader.read()).done) { /* consume */ } } finally { detach(); reader.releaseLock(); }
   }
 
   private error(code: string, message: string, status: number, rounds: ToolStreamSnapshot[]): OpenAIToolLoopDecision {
+    if (this.options.signal?.aborted) {
+      code = "native_tool_cancelled";
+      message = "Native Proxy Tool request was cancelled";
+      status = 499;
+    }
     const custom = this.codec.buildError?.(code, message, status);
     return {
       kind: "error", code, message, status, rounds,

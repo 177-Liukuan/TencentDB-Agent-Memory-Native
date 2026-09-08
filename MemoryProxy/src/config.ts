@@ -34,9 +34,9 @@ export const DEFAULT_CONFIG: ProxyConfig = {
   },
   nativeProxyTools: {
     enabled: false,
-    maxRounds: 5,
-    maxCallsPerRound: 8,
-    maxTotalCalls: 20,
+    maxRounds: 0,
+    maxCallsPerRound: 0,
+    maxTotalCalls: 0,
     toolTimeoutMs: 20_000,
     maxResultBytes: 65_536,
     stateTtlSeconds: 1_800,
@@ -300,17 +300,17 @@ function parseNativeProxyTools(yaml: RawYamlConfig): ProxyConfig["nativeProxyToo
     "nativeProxyTools.maxCallsPerRound",
     raw?.maxCallsPerRound,
     defaults.maxCallsPerRound,
-    1,
+    0,
     64,
   );
   const maxTotalCalls = boundedInt(
     "nativeProxyTools.maxTotalCalls",
     raw?.maxTotalCalls,
     defaults.maxTotalCalls,
-    1,
+    0,
     256,
   );
-  if (maxTotalCalls < maxCallsPerRound) {
+  if (maxTotalCalls > 0 && maxCallsPerRound > 0 && maxTotalCalls < maxCallsPerRound) {
     throw new Error("nativeProxyTools.maxTotalCalls must be greater than or equal to maxCallsPerRound");
   }
 
@@ -343,7 +343,7 @@ function parseNativeProxyTools(yaml: RawYamlConfig): ProxyConfig["nativeProxyToo
       "nativeProxyTools.maxRounds",
       raw?.maxRounds,
       defaults.maxRounds,
-      1,
+      0,
       20,
     ),
     maxCallsPerRound,

@@ -38,6 +38,7 @@ export interface AnthropicClientToolResult {
 }
 
 export interface ClientToolResumeInput {
+  signal?: AbortSignal;
   body: Record<string, unknown>;
   scope: ToolExecutionScope;
   storage: ToolExecutionStorageAdapter;
@@ -648,13 +649,26 @@ export async function resumeClientToolResults(
     const round = context.round + 1;
     let upstreamRound: UpstreamRound;
     try {
+      input.signal?.throwIfAborted();
       upstreamRound = await input.reenter({
+        signal: input.signal,
         upstreamSnapshot: structuredClone(context.upstreamSnapshot),
         messages: structuredClone(messages),
         round,
         totalCalls: context.totalCalls,
       }, key);
     } catch (error) {
+      if (input.signal?.aborted) {
+        // 已取得续写执行权但请求被取消，保存终止结果，避免留下“正在续写”的假状态。
+        const outcome = createPersistedClientReentryOutcome({
+          kind: "error", status: 499, headers: new Headers({ "content-type": "application/json" }),
+          bytes: new TextEncoder().encode(JSON.stringify({ error: {
+            type: "invalid_request_error", code: "native_tool_cancelled", message: "Native Proxy Tool request was cancelled",
+          } })),
+        });
+        await completeClientToolReentry(input.storage, key, reentryClaim.leaseOwner, outcome);
+        throw new ClientToolResumeFailure("native_tool_cancelled", "Native Proxy Tool request was cancelled", 499);
+      }
       if (error instanceof NativeToolTargetUnavailableError) {
         throw new ClientToolResumeFailure(
           "native_tool_target_unavailable",
@@ -687,6 +701,9 @@ export async function resumeClientToolResults(
       logicalMessages: logicalMessages(context),
     };
   } catch (error) {
+    if (input.signal?.aborted) return errorDecision(new ClientToolResumeFailure(
+      "native_tool_cancelled", "Native Proxy Tool request was cancelled", 499,
+    ));
     return errorDecision(error);
   }
 }
@@ -754,6 +771,7 @@ interface WaitForResultsInput extends ClientToolResumeInput {
 async function waitForAllToolResults(input: WaitForResultsInput): Promise<ToolExecutionContext> {
   const startedAt = input.now().getTime();
   while (true) {
+    input.signal?.throwIfAborted();
     const context = await input.storage.get(input.key);
     if (!context) throw new ClientToolResumeFailure(
       "expired_tool_batch",
@@ -812,6 +830,7 @@ async function executeRecoveredSlot(
   input: WaitForResultsInput,
   originalSlot: ToolCallSlot,
 ): Promise<boolean> {
+  input.signal?.throwIfAborted();
   const leaseOwner = `native-tool-resume-${input.createId()}`;
   const leaseUntil = new Date(
     input.now().getTime() + nativeToolLeaseDurationMs(input.limits.toolTimeoutMs),
@@ -849,7 +868,7 @@ async function executeRecoveredSlot(
   };
   let result: NativeToolResult;
   try {
-    result = await input.dispatcher.execute(call, input.scope);
+    result = await input.dispatcher.execute(call, input.scope, input.signal);
   } catch {
     result = genericExecutionError();
   }

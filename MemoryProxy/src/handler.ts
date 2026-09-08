@@ -360,6 +360,7 @@ async function forwardWithRetry(
   forwardTimeoutMs: number,
   sessionKeyForDebug?: string,
   rateLimitContext?: { config: ProxyConfig; instanceId?: string },
+  requestSignal?: AbortSignal,
 ): Promise<{ resp: Response; retried: boolean }> {
   let upstreamResp: Response | undefined;
   let forwardFailed = false;
@@ -405,11 +406,12 @@ async function forwardWithRetry(
 
   const fetchOpts: RequestInit = {
     method: "POST",
+    signal: requestSignal,
     headers: upstreamHeaders,
     body: JSON.stringify(upstreamBody),
   };
   if (forwardTimeoutMs > 0) {
-    fetchOpts.signal = AbortSignal.timeout(forwardTimeoutMs);
+    fetchOpts.signal = requestSignal ? AbortSignal.any([requestSignal, AbortSignal.timeout(forwardTimeoutMs)]) : AbortSignal.timeout(forwardTimeoutMs);
   }
 
   if (rateLimitContext) {
@@ -438,6 +440,7 @@ async function forwardWithRetry(
   const shouldRetry = target.retryTarget &&
     (forwardFailed || (upstreamResp && upstreamResp.status >= 400 && upstreamResp.status < 500));
 
+  requestSignal?.throwIfAborted();
   if (shouldRetry && target.retryTarget) {
     const reason = forwardFailed ? "timeout/error" : `${upstreamResp!.status}`;
     pipe.info("RETRY", `Routed model failed (${reason}), retryUrl=${target.retryTarget.url} model=${target.retryTarget.model}`);
@@ -460,11 +463,12 @@ async function forwardWithRetry(
       }
       const retryFetchOpts: RequestInit = {
         method: "POST",
+        signal: requestSignal,
         headers: retryHeaders,
         body: JSON.stringify(retryBody),
       };
       if (forwardTimeoutMs > 0) {
-        retryFetchOpts.signal = AbortSignal.timeout(forwardTimeoutMs);
+        retryFetchOpts.signal = requestSignal ? AbortSignal.any([requestSignal, AbortSignal.timeout(forwardTimeoutMs)]) : AbortSignal.timeout(forwardTimeoutMs);
       }
       upstreamResp = await fetch(target.retryTarget.url, retryFetchOpts);
       if (upstreamResp.ok) {
@@ -1171,6 +1175,7 @@ export async function handleChatCompletions(
       scope: toolExecutionScope,
       storage: nativeStorage,
       dispatcher: nativeDispatcher,
+      signal: c.req.raw.signal,
       limits: config.nativeProxyTools,
       reentryLeaseMs: (config.server.forwardTimeoutMs ?? 600_000)
         + config.nativeProxyTools.toolTimeoutMs * 2,
@@ -1207,6 +1212,7 @@ export async function handleChatCompletions(
         registry: nativeToolRuntime.registry,
         storage: nativeStorage,
         dispatcher: nativeDispatcher,
+        signal: c.req.raw.signal,
         limits: config.nativeProxyTools,
         reenter: exactReentry,
         trackBackgroundOperation: (operation) => nativeToolRuntime.trackBackgroundOperation(operation),
@@ -1495,6 +1501,7 @@ export async function handleChatCompletions(
       pipe, forwardTimeoutMs,
       sessionKey,
       { config, instanceId: spaceId || undefined },
+      c.req.raw.signal,
     );
     upstreamResp = result.resp;
     retried = result.retried;
@@ -1634,6 +1641,7 @@ export async function handleChatCompletions(
         registry: nativeToolRuntime.registry,
         storage: nativeToolRuntime.storage,
         dispatcher: nativeToolRuntime.dispatcher,
+        signal: c.req.raw.signal,
         limits: config.nativeProxyTools,
         reenter,
         trackBackgroundOperation: (operation) => nativeToolRuntime.trackBackgroundOperation(operation),

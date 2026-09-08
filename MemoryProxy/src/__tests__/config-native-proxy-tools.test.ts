@@ -67,12 +67,12 @@ describe("Native Proxy Tool configuration", () => {
     })).toThrow(/upstream\.agents\.claude-code\.protocol/);
   });
 
-  it("defaults to a disabled, bounded ClickHouse state backend", () => {
+  it("keeps single-operation protections without default loop budgets", () => {
     expect(DEFAULT_CONFIG.nativeProxyTools).toEqual({
       enabled: false,
-      maxRounds: 5,
-      maxCallsPerRound: 8,
-      maxTotalCalls: 20,
+      maxRounds: 0,
+      maxCallsPerRound: 0,
+      maxTotalCalls: 0,
       toolTimeoutMs: 20_000,
       maxResultBytes: 65_536,
       stateTtlSeconds: 1_800,
@@ -143,7 +143,9 @@ describe("Native Proxy Tool configuration", () => {
   });
 
   it.each([
-    [{ maxRounds: 0 }, "nativeProxyTools.maxRounds"],
+    [{ maxRounds: -1 }, "nativeProxyTools.maxRounds"],
+    [{ maxCallsPerRound: -1 }, "nativeProxyTools.maxCallsPerRound"],
+    [{ maxTotalCalls: -1 }, "nativeProxyTools.maxTotalCalls"],
     [{ maxCallsPerRound: 65 }, "nativeProxyTools.maxCallsPerRound"],
     [{ maxTotalCalls: 257 }, "nativeProxyTools.maxTotalCalls"],
     [{ toolTimeoutMs: 99 }, "nativeProxyTools.toolTimeoutMs"],
@@ -160,6 +162,14 @@ describe("Native Proxy Tool configuration", () => {
         maxTotalCalls: 8,
       },
     })).toThrow(/nativeProxyTools\.maxTotalCalls.*maxCallsPerRound/);
+  });
+
+  it.each([
+    { maxRounds: 0, maxCallsPerRound: 0, maxTotalCalls: 0 },
+    { maxRounds: 4, maxCallsPerRound: 8, maxTotalCalls: 0 },
+    { maxRounds: 0, maxCallsPerRound: 0, maxTotalCalls: 20 },
+  ])("accepts independently disabled budgets %j", (limits) => {
+    expect(buildConfigWithYaml({ nativeProxyTools: limits }).nativeProxyTools).toMatchObject(limits);
   });
 
   it.each(["state; DROP TABLE x", "db.state", "1state", "state-name"])(

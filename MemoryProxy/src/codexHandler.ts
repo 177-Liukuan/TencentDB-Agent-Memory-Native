@@ -716,6 +716,7 @@ export async function handleCodexEndpoint(
   }
 
   const nativeRequest = buildResponsesNativeRequestContext({
+    signal: c.req.raw.signal,
     config, spaceId, userId, agentSource, sessionId: sessionKey, sessionInfo, turnSeq,
     eligible: !injectionSkipped && Boolean(sessionInfo),
     originalInput: input as import("./native-proxy-tools/types.js").JsonValue[],
@@ -991,6 +992,7 @@ async function forwardToUpstream(
   let upstreamResp: Response;
   try {
     upstreamResp = await fetch(upstreamUrl, {
+      signal: c.req.raw.signal,
       method: "POST",
       headers: upstreamHeaders,
       body: JSON.stringify(body),

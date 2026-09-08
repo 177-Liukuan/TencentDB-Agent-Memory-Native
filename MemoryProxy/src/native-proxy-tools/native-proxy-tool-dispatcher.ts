@@ -97,9 +97,11 @@ function waitForBridge(
   signal: AbortSignal,
 ): Promise<BridgeToolExecutionResult> {
   return new Promise((resolve, reject) => {
-    const abort = () => reject(signal.reason ?? new Error("Native tool timed out"));
-    if (signal.aborted) return abort();
-    signal.addEventListener("abort", abort, { once: true });
+    const abort = () => {
+      signal.removeEventListener("abort", abort);
+      reject(signal.reason ?? new Error("Native tool timed out"));
+    };
+    // The operation may have started before cancellation; always consume its rejection.
     operation.then(
       (value) => {
         signal.removeEventListener("abort", abort);
@@ -110,6 +112,8 @@ function waitForBridge(
         reject(error);
       },
     );
+    if (signal.aborted) abort();
+    else signal.addEventListener("abort", abort, { once: true });
   });
 }
 
@@ -149,7 +153,9 @@ export class NativeProxyToolDispatcher {
     }
   }
 
-  async execute(call: UnifiedToolCall, context: ToolExecutionScope): Promise<NativeToolResult> {
+  async execute(call: UnifiedToolCall, context: ToolExecutionScope, requestSignal?: AbortSignal): Promise<NativeToolResult> {
+    const cancelled = () => errorResult("native_tool_cancelled", "Native Proxy Tool request was cancelled; execution may already have started", false);
+    if (requestSignal?.aborted) return cancelled();
     if (call.owner !== "proxy") {
       return errorResult("tool_not_owned_by_proxy", "The requested tool is not owned by the proxy", false);
     }
@@ -167,13 +173,15 @@ export class NativeProxyToolDispatcher {
     }
 
     const label = labels(definition);
-    const signal = AbortSignal.timeout(this.options.config.nativeProxyTools.toolTimeoutMs);
+    const timeout = AbortSignal.timeout(this.options.config.nativeProxyTools.toolTimeoutMs);
+    const signal = requestSignal ? AbortSignal.any([requestSignal, timeout]) : timeout;
     const executor = this.executors[definition.backend];
     const maxAttempts = definition.effect === "read" ? 2 : 1;
     let response: BridgeToolExecutionResult | undefined;
 
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
       try {
+        signal.throwIfAborted();
         response = await waitForBridge(executor({
           callId: call.callId,
           definition,
@@ -182,6 +190,7 @@ export class NativeProxyToolDispatcher {
           signal,
         }), signal);
       } catch {
+        if (requestSignal?.aborted) return cancelled();
         if (signal.aborted) {
           return errorResult(`${label.prefix}_bridge_timeout`, `${label.operation} timed out`, true);
         }
@@ -192,6 +201,7 @@ export class NativeProxyToolDispatcher {
           true,
         );
       }
+      if (requestSignal?.aborted) return cancelled();
       if (responseIsRetryable(response) && attempt < maxAttempts) continue;
       break;
     }

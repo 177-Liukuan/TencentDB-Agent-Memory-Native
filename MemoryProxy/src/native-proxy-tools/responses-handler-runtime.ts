@@ -14,6 +14,7 @@ import { getNativeProxyToolRuntime } from "./runtime.js";
 import type { JsonValue, PersistedForwardTarget, ToolExecutionScope } from "./types.js";
 
 export interface ResponsesNativeRequestContext {
+  signal?: AbortSignal;
   scope: ToolExecutionScope;
   turnSeq: number;
   originalInput: JsonValue[];
@@ -66,6 +67,7 @@ export async function runResponsesNativeToolLoop(input: {
     timeoutMs: input.config.server.forwardTimeoutMs ?? 600_000,
   });
   const coordinator = new ResponsesToolLoopCoordinator({
+    signal: input.request.signal,
     registry: runtime.registry,
     storage: runtime.storage,
     dispatcher: runtime.dispatcher,
@@ -88,6 +90,7 @@ export async function runResponsesNativeToolLoop(input: {
 }
 
 export function buildResponsesNativeRequestContext(input: {
+  signal?: AbortSignal;
   config: ProxyConfig;
   spaceId: string;
   userId: string;
@@ -102,6 +105,7 @@ export function buildResponsesNativeRequestContext(input: {
   const sessionSpace = typeof input.sessionInfo?.space_id === "string" ? input.sessionInfo.space_id : "";
   const sessionUser = typeof input.sessionInfo?.user_id === "string" ? input.sessionInfo.user_id : "";
   return {
+    signal: input.signal,
     turnSeq: input.turnSeq,
     originalInput: structuredClone([...(input.originalInput ?? [])]),
     scope: {
@@ -141,6 +145,7 @@ export async function resumeResponsesNativeToolLoop(input: {
   let selected = restart;
   // Responses 客户端当前只使用短期运行状态续接混合调用；Claude Hook 驱动的长期历史恢复仅接在 Anthropic 入口。
   const resume = await runtime.runOperation(() => resumeClientToolResults({
+    signal: input.request!.signal,
     body: input.body,
     scope: input.request!.scope,
     storage: runtime.storage!,
@@ -162,6 +167,7 @@ export async function resumeResponsesNativeToolLoop(input: {
   }
 
   const coordinator = new ResponsesToolLoopCoordinator({
+    signal: input.request.signal,
     registry: runtime.registry,
     storage: runtime.storage,
     dispatcher: runtime.dispatcher,

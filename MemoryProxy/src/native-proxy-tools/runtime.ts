@@ -27,7 +27,7 @@ export type NativeReentryTransport = (
 export const NATIVE_RETAINED_TARGET_LIMIT = 1_024;
 
 export interface NativeProxyToolExecutor {
-  execute(call: UnifiedToolCall, scope: ToolExecutionScope): Promise<NativeToolResult>;
+  execute(call: UnifiedToolCall, scope: ToolExecutionScope, signal?: AbortSignal): Promise<NativeToolResult>;
 }
 
 export interface NativeProxyToolRuntimeReadiness {

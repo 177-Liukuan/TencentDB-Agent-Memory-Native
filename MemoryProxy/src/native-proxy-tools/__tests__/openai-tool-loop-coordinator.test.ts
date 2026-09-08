@@ -3,6 +3,8 @@ import { describe, expect, it, vi } from "vitest";
 import { DEFAULT_CONFIG } from "../../config.js";
 import { InMemoryToolExecutionStorageAdapter } from "../../db/in-memory-tool-execution-storage-adapter.js";
 import { OpenAIToolLoopCoordinator } from "../openai-tool-loop-coordinator.js";
+import { ResponsesToolLoopCoordinator } from "../responses-tool-loop-coordinator.js";
+import { AnthropicClientResponsesToolLoopCoordinator } from "../anthropic-client-responses-tool-loop.js";
 import { resumeClientToolResults } from "../client-tool-resume.js";
 import { createDefaultNativeProxyToolRegistry } from "../tool-registry.js";
 import type { ToolExecutionScope, UpstreamRequestSnapshot } from "../types.js";
@@ -67,6 +69,30 @@ function harness() {
 }
 
 describe("OpenAI Tool Loop coordinator", () => {
+  it.each(["openai", "responses", "anthropic-responses"])("cancels an idle %s upstream without dispatching", async (protocol) => {
+    const abort = new AbortController();
+    const execute = vi.fn();
+    const reenter = vi.fn();
+    const options = {
+      signal: abort.signal, registry: createDefaultNativeProxyToolRegistry(),
+      storage: new InMemoryToolExecutionStorageAdapter(), dispatcher: { execute },
+      limits: structuredClone(DEFAULT_CONFIG.nativeProxyTools), reenter,
+    };
+    const coordinator = protocol === "openai" ? new OpenAIToolLoopCoordinator(options)
+      : protocol === "responses" ? new ResponsesToolLoopCoordinator(options)
+      : new AnthropicClientResponsesToolLoopCoordinator({ ...options, model: "test" });
+    const cancel = vi.fn();
+    const running = coordinator.handleRound({
+      stream: new ReadableStream<Uint8Array>({ cancel }), status: 200, headers: new Headers(),
+      scope, turnSeq: 1, upstreamSnapshot: snapshot, round: 1, totalCalls: 0,
+    });
+    abort.abort();
+    expect(await running).toMatchObject({ kind: "error", code: "native_tool_cancelled", status: 499 });
+    expect(cancel).toHaveBeenCalledTimes(1);
+    expect(execute).not.toHaveBeenCalled();
+    expect(reenter).not.toHaveBeenCalled();
+  }, 1_000);
+
   it.each([false, true])("persists a Client-only continuation (resumed: %s)", async (resumed) => {
     const { coordinator, storage, reenter } = harness();
     const clientBytes = toolRound([{ id: "c1", name: "client_shell", arguments: "{\"command\":\"pwd\"}" }]);

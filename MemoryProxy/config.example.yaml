@@ -325,9 +325,11 @@ clickhouse:
 # 降级到内存/Redis。关闭时不注入 Native Tool，也不会回退到文本/curl Fake Tool。
 nativeProxyTools:
   enabled: false
-  maxRounds: 5
-  maxCallsPerRound: 8
-  maxTotalCalls: 20
+  # 0 = 不另设循环/调用次数上限；正数仍可用于显式限制。
+  # 整个任务由客户端取消/任务超时控制，单次工具和模型请求的超时继续生效。
+  maxRounds: 0
+  maxCallsPerRound: 0
+  maxTotalCalls: 0
   toolTimeoutMs: 20000
   maxResultBytes: 65536
   stateTtlSeconds: 1800
