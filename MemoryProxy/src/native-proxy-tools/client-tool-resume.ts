@@ -11,11 +11,13 @@ import type { NativeToolLedgerStorageAdapter } from "../db/native-tool-ledger-st
 import type { UnifiedToolCall } from "../injection/adapters/interface.js";
 import { buildToolResultMessage } from "./anthropic-response-rebuilder.js";
 import { NativeToolTargetUnavailableError } from "./exact-target-transport.js";
+import type { OpenAIToolLoopDecision } from "./openai-tool-loop-coordinator.js";
 import { openAIAssistantMessageFromSkeleton } from "./openai-response-rebuilder.js";
 import { buildNativeToolLedgerRound } from "./tool-ledger-round.js";
 import type { NativeProxyToolDispatcher } from "./native-proxy-tool-dispatcher.js";
 import type {
   NativeReentryRequest,
+  ToolLoopDecision,
   UpstreamRound,
 } from "./tool-loop-coordinator.js";
 import type {
@@ -669,6 +671,9 @@ export async function resumeClientToolResults(
         await completeClientToolReentry(input.storage, key, reentryClaim.leaseOwner, outcome);
         throw new ClientToolResumeFailure("native_tool_cancelled", "Native Proxy Tool request was cancelled", 499);
       }
+      // No response has entered the coordinator, so no new tool can have run.
+      // Keep accepted results; let the next Client retry claim this batch now.
+      await releaseClientToolReentry(input.storage, key, reentryClaim.leaseOwner);
       if (error instanceof NativeToolTargetUnavailableError) {
         throw new ClientToolResumeFailure(
           "native_tool_target_unavailable",
@@ -1086,6 +1091,49 @@ export async function renewClientToolReentry(
     "Tool Result batch re-entry lease could not be renewed",
     503,
   );
+}
+
+export async function releaseClientToolReentry(
+  storage: ToolExecutionStorageAdapter,
+  key: ToolExecutionStateKey,
+  leaseOwner: string,
+  maxStorageAttempts = 8,
+): Promise<void> {
+  for (let attempt = 0; attempt < maxStorageAttempts; attempt++) {
+    const context = await storage.get(key);
+    if (!context || context.clientDispatchStatus !== "resuming"
+      || context.reentryLeaseOwner !== leaseOwner) {
+      throw new ClientToolResumeFailure(
+        "native_tool_reentry_lease_lost", "Tool Result batch re-entry lease was lost", 409,
+      );
+    }
+    if (await storage.releaseReentry({ key, leaseOwner, expectedRevision: context.revision })) return;
+  }
+  throw new ClientToolResumeFailure("native_tool_state_conflict", "Tool Result batch re-entry lease could not be released", 503);
+}
+
+/** Retry only a failed first continuation with no new Native calls or client exposure. */
+export async function settleClientToolReentry(
+  storage: ToolExecutionStorageAdapter,
+  key: ToolExecutionStateKey,
+  leaseOwner: string,
+  decision: ToolLoopDecision | OpenAIToolLoopDecision,
+): Promise<void> {
+  const retryable = decision.kind === "error"
+    && ["upstream_stream_incomplete", "upstream_stream_interrupted", "upstream_non_2xx"].includes(decision.code)
+    && (decision.status >= 500 || decision.status === 429)
+    && decision.rounds.length <= 1
+    && decision.rounds.every((round) => round.toolCalls.every((call) => call.owner !== "proxy"));
+  if (retryable) {
+    await releaseClientToolReentry(storage, key, leaseOwner);
+    return;
+  }
+  // A saved error is terminal, not an invitation to replay the same error ten times.
+  if (decision.kind === "error") decision.headers.set("x-should-retry", "false");
+  await completeClientToolReentry(storage, key, leaseOwner, createPersistedClientReentryOutcome({
+    kind: decision.kind, status: decision.status, headers: decision.headers, bytes: decision.bytes,
+    ...(decision.kind === "client_dispatch" ? { childStateKey: decision.stateKey } : {}),
+  }));
 }
 
 export async function completeClientToolReentry(

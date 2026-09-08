@@ -69,6 +69,7 @@ import { AnthropicClientResponsesToolLoopCoordinator } from "./native-proxy-tool
 import type { OpenAIToolLoopDecision } from "./native-proxy-tools/openai-tool-loop-coordinator.js";
 import {
   completeClientToolReentry,
+  settleClientToolReentry,
   createPersistedClientReentryOutcome,
   renewClientToolReentry,
   resumeClientToolResults,
@@ -1509,19 +1510,11 @@ export async function handleAnthropicMessages(
       }
       try {
         if (!parentContinuationCommitted) {
-          await completeClientToolReentry(
+          await settleClientToolReentry(
             nativeStorage,
             resume.stateKey,
             resume.reentryLeaseOwner,
-            createPersistedClientReentryOutcome({
-              kind: decision.kind,
-              status: decision.status,
-              headers: decision.headers,
-              bytes: decision.bytes,
-              ...(decision.kind === "client_dispatch"
-                ? { childStateKey: decision.stateKey }
-                : {}),
-            }),
+            decision,
           );
         }
       } catch (error) {

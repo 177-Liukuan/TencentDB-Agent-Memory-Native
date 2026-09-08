@@ -13,6 +13,8 @@ import {
   extractClientToolResults,
   extractAnthropicClientToolResults,
   resumeClientToolResults,
+  releaseClientToolReentry,
+  settleClientToolReentry,
   type ClientToolResumeInput,
 } from "../client-tool-resume.js";
 import { NativeToolTargetUnavailableError } from "../exact-target-transport.js";
@@ -24,6 +26,8 @@ import type {
   ToolExecutionScope,
 } from "../types.js";
 import type { NativeReentryRequest, UpstreamRound } from "../tool-loop-coordinator.js";
+import { AnthropicStreamParser } from "../../injection/adapters/anthropic-stream.js";
+import { createDefaultNativeProxyToolRegistry } from "../tool-registry.js";
 
 const fixedNow = new Date("2026-08-31T03:00:00.000Z");
 const encoder = new TextEncoder();
@@ -668,8 +672,8 @@ describe("resumeClientToolResults", () => {
     expect(harness.reenter).toHaveBeenCalledTimes(1);
   });
 
-  it("retries identical persisted results after a failed re-entry lease expires", async () => {
-    let currentTime = fixedNow.getTime();
+  it("retries identical persisted results immediately after a failed re-entry", async () => {
+    const currentTime = fixedNow.getTime();
     const now = () => new Date(currentTime);
     const storage = new InMemoryToolExecutionStorageAdapter({ now });
     const first = resumeHarness({
@@ -687,16 +691,9 @@ describe("resumeClientToolResults", () => {
       code: "native_tool_reentry_failed",
     });
     await expect(storage.get(state.key)).resolves.toMatchObject({
-      clientDispatchStatus: "resuming",
+      clientDispatchStatus: "dispatched",
       reentryAttempt: 1,
     });
-
-    await expect(resumeClientToolResults(first.input())).resolves.toMatchObject({
-      kind: "error",
-      code: "native_tool_reentry_in_progress",
-    });
-
-    currentTime += 10_001;
     const second = resumeHarness({ storage, now });
     const decision = await resumeClientToolResults(second.input());
     expect(decision).toMatchObject({ kind: "reentered", reentryLeaseOwner: expect.any(String) });
@@ -716,6 +713,57 @@ describe("resumeClientToolResults", () => {
       clientDispatchStatus: "completed",
       reentryAttempt: 2,
     });
+    expect(first.execute).not.toHaveBeenCalled();
+    expect(second.execute).not.toHaveBeenCalled();
+  });
+
+  it("fences a stale owner after releasing and reclaiming the same batch", async () => {
+    const harness = resumeHarness();
+    const state = mixedState({ p1: { status: "succeeded", result: "p1", isError: false } });
+    await harness.storage.create(state);
+    const first = await resumeClientToolResults(harness.input());
+    if (first.kind !== "reentered") throw new Error("expected first claim");
+    await releaseClientToolReentry(harness.storage, state.key, first.reentryLeaseOwner);
+    const second = await resumeClientToolResults(harness.input());
+    if (second.kind !== "reentered") throw new Error("expected second claim");
+    await expect(releaseClientToolReentry(harness.storage, state.key, first.reentryLeaseOwner)).rejects.toThrow(/lease was lost/);
+    expect(await harness.storage.get(state.key)).toMatchObject({
+      clientDispatchStatus: "resuming", reentryLeaseOwner: second.reentryLeaseOwner,
+    });
+    expect(harness.execute).not.toHaveBeenCalled();
+  });
+
+  it("still recovers an abandoned re-entry only after its lease expires", async () => {
+    let time = fixedNow.getTime();
+    const now = () => new Date(time);
+    const harness = resumeHarness({ storage: new InMemoryToolExecutionStorageAdapter({ now }), now });
+    const state = mixedState({ p1: { status: "succeeded", result: "p1", isError: false } });
+    await harness.storage.create(state);
+    expect((await resumeClientToolResults(harness.input())).kind).toBe("reentered");
+    expect(await resumeClientToolResults(harness.input())).toMatchObject({ code: "native_tool_reentry_in_progress" });
+    time += 10_001;
+    expect((await resumeClientToolResults(harness.input())).kind).toBe("reentered");
+    expect(harness.execute).not.toHaveBeenCalled();
+  });
+
+  it("does not retry an interrupted continuation that already started another Native tool", async () => {
+    const harness = resumeHarness();
+    const state = mixedState({ p1: { status: "succeeded", result: "p1", isError: false } });
+    await harness.storage.create(state);
+    const resume = await resumeClientToolResults(harness.input());
+    if (resume.kind !== "reentered") throw new Error("expected claim");
+    const parser = new AnthropicStreamParser(createDefaultNativeProxyToolRegistry());
+    const snapshot = parser.snapshot();
+    snapshot.toolCalls.push({ callId: "new-native", toolName: "skill_create", owner: "proxy",
+      slotIndex: 0, contentBlockIndex: 0, argumentsComplete: true, input: {} });
+    const decision = { kind: "error" as const, code: "upstream_stream_incomplete", message: "interrupted",
+      status: 502, bytes: encoder.encode("interrupted"), headers: new Headers(), rounds: [snapshot] };
+    await settleClientToolReentry(harness.storage, state.key, resume.reentryLeaseOwner, decision);
+    const retry = await resumeClientToolResults(harness.input());
+    expect(retry).toMatchObject({ kind: "replay", status: 502 });
+    if (retry.kind !== "replay") throw new Error("expected terminal error");
+    expect(retry.headers.get("x-should-retry")).toBe("false");
+    expect(harness.reenter).toHaveBeenCalledTimes(1);
   });
 
   it("replays an atomically persisted re-entry outcome after delivery is interrupted", async () => {

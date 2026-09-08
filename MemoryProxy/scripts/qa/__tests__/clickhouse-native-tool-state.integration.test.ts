@@ -9,7 +9,11 @@ import {
   completeClientToolReentry,
   createPersistedClientReentryOutcome,
   resumeClientToolResults,
+  settleClientToolReentry,
+  releaseClientToolReentry,
 } from "../../../src/native-proxy-tools/client-tool-resume.js";
+import { AnthropicToolLoopCoordinator } from "../../../src/native-proxy-tools/tool-loop-coordinator.js";
+import { createDefaultNativeProxyToolRegistry } from "../../../src/native-proxy-tools/tool-registry.js";
 import type { ToolExecutionContext } from "../../../src/native-proxy-tools/types.js";
 import {
   ClickHouseToolExecutionStorageAdapter,
@@ -77,6 +81,69 @@ describeIntegration("real ClickHouse Native Tool state", () => {
   let cleanupClient: ClickHouseClient | undefined;
   let primary: ClickHouseToolExecutionStorageAdapter;
   let secondary: ClickHouseToolExecutionStorageAdapter;
+
+  it.each(["fetch reset", "incomplete stream"])("recovers %s across ClickHouse instances and fences stale owners", async (failure) => {
+    const state = testContext(randomUUID());
+    state.responseStreamStatus = "completed";
+    state.clientDispatchStatus = "dispatched";
+    state.slots = [{ callId: "client-result", slotIndex: 0, contentBlockIndex: 0,
+      toolName: "Bash", owner: "client", input: { command: "pwd" }, argumentsComplete: true,
+      status: "pending", executionAttempt: 0 }];
+    state.assistantSkeleton = [{ type: "tool_use", id: "client-result", name: "Bash", input: { command: "pwd" } }];
+    await primary.create(state);
+    let modelRequests = 0;
+    const input = {
+      body: { messages: [{ role: "user", content: [{ type: "tool_result", tool_use_id: "client-result", content: "/workspace" }] }] },
+      scope: state.key, storage: primary,
+      dispatcher: { execute: async () => { throw new Error("Completed tools must not execute again"); } },
+      limits: structuredClone(DEFAULT_CONFIG.nativeProxyTools),
+      reentryLeaseMs: 640_000,
+      reenter: async () => {
+        modelRequests++;
+        if (modelRequests === 1 && failure === "fetch reset") throw new Error("simulated upstream reset");
+        const text = 'event: message_start\ndata: {"type":"message_start","message":{"id":"test","type":"message","role":"assistant","content":[]}}\n\n'
+          + (modelRequests === 1 ? '' : 'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n');
+        return { stream: new ReadableStream<Uint8Array>({ start(c) { c.enqueue(new TextEncoder().encode(text)); c.close(); } }),
+          status: 200, headers: new Headers({ "content-type": "text/event-stream" }) };
+      },
+    };
+    const failed = await resumeClientToolResults(input);
+    let oldOwner: string | undefined;
+    if (failure === "fetch reset") {
+      expect(failed).toMatchObject({ kind: "error", status: 502 });
+    } else {
+      if (failed.kind !== "reentered") throw new Error("expected interrupted stream");
+      oldOwner = failed.reentryLeaseOwner;
+      const decision = await new AnthropicToolLoopCoordinator({ ...input, registry: createDefaultNativeProxyToolRegistry() }).handleRound({
+        ...failed.upstreamRound, scope: state.key, turnSeq: 1, round: failed.round, totalCalls: failed.totalCalls,
+        upstreamSnapshot: failed.upstreamSnapshot, parentStateKey: state.key, parentReentryAttempt: failed.reentryAttempt,
+      });
+      expect(decision).toMatchObject({ kind: "error", code: "upstream_stream_incomplete", status: 502 });
+      await settleClientToolReentry(primary, state.key, failed.reentryLeaseOwner, decision);
+    }
+    expect(await secondary.get(state.key)).toMatchObject({ clientDispatchStatus: "dispatched",
+      reentryAttempt: 1, slots: [{ status: "succeeded", result: "/workspace" }] });
+    // Two processes receive the retry concurrently: only one may request the model.
+    const retries = await Promise.all([
+      resumeClientToolResults({ ...input, storage: secondary }), resumeClientToolResults(input),
+    ]);
+    const accepted = retries.find((r) => r.kind === "reentered");
+    expect(retries.filter((r) => r.kind === "reentered")).toHaveLength(1);
+    expect(modelRequests).toBe(2);
+    if (!accepted || accepted.kind !== "reentered") throw new Error("expected retry claim");
+    if (oldOwner) await expect(releaseClientToolReentry(primary, state.key, oldOwner)).rejects.toThrow(/lease was lost/);
+    const claimed = (await primary.get(state.key))!;
+    expect(await primary.releaseReentry({ key: state.key, leaseOwner: "stale-owner", expectedRevision: claimed.revision })).toBe(false);
+    expect(await primary.releaseReentry({ key: state.key, leaseOwner: accepted.reentryLeaseOwner, expectedRevision: claimed.revision - 1 })).toBe(false);
+    await settleClientToolReentry(secondary, state.key, accepted.reentryLeaseOwner, {
+      kind: "final", status: 200, headers: new Headers(), bytes: new TextEncoder().encode("recovered"), rounds: [],
+    });
+    const replay = await resumeClientToolResults(input);
+    expect(replay).toMatchObject({ kind: "replay", status: 200 });
+    if (replay.kind !== "replay") throw new Error("expected replay");
+    expect(new TextDecoder().decode(replay.bytes)).toBe("recovered");
+    expect(modelRequests).toBe(2);
+  }, 30_000);
 
   it("resumes a Client-only round across instances and replays without another model request", async () => {
     const state = testContext(randomUUID());

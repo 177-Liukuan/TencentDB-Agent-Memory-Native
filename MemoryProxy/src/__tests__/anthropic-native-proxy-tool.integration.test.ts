@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { request as httpRequest } from "node:http";
 import { serve } from "@hono/node-server";
 
@@ -255,6 +255,74 @@ afterEach(async () => {
 });
 
 describe("Anthropic Native Proxy Tool handler", () => {
+  it.each(["fetch reset", "incomplete stream"])("recovers from %s on Client continuation without repeating tools", async (failure) => {
+    const proxyConfig = config();
+    const storage = new InMemoryToolExecutionStorageAdapter();
+    const ledgerStorage = new InMemoryNativeToolLedgerStorageAdapter();
+    const runtime = createNativeProxyToolRuntime(proxyConfig, {
+      createStorage: () => storage, createLedgerStorage: () => ledgerStorage,
+    });
+    __setNativeProxyToolRuntimeForTests(runtime);
+    await runtime.ready();
+    await installInitializedSession();
+    let toolExecutions = 0;
+    vi.spyOn(runtime.dispatcher!, "execute").mockImplementation(async () => {
+      toolExecutions++;
+      return { isError: false, value: { memories: ["saved rule"] } };
+    });
+    let upstreamCalls = 0;
+    vi.stubGlobal("fetch", vi.fn(async (url: string | URL | Request) => {
+      if (String(url) !== "https://upstream.example/v1/messages") {
+        return new Response(JSON.stringify({ code: 0, data: { items: [] } }), { headers: { "content-type": "application/json" } });
+      }
+      upstreamCalls++;
+      if (upstreamCalls === 1) return singleConsumerSse(mixedCallFixture()).response;
+      if (upstreamCalls === 2) {
+        if (failure === "fetch reset") throw new Error("upstream reset");
+        return singleConsumerSse(messageStart("interrupted")).response;
+      }
+      return singleConsumerSse(finalTextFixture("recovered answer")).response;
+    }));
+    const app = createApp(proxyConfig);
+    const server = serve({ fetch: app.fetch, hostname: "127.0.0.1", port: 0 });
+    onTestFinished(() => new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve())));
+    await new Promise<void>((resolve) => { if (server.listening) resolve(); else server.once("listening", resolve); });
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("expected TCP server");
+    const headers = { "content-type": "application/json", "x-api-key": "client-key", "x-user-id": "user-1", "x-conversation-id": "session-1" };
+    // Real HTTP client sends the same result again, as a user/Claude retry would.
+    const request = (messages: unknown[]) => new Promise<Response>((resolve, reject) => {
+      const client = httpRequest({ hostname: "127.0.0.1", port: address.port,
+        path: "/claude-code/space-1/v1/messages", method: "POST", headers,
+      }, (response) => {
+        const chunks: Buffer[] = [];
+        response.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+        response.on("error", reject);
+        response.on("end", () => resolve(new Response(Buffer.concat(chunks), { status: response.statusCode })));
+      });
+      client.on("error", reject);
+      client.end(JSON.stringify({
+        model: "claude-test", max_tokens: 1024, stream: true,
+        tools: [{ name: "client_shell", input_schema: { type: "object" } }], messages,
+      }));
+    });
+    const first = await request([{ role: "user", content: "check project" }]);
+    expect(await first.text()).toContain("client-call-1");
+    const results = [{ role: "user", content: [{ type: "tool_result", tool_use_id: "client-call-1", content: "/workspace" }] }];
+    const failed = await request(results);
+    expect(failed.status).toBe(502);
+    await failed.text();
+    const retry = await request(results);
+    expect(retry.status).toBe(200);
+    const answer = await retry.text();
+    expect(answer).toContain("recovered answer");
+    const replay = await request(results);
+    expect(replay.status).toBe(200);
+    expect(await replay.text()).toBe(answer);
+    expect(upstreamCalls).toBe(3);
+    expect(toolExecutions).toBe(1);
+  });
+
   it("aborts internal re-entry when the actual HTTP client disconnects", async () => {
     const proxyConfig = config();
     const runtime = createNativeProxyToolRuntime(proxyConfig, {

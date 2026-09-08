@@ -21,6 +21,7 @@ import {
   type ReentryClaim,
   type ReentryCompletion,
   type ReentryRenewal,
+  type ReentryRelease,
   type ObservationClaim,
   type ObservationCompletion,
   type ObservationPreparation,
@@ -555,6 +556,17 @@ export class ClickHouseToolExecutionStorageAdapter implements ToolExecutionStora
       ) return null;
       current.reentryLeaseUntil = renewal.leaseUntil;
       current.expiresAt = extendToolExecutionExpiryForLease(current.expiresAt, renewal.leaseUntil);
+      return current;
+    });
+  }
+
+  async releaseReentry(release: ReentryRelease): Promise<boolean> {
+    return this.mutate(release.key, release.expectedRevision, (current) => {
+      if (current.clientDispatchStatus !== "resuming"
+        || current.reentryLeaseOwner !== release.leaseOwner) return null;
+      current.clientDispatchStatus = "dispatched";
+      delete current.reentryLeaseOwner;
+      delete current.reentryLeaseUntil;
       return current;
     });
   }

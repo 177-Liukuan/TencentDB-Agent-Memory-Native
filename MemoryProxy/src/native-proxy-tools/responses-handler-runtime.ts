@@ -5,8 +5,7 @@ import {
   createRetainedExactTargetTransport,
 } from "./exact-target-transport.js";
 import {
-  completeClientToolReentry,
-  createPersistedClientReentryOutcome,
+  settleClientToolReentry,
   resumeClientToolResults,
 } from "./client-tool-resume.js";
 import { ResponsesToolLoopCoordinator } from "./responses-tool-loop-coordinator.js";
@@ -186,17 +185,11 @@ export async function resumeResponsesNativeToolLoop(input: {
     parentReentryAttempt: resume.reentryAttempt,
   }));
   if (decision.kind === "client_dispatch") runtime.retainExactTarget(decision.stateKey, selected);
-  await completeClientToolReentry(
+  await settleClientToolReentry(
     runtime.storage,
     resume.stateKey,
     resume.reentryLeaseOwner,
-    createPersistedClientReentryOutcome({
-      kind: decision.kind,
-      status: decision.status,
-      headers: decision.headers,
-      bytes: decision.bytes,
-      ...(decision.kind === "client_dispatch" ? { childStateKey: decision.stateKey } : {}),
-    }),
+    decision,
   );
   runtime.releaseExactTarget(resume.stateKey);
   return new Response(streamFrom(decision.bytes), { status: decision.status, headers: decision.headers });

@@ -62,6 +62,7 @@ import {
 } from "./native-proxy-tools/exact-target-transport.js";
 import {
   completeClientToolReentry,
+  settleClientToolReentry,
   createPersistedClientReentryOutcome,
   renewClientToolReentry,
   resumeClientToolResults,
@@ -1245,17 +1246,11 @@ export async function handleChatCompletions(
         parentReentryAttempt: resume.reentryAttempt,
       }));
       if (!parentContinuationCommitted) {
-        await completeClientToolReentry(
+        await settleClientToolReentry(
           nativeStorage,
           resume.stateKey,
           resume.reentryLeaseOwner,
-          createPersistedClientReentryOutcome({
-            kind: decision.kind,
-            status: decision.status,
-            headers: decision.headers,
-            bytes: decision.bytes,
-            ...(decision.kind === "client_dispatch" ? { childStateKey: decision.stateKey } : {}),
-          }),
+          decision,
         );
       }
       if (decision.kind === "client_dispatch") {

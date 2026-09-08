@@ -99,6 +99,7 @@ export interface ReentryClaim {
 }
 
 export type ReentryRenewal = ReentryClaim;
+export type ReentryRelease = Omit<ReentryClaim, "leaseUntil">;
 
 export interface ReentryCompletion {
   key: ToolExecutionStateKey;
@@ -142,6 +143,7 @@ export interface ToolExecutionStorageAdapter {
   compareAndSetSlotResult(update: SlotResultCas): Promise<boolean>;
   tryClaimReentry(claim: ReentryClaim): Promise<boolean>;
   renewReentry(renewal: ReentryRenewal): Promise<boolean>;
+  releaseReentry(release: ReentryRelease): Promise<boolean>;
   completeReentry(completion: ReentryCompletion): Promise<boolean>;
   prepareObservation(preparation: ObservationPreparation): Promise<boolean>;
   tryClaimObservation(claim: ObservationClaim): Promise<boolean>;
