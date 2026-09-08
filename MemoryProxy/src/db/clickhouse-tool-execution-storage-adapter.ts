@@ -862,7 +862,13 @@ export class ClickHouseToolExecutionStorageAdapter implements ToolExecutionStora
         query,
         query_params: queryParams,
         format: "JSONEachRow",
-        clickhouse_settings: { date_time_output_format: "iso" },
+        clickhouse_settings: {
+          date_time_output_format: "iso",
+          // ClickHouse 25.12 can lose _block_number when lazy materialization
+          // reads pending UPDATE patches after a merge. Keep patches applied,
+          // but read state columns eagerly (including ORDER BY ... LIMIT 1).
+          query_plan_optimize_lazy_materialization: 0,
+        },
       });
       return await result.json() as ToolExecutionStateRow[];
     } catch (error) {

@@ -360,4 +360,41 @@ describeIntegration("real ClickHouse Native Tool state", () => {
       ],
     });
   }, 30_000);
+
+  it("reads the latest state after source parts merge while update patches remain", async () => {
+    // Force the same patch-join path as an UPDATE racing a background merge,
+    // without timing-dependent sleeps. This setting affects only our test table.
+    await cleanupClient!.command({
+      query: `ALTER TABLE ${table} MODIFY SETTING apply_patches_on_merge = 0`,
+    });
+    try {
+      const state = testContext(randomUUID());
+      state.upstreamSnapshot.system = "snapshot payload ".repeat(4_096);
+      await primary.create(state);
+      await primary.create(testContext(randomUUID()));
+      for (let revision = 0; revision < 3; revision++) {
+        expect(await primary.compareAndSetStreamSnapshot({
+          key: state.key,
+          expectedRevision: revision,
+          assistantSkeleton: [{ type: "text", text: `snapshot-${revision + 1}` }],
+          slots: state.slots,
+          responseStreamStatus: "streaming",
+        })).toBe(true);
+      }
+      await cleanupClient!.command({ query: `OPTIMIZE TABLE ${table} FINAL` });
+
+      const found = await secondary.findByCallId(state.key, state.slots[0].callId);
+      expect(found).toMatchObject({
+        key: state.key,
+        revision: 3,
+        assistantSkeleton: [{ type: "text", text: "snapshot-3" }],
+      });
+      expect(found?.upstreamSnapshot.system).toBe(state.upstreamSnapshot.system);
+      expect(await secondary.get(state.key)).toMatchObject({ revision: 3 });
+    } finally {
+      await cleanupClient!.command({
+        query: `ALTER TABLE ${table} MODIFY SETTING apply_patches_on_merge = 1`,
+      });
+    }
+  }, 30_000);
 });
