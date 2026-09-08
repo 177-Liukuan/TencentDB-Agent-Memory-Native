@@ -41,6 +41,16 @@ function sentBody(): Record<string, unknown> {
 }
 
 describe("exact Anthropic target transport", () => {
+  it("preserves the transport cause for safe diagnostics without exposing it in the public message", async () => {
+    const snapshot = buildUpstreamRequestSnapshot({ body: sentBody(), url: "https://upstream.example/v1/messages", model: "claude-test", authSource: "agent" });
+    const cause = Object.assign(new Error("private-token-in-upstream-error"), { code: "ECONNRESET" });
+    const reenter = createRetainedExactTargetTransport({ capturedSnapshot: snapshot, headers: {}, timeoutMs: 5000,
+      fetchImpl: async () => { throw cause; } });
+    const error = await reenter({ upstreamSnapshot: snapshot, messages: [], round: 2, totalCalls: 1 }).catch(error => error);
+    expect(error.cause).toBe(cause);
+    expect(error.message).not.toContain("private-token");
+  });
+
   it("uses each re-entry's cancellation signal, not a retained prior request signal", async () => {
     const snapshot = buildUpstreamRequestSnapshot({
       body: sentBody(), url: "https://upstream.example/v1/messages", model: "claude-test", authSource: "agent",

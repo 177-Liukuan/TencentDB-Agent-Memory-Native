@@ -32,6 +32,7 @@ import type {
   UpstreamRequestSnapshot,
 } from "./types.js";
 import { nativeToolLeaseDurationMs } from "./types.js";
+import { log } from "../report/log.js";
 
 export interface AnthropicClientToolResult {
   callId: string;
@@ -95,10 +96,38 @@ class ClientToolResumeFailure extends Error {
     readonly code: string,
     message: string,
     readonly status: number,
+    options?: ErrorOptions,
   ) {
-    super(message);
+    super(message, options);
     this.name = "ClientToolResumeFailure";
   }
+}
+
+const SAFE_NETWORK_CODES = new Set([
+  "ECONNRESET", "ECONNREFUSED", "ETIMEDOUT", "ENOTFOUND", "EAI_AGAIN", "EPIPE",
+  "UND_ERR_SOCKET", "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_HEADERS_TIMEOUT", "UND_ERR_BODY_TIMEOUT",
+  "CERT_HAS_EXPIRED", "DEPTH_ZERO_SELF_SIGNED_CERT", "ERR_TLS_CERT_ALTNAME_INVALID",
+]);
+
+/** Log identifiers and known error categories, never free-text errors, headers or payloads. */
+function logReentryFailure(
+  key: ToolExecutionScope & { toolBatchId?: string },
+  round: number | undefined,
+  code: string,
+  status: number,
+  error?: unknown,
+): void {
+  const cause: Record<string, string> = {};
+  for (let depth = 0; depth < 4 && error instanceof Error; depth++, error = error.cause) {
+    if (error instanceof NativeToolTargetUnavailableError) cause.targetReason = error.reason;
+    if (["Error", "TypeError", "AbortError", "TimeoutError"].includes(error.name)) cause.causeName = error.name;
+    const errorCode = (error as Error & { code?: unknown }).code;
+    if (typeof errorCode === "string" && SAFE_NETWORK_CODES.has(errorCode)) cause.causeCode = errorCode;
+  }
+  log.warn("native_tool.reentry_failed", {
+    sessionId: key.sessionId, toolBatchId: key.toolBatchId, contextVersion: key.contextVersion,
+    round, code, status, ...cause,
+  });
 }
 
 export function createPersistedClientReentryOutcome(input: {
@@ -475,6 +504,7 @@ export async function resumeClientToolResults(
     input.limits.toolTimeoutMs,
   ));
   const maxStorageAttempts = input.maxStorageAttempts ?? 8;
+  let diagnosticContext: ToolExecutionContext | undefined;
 
   try {
     // 一次客户端续轮必须完整对应同一组已下发调用；未知、缺失或跨组结果都不能猜测归属。
@@ -485,6 +515,7 @@ export async function resumeClientToolResults(
       })
     )));
     const known = located.filter((context): context is ToolExecutionContext => context !== null);
+    diagnosticContext = known[0];
     if (known.length === 0) {
       const active = await input.storage.findActiveBySession(input.scope);
       const awaitingClient = active.some((context) => (
@@ -679,12 +710,14 @@ export async function resumeClientToolResults(
           "native_tool_target_unavailable",
           "The persisted Native Proxy Tool upstream target is unavailable",
           503,
+          { cause: error },
         );
       }
       throw new ClientToolResumeFailure(
         "native_tool_reentry_failed",
         "Native Proxy Tool re-entry failed",
         502,
+        { cause: error },
       );
     }
     return {
@@ -706,10 +739,15 @@ export async function resumeClientToolResults(
       logicalMessages: logicalMessages(context),
     };
   } catch (error) {
-    if (input.signal?.aborted) return errorDecision(new ClientToolResumeFailure(
-      "native_tool_cancelled", "Native Proxy Tool request was cancelled", 499,
-    ));
-    return errorDecision(error);
+    const decision = errorDecision(input.signal?.aborted
+      ? new ClientToolResumeFailure("native_tool_cancelled", "Native Proxy Tool request was cancelled", 499)
+      : error);
+    if (decision.kind === "error") logReentryFailure(
+      diagnosticContext?.key ?? input.scope,
+      diagnosticContext ? diagnosticContext.round + 1 : undefined,
+      decision.code, decision.status, error,
+    );
+    return decision;
   }
 }
 
@@ -1112,13 +1150,20 @@ export async function releaseClientToolReentry(
   throw new ClientToolResumeFailure("native_tool_state_conflict", "Tool Result batch re-entry lease could not be released", 503);
 }
 
-/** Retry only a failed first continuation with no new Native calls or client exposure. */
+/**
+ * Retry only a failed first continuation with no new Native calls or client exposure.
+ * Returns true when the caller must retain its exact-target transport for retry.
+ */
 export async function settleClientToolReentry(
   storage: ToolExecutionStorageAdapter,
   key: ToolExecutionStateKey,
   leaseOwner: string,
   decision: ToolLoopDecision | OpenAIToolLoopDecision,
-): Promise<void> {
+  firstRound: number,
+): Promise<boolean> {
+  if (decision.kind === "error") logReentryFailure(
+    key, firstRound + Math.max(0, decision.rounds.length - 1), decision.code, decision.status,
+  );
   const retryable = decision.kind === "error"
     && ["upstream_stream_incomplete", "upstream_stream_interrupted", "upstream_non_2xx"].includes(decision.code)
     && (decision.status >= 500 || decision.status === 429)
@@ -1126,7 +1171,7 @@ export async function settleClientToolReentry(
     && decision.rounds.every((round) => round.toolCalls.every((call) => call.owner !== "proxy"));
   if (retryable) {
     await releaseClientToolReentry(storage, key, leaseOwner);
-    return;
+    return true;
   }
   // A saved error is terminal, not an invitation to replay the same error ten times.
   if (decision.kind === "error") decision.headers.set("x-should-retry", "false");
@@ -1134,6 +1179,7 @@ export async function settleClientToolReentry(
     kind: decision.kind, status: decision.status, headers: decision.headers, bytes: decision.bytes,
     ...(decision.kind === "client_dispatch" ? { childStateKey: decision.stateKey } : {}),
   }));
+  return false;
 }
 
 export async function completeClientToolReentry(

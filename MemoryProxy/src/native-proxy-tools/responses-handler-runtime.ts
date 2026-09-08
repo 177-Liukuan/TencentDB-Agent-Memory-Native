@@ -185,12 +185,13 @@ export async function resumeResponsesNativeToolLoop(input: {
     parentReentryAttempt: resume.reentryAttempt,
   }));
   if (decision.kind === "client_dispatch") runtime.retainExactTarget(decision.stateKey, selected);
-  await settleClientToolReentry(
+  const retryable = await settleClientToolReentry(
     runtime.storage,
     resume.stateKey,
     resume.reentryLeaseOwner,
     decision,
+    resume.round,
   );
-  runtime.releaseExactTarget(resume.stateKey);
+  if (!retryable) runtime.releaseExactTarget(resume.stateKey);
   return new Response(streamFrom(decision.bytes), { status: decision.status, headers: decision.headers });
 }

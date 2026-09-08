@@ -192,11 +192,11 @@ function successfulAuthSource(input: {
   retried: boolean;
   target: ForwardTarget;
   effectiveApiKey: string;
-  hasAgentEntry: boolean;
+  hasAgentApiKey: boolean;
 }): PersistedForwardTarget["authSource"] {
   if (!input.retried && input.target.authHeaders) return "extension";
   if (!input.effectiveApiKey) return "client";
-  return input.hasAgentEntry ? "agent" : "global";
+  return input.hasAgentApiKey ? "agent" : "global";
 }
 
 /**
@@ -1508,13 +1508,15 @@ export async function handleAnthropicMessages(
       if (decision.kind === "client_dispatch" && selectedReentry) {
         nativeToolRuntime.retainExactTarget(decision.stateKey, selectedReentry);
       }
+      let retryable = false;
       try {
         if (!parentContinuationCommitted) {
-          await settleClientToolReentry(
+          retryable = await settleClientToolReentry(
             nativeStorage,
             resume.stateKey,
             resume.reentryLeaseOwner,
             decision,
+            resume.round,
           );
         }
       } catch (error) {
@@ -1523,7 +1525,7 @@ export async function handleAnthropicMessages(
         }
         throw error;
       }
-      nativeToolRuntime.releaseExactTarget(resume.stateKey);
+      if (!retryable) nativeToolRuntime.releaseExactTarget(resume.stateKey);
 
       const resumeTags = [
         `agent_source:${agentSource}`,
@@ -2305,7 +2307,8 @@ export async function handleAnthropicMessages(
             retried,
             target,
             effectiveApiKey,
-            hasAgentEntry: agentUpstreamEntry !== undefined,
+            // A protocol-only entry inherits the global key; it does not own one.
+            hasAgentApiKey: !!agentUpstreamEntry?.apiKey,
           }),
         });
       } catch {

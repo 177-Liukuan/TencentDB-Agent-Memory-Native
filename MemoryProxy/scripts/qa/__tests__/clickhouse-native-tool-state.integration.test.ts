@@ -119,7 +119,7 @@ describeIntegration("real ClickHouse Native Tool state", () => {
         upstreamSnapshot: failed.upstreamSnapshot, parentStateKey: state.key, parentReentryAttempt: failed.reentryAttempt,
       });
       expect(decision).toMatchObject({ kind: "error", code: "upstream_stream_incomplete", status: 502 });
-      await settleClientToolReentry(primary, state.key, failed.reentryLeaseOwner, decision);
+      await settleClientToolReentry(primary, state.key, failed.reentryLeaseOwner, decision, failed.round);
     }
     expect(await secondary.get(state.key)).toMatchObject({ clientDispatchStatus: "dispatched",
       reentryAttempt: 1, slots: [{ status: "succeeded", result: "/workspace" }] });
@@ -137,7 +137,7 @@ describeIntegration("real ClickHouse Native Tool state", () => {
     expect(await primary.releaseReentry({ key: state.key, leaseOwner: accepted.reentryLeaseOwner, expectedRevision: claimed.revision - 1 })).toBe(false);
     await settleClientToolReentry(secondary, state.key, accepted.reentryLeaseOwner, {
       kind: "final", status: 200, headers: new Headers(), bytes: new TextEncoder().encode("recovered"), rounds: [],
-    });
+    }, accepted.round);
     const replay = await resumeClientToolResults(input);
     expect(replay).toMatchObject({ kind: "replay", status: 200 });
     if (replay.kind !== "replay") throw new Error("expected replay");

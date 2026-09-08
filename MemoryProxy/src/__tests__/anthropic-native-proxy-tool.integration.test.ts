@@ -255,10 +255,19 @@ afterEach(async () => {
 });
 
 describe("Anthropic Native Proxy Tool handler", () => {
-  it.each(["fetch reset", "incomplete stream"])("recovers from %s on Client continuation without repeating tools", async (failure) => {
+  it.each([
+    ["agent key", "fetch reset"],
+    ["agent key", "incomplete stream"],
+    ["global key", "fetch reset"],
+    ["global key", "incomplete stream"],
+    ["global key", "restart"],
+  ])("recovers with %s after %s without repeating tools", async (credential, failure) => {
     const proxyConfig = config();
-    const storage = new InMemoryToolExecutionStorageAdapter();
-    const ledgerStorage = new InMemoryNativeToolLedgerStorageAdapter();
+    if (credential === "global key") proxyConfig.upstream.agents["claude-code"] = { protocol: "native" };
+    const backend = createInMemoryToolExecutionBackend();
+    const ledgerBackend = createInMemoryNativeToolLedgerBackend();
+    const storage = new InMemoryToolExecutionStorageAdapter({ backend });
+    const ledgerStorage = new InMemoryNativeToolLedgerStorageAdapter({ backend: ledgerBackend });
     const runtime = createNativeProxyToolRuntime(proxyConfig, {
       createStorage: () => storage, createLedgerStorage: () => ledgerStorage,
     });
@@ -271,10 +280,11 @@ describe("Anthropic Native Proxy Tool handler", () => {
       return { isError: false, value: { memories: ["saved rule"] } };
     });
     let upstreamCalls = 0;
-    vi.stubGlobal("fetch", vi.fn(async (url: string | URL | Request) => {
+    vi.stubGlobal("fetch", vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
       if (String(url) !== "https://upstream.example/v1/messages") {
         return new Response(JSON.stringify({ code: 0, data: { items: [] } }), { headers: { "content-type": "application/json" } });
       }
+      expect(new Headers(init?.headers).get("x-api-key")).toBe(credential === "global key" ? "server-key" : "agent-key");
       upstreamCalls++;
       if (upstreamCalls === 1) return singleConsumerSse(mixedCallFixture()).response;
       if (upstreamCalls === 2) {
@@ -308,10 +318,29 @@ describe("Anthropic Native Proxy Tool handler", () => {
     });
     const first = await request([{ role: "user", content: "check project" }]);
     expect(await first.text()).toContain("client-call-1");
+    if (failure === "restart") {
+      await shutdownNativeProxyToolRuntime();
+      __resetNativeProxyToolRuntimeForTests();
+      const restarted = createNativeProxyToolRuntime(proxyConfig, {
+        createStorage: () => new InMemoryToolExecutionStorageAdapter({ backend }),
+        createLedgerStorage: () => new InMemoryNativeToolLedgerStorageAdapter({ backend: ledgerBackend }),
+      });
+      await restarted.ready();
+      __setNativeProxyToolRuntimeForTests(restarted);
+      vi.spyOn(restarted.dispatcher!, "execute").mockImplementation(async () => {
+        toolExecutions++;
+        return { isError: false, value: {} };
+      });
+    }
     const results = [{ role: "user", content: [{ type: "tool_result", tool_use_id: "client-call-1", content: "/workspace" }] }];
     const failed = await request(results);
     expect(failed.status).toBe(502);
     await failed.text();
+    if (failure === "incomplete stream") {
+      const batch = [...backend.rows.values()].find((row) => row.slots.some((slot) => slot.callId === "client-call-1"))!;
+      // A recoverable failure must retain the credentials needed by the next request.
+      expect(runtime.getRetainedExactTarget(batch.key)).toBeDefined();
+    }
     const retry = await request(results);
     expect(retry.status).toBe(200);
     const answer = await retry.text();

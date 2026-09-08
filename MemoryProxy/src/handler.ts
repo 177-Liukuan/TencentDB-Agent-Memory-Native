@@ -1245,18 +1245,20 @@ export async function handleChatCompletions(
         parentStateKey: resume.stateKey,
         parentReentryAttempt: resume.reentryAttempt,
       }));
+      let retryable = false;
       if (!parentContinuationCommitted) {
-        await settleClientToolReentry(
+        retryable = await settleClientToolReentry(
           nativeStorage,
           resume.stateKey,
           resume.reentryLeaseOwner,
           decision,
+          resume.round,
         );
       }
       if (decision.kind === "client_dispatch") {
         nativeToolRuntime.retainExactTarget(decision.stateKey, exactReentry);
       }
-      nativeToolRuntime.releaseExactTarget(resume.stateKey);
+      if (!retryable) nativeToolRuntime.releaseExactTarget(resume.stateKey);
       return new Response(streamFromBytes(decision.bytes), {
         status: decision.status,
         headers: decision.headers,

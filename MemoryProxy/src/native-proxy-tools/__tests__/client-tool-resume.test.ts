@@ -28,6 +28,7 @@ import type {
 import type { NativeReentryRequest, UpstreamRound } from "../tool-loop-coordinator.js";
 import { AnthropicStreamParser } from "../../injection/adapters/anthropic-stream.js";
 import { createDefaultNativeProxyToolRegistry } from "../tool-registry.js";
+import { log } from "../../report/log.js";
 
 const fixedNow = new Date("2026-08-31T03:00:00.000Z");
 const encoder = new TextEncoder();
@@ -746,6 +747,46 @@ describe("resumeClientToolResults", () => {
     expect(harness.execute).not.toHaveBeenCalled();
   });
 
+  it("logs batch and safe network cause without logging credentials or tool results", async () => {
+    const warning = vi.spyOn(log, "warn");
+    const sensitive = "secret-key-and-private-prompt";
+    const cause = Object.assign(new Error(sensitive), { code: "ECONNRESET" });
+    const harness = resumeHarness({ reenter: async () => {
+      throw new Error("Native Proxy Tool upstream re-entry failed", { cause });
+    } });
+    const state = mixedState({ p1: { status: "succeeded", result: sensitive, isError: false } });
+    await harness.storage.create(state);
+    try {
+      expect(await resumeClientToolResults(harness.input())).toMatchObject({ status: 502 });
+      expect(warning).toHaveBeenCalledWith("native_tool.reentry_failed", expect.objectContaining({
+        sessionId: "session-1", toolBatchId: "batch-mixed", round: 2,
+        code: "native_tool_reentry_failed", status: 502, causeCode: "ECONNRESET",
+      }));
+      expect(JSON.stringify(warning.mock.calls)).not.toContain(sensitive);
+    } finally { warning.mockRestore(); }
+  });
+
+  it("returns a retryable settlement and records the failed round even with no SSE bytes", async () => {
+    const harness = resumeHarness();
+    const state = mixedState({ p1: { status: "succeeded", result: "p1", isError: false } });
+    await harness.storage.create(state);
+    const resume = await resumeClientToolResults(harness.input());
+    if (resume.kind !== "reentered") throw new Error("expected claim");
+    const warning = vi.spyOn(log, "warn");
+    try {
+      const retryable = await settleClientToolReentry(harness.storage, state.key, resume.reentryLeaseOwner, {
+        kind: "error", code: "upstream_stream_incomplete", message: "interrupted", status: 502,
+        bytes: encoder.encode("interrupted"), headers: new Headers(), rounds: [],
+      }, resume.round);
+      expect(retryable).toBe(true);
+      expect(warning).toHaveBeenCalledWith("native_tool.reentry_failed", expect.objectContaining({
+        sessionId: "session-1", toolBatchId: "batch-mixed", round: 2,
+        code: "upstream_stream_incomplete", status: 502,
+      }));
+      expect((await harness.storage.get(state.key))?.clientDispatchStatus).toBe("dispatched");
+    } finally { warning.mockRestore(); }
+  });
+
   it("does not retry an interrupted continuation that already started another Native tool", async () => {
     const harness = resumeHarness();
     const state = mixedState({ p1: { status: "succeeded", result: "p1", isError: false } });
@@ -758,7 +799,7 @@ describe("resumeClientToolResults", () => {
       slotIndex: 0, contentBlockIndex: 0, argumentsComplete: true, input: {} });
     const decision = { kind: "error" as const, code: "upstream_stream_incomplete", message: "interrupted",
       status: 502, bytes: encoder.encode("interrupted"), headers: new Headers(), rounds: [snapshot] };
-    await settleClientToolReentry(harness.storage, state.key, resume.reentryLeaseOwner, decision);
+    expect(await settleClientToolReentry(harness.storage, state.key, resume.reentryLeaseOwner, decision, resume.round)).toBe(false);
     const retry = await resumeClientToolResults(harness.input());
     expect(retry).toMatchObject({ kind: "replay", status: 502 });
     if (retry.kind !== "replay") throw new Error("expected terminal error");

@@ -60,7 +60,8 @@ const SKIP_RESPONSE_HEADERS = new Set([
 ]);
 
 export class NativeToolTargetUnavailableError extends Error {
-  constructor() {
+  constructor(readonly reason: "invalid_snapshot" | "target_changed" | "model_changed"
+    | "extension_credentials_unavailable" | "target_not_configured" | "credential_unavailable" = "invalid_snapshot") {
     super("The persisted Native Proxy Tool upstream target is unavailable");
     this.name = "NativeToolTargetUnavailableError";
   }
@@ -284,8 +285,8 @@ async function sendExactRound(
         ? AbortSignal.any([request.signal, AbortSignal.timeout(options.timeoutMs)])
         : AbortSignal.timeout(options.timeoutMs),
     });
-  } catch {
-    throw new Error("Native Proxy Tool upstream re-entry failed");
+  } catch (cause) {
+    throw new Error("Native Proxy Tool upstream re-entry failed", { cause });
   }
   return {
     stream: response.body ?? emptyStream(),
@@ -303,7 +304,7 @@ export function createRetainedExactTargetTransport(
   return async (request) => {
     validateSnapshot(request.upstreamSnapshot);
     if (!sameTarget(request.upstreamSnapshot.target, capturedTarget)) {
-      throw new NativeToolTargetUnavailableError();
+      throw new NativeToolTargetUnavailableError("target_changed");
     }
     return sendExactRound(request, headers, options);
   };
@@ -367,7 +368,7 @@ function restartHeaders(
 ): Record<string, string> {
   const headers = sanitizeRequestHeaders(options.currentRequestHeaders);
   if (candidate.authSource !== "client") {
-    if (!candidate.apiKey) throw new NativeToolTargetUnavailableError();
+    if (!candidate.apiKey) throw new NativeToolTargetUnavailableError("credential_unavailable");
     if (protocol === "openai" || protocol === "responses") {
       headers.authorization = `Bearer ${candidate.apiKey}`;
       delete headers["x-api-key"];
@@ -388,17 +389,17 @@ export function createRestartExactTargetTransport(
   return async (request) => {
     const snapshot = request.upstreamSnapshot;
     validateSnapshot(snapshot);
-    if (
-      snapshot.target.authSource === "extension"
-      || snapshot.target.model !== options.currentModel
-    ) {
-      throw new NativeToolTargetUnavailableError();
+    if (snapshot.target.authSource === "extension") {
+      throw new NativeToolTargetUnavailableError("extension_credentials_unavailable");
+    }
+    if (snapshot.target.model !== options.currentModel) {
+      throw new NativeToolTargetUnavailableError("model_changed");
     }
     const candidate = candidates.find((entry) => (
       entry.url === snapshot.target.url
       && entry.authSource === snapshot.target.authSource
     ));
-    if (!candidate) throw new NativeToolTargetUnavailableError();
+    if (!candidate) throw new NativeToolTargetUnavailableError("target_not_configured");
     return sendExactRound(request, restartHeaders(candidate, options, snapshot.protocol), options);
   };
 }
