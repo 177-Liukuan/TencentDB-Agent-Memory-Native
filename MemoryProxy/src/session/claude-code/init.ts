@@ -559,6 +559,10 @@ async function completeRegistration(
 
 // ── Main Handler ───────────────────────────────────────────────────────────────
 
+// 同一 Store/Session 的状态迁移串行执行，防止迟到的初始化失败覆盖成功绑定。
+// 仅保护当前进程；不同 Session 不互相等待，不共享请求消息或响应。
+const sessionInitQueues = new WeakMap<SessionStore, Map<string, Promise<void>>>();
+
 /**
  * 顶层入口 wrapper：装饰 handleSessionInitInner，在完成后发一条埋点
  * （仅当 prev !== initialized && after === initialized 时）。
@@ -579,6 +583,17 @@ export async function handleSessionInit(
   presetIdentity?: PresetIdentity,
 ): Promise<SessionInitResult> {
   const compositeKey = `claude-code:${sessionKey}`;
+  let queue = sessionInitQueues.get(store);
+  if (!queue) {
+    queue = new Map();
+    sessionInitQueues.set(store, queue);
+  }
+  const previous = queue.get(compositeKey);
+  let release!: () => void;
+  const current = new Promise<void>(resolve => { release = resolve; });
+  queue.set(compositeKey, current);
+  await previous;
+  // 等待结束后再读状态；不能沿用进入队列之前看到的 uninitialized。
   const prevStatus = store.get(compositeKey)?.status ?? "uninitialized";
   try {
     return await handleSessionInitInner(
@@ -586,6 +601,8 @@ export async function handleSessionInit(
       metadataClient, userKey, spaceId, presetIdentity,
     );
   } finally {
+    release();
+    if (queue.get(compositeKey) === current) queue.delete(compositeKey);
     // 无论正常/异常返回都尝试发一次埋点；装饰器内部自吞异常。
     emitSessionInitTelemetryIfCompleted({
       store,
